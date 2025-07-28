@@ -20,10 +20,16 @@ SEGMENT_DURATION = 10  # seconds
 CHUNKS_PER_GROUP = 5
 IDEAL_SEGMENT_COUNT = 300
 
+def is_job_halted(job_id):
+    status = redis_client.hget(f"job:{job_id}", "status")
+    if not status:
+        return True
+    return status.decode() in ("FAILED", "ABORTED")
+
 @app.task(bind=True)
 def segment_video(self, job_id, file_path, filename):
     try:
-        if not redis_client.exists(f"job:{job_id}"):
+        if is_job_halted(job_id):
             logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
             return {'status': 'ABORTED'}        
             
@@ -70,21 +76,46 @@ def segment_video(self, job_id, file_path, filename):
             logger.warning(f"VEM [{job_id}] Duration estimate failed: {e}")
             estimated_chunks = 0
 
+        # Log video resolution and duration
+        try:
+            video_info = subprocess.check_output([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x',
+                file_path
+            ], text=True).strip()
+            
+            duration_output = subprocess.check_output([
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                file_path
+            ], text=True).strip()
+            
+            logger.info(f"VEM [{job_id}] Resolution: {video_info}, Duration: {float(duration_output):.2f} seconds")
+
+        except Exception as e:
+            logger.warning(f"VEM [{job_id}] Failed to retrieve resolution/duration: {e}")
+
         redis_client.hset(f"job:{job_id}", mapping={
             'total_chunks': estimated_chunks,
             'completed_chunks': 0
         })
 
+        # segment based on keyframes explicitly: -segment_format mpegts -break_non_keyframes 0
+        # -bsf:v h264_mp4toannexb \
+        # -force_key_frames "expr:gte(t,n_forced*26)"
         cmd = [
             'ffmpeg', '-i', file_path,
             '-map', '0',  # all streams
             '-c', 'copy',
+            '-bsf:v', 'h264_mp4toannexb',
             '-f', 'segment',
             '-segment_time', str(segment_duration),
+            '-force_key_frames', '"expr:gte(t,n_forced*26)"',
             '-reset_timestamps', '1',
             chunk_prefix
         ]
-        logger.info(f"VEM [{job_id}] Running: {' '.join(cmd)}")
+        logger.info(f"VEM [{job_id}] Segment command: {' '.join(cmd)}")
 
         segment_re = re.compile(r"Opening '(.*?)chunk_(\d+)\.ts' for writing")
         previous_chunk_path = None
@@ -94,7 +125,7 @@ def segment_video(self, job_id, file_path, filename):
 
         queued_chunks = set()
         while True:
-            if not redis_client.exists(f"job:{job_id}"):
+            if is_job_halted(job_id):
                 logger.warning(f"VEM [{job_id}] Job deleted. Terminating segmentation.")
                 process.terminate()
                 process.wait()
@@ -164,7 +195,7 @@ def segment_video(self, job_id, file_path, filename):
 def encode_chunk(self, job_id, chunk_path, chunk_index):
     try:
 
-        if not redis_client.exists(f"job:{job_id}"):
+        if is_job_halted(job_id):
             logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
             return {'status': 'ABORTED'}        
 
@@ -183,14 +214,21 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
             '-map', '0:a:0?',
             '-c:v', 'h264_vaapi',
             '-rc_mode', 'CQP',
-            '-qp', '30',
+            '-qp', '27',
             '-c:a', 'aac',
             '-ac', '2',
             '-b:a', '192k',
             encoded_path
         ]
         logger.info(f"VEM [{job_id}] Encoding chunk {chunk_index}")
-        subprocess.run(cmd, check=True)
+        logger.info(f"VEM [{job_id}] Encode command: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"VEM [{job_id}] Encoding chunk {chunk_index} FAILED")
+            logger.error(f"VEM [{job_id}] Encode failed with return code {result.returncode}")
+            logger.error(f"VEM [{job_id}] FFmpeg stderr:\n{result.stderr}")
+            raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
         redis_client.hincrby(f"job:{job_id}", 'completed_chunks', 1)
 
@@ -205,7 +243,9 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
         return {'status': 'COMPLETED', 'chunk_index': chunk_index}
 
     except subprocess.CalledProcessError as e:
+        logger.error(f"VEM [{job_id}] Encoding chunk {chunk_index} FAILED")
         logger.error(f"VEM [{job_id}] Encode failed: {e}")
+        logger.error(f"VEM [{job_id}] FFmpeg stderr:\n{e.stderr}")
         try:
             self.retry(exc=e)
         except Retry:
@@ -222,7 +262,7 @@ def monitor_encoding(self, job_id):
     job_key = f"job:{job_id}"
     try:
 
-        if not redis_client.exists(f"job:{job_id}"):
+        if is_job_halted(job_id):
             logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
             return {'status': 'ABORTED'}        
 
@@ -247,10 +287,9 @@ def monitor_encoding(self, job_id):
 @app.task(bind=True)
 def stitch_video(self, job_id):
     try:
-
-        if not redis_client.exists(f"job:{job_id}"):
+        if is_job_halted(job_id):
             logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
-            return {'status': 'ABORTED'}        
+            return {'status': 'ABORTED'}
 
         job_key = f"job:{job_id}"
         job_data = redis_client.hgetall(job_key)
@@ -259,13 +298,20 @@ def stitch_video(self, job_id):
             return {'status': 'FAILED', 'reason': 'Missing job'}
 
         job_dir = job_data.get(b'job_dir', b'').decode()
-        output_path = os.path.join(job_dir, "output.mp4")
+        input_filename = os.path.basename(job_data.get(b'filename', b'output.mp4').decode())
+        base_name, _ = os.path.splitext(input_filename)
+        output_path = os.path.join(job_dir, base_name + '.mp4')
         total_chunks = int(job_data[b'total_chunks'].decode())
         concat_file = os.path.join(job_dir, "concat_list.txt")
 
         # Wait up to 10 seconds for all encoded chunks to appear
         retries = 10
         for attempt in range(retries):
+
+            if is_job_halted(job_id):
+                logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
+                return {'status': 'ABORTED'}
+
             missing = []
             for i in range(total_chunks):
                 path = os.path.join(job_dir, f"encoded_chunk_{i:03d}.mp4")
@@ -286,6 +332,7 @@ def stitch_video(self, job_id):
                 f.write(f"file 'encoded_chunk_{i:03d}.mp4'\n")
 
         redis_client.hset(job_key, 'status', 'STITCHING')
+        logger.warning(f"VEM [{job_id}] Waiting for {len(missing)} chunks to appear: {missing[:3]}...")
 
         cmd = [
             'ffmpeg', '-f', 'concat', '-safe', '0',
@@ -300,7 +347,7 @@ def stitch_video(self, job_id):
 
         current_out_time = 0
         while True:
-            if not redis_client.exists(job_key):
+            if is_job_halted(job_id):
                 logger.warning(f"VEM [{job_id}] Job deleted. Terminating stitching.")
                 process.terminate()
                 process.wait()
@@ -323,12 +370,15 @@ def stitch_video(self, job_id):
         process.wait()
 
         if process.returncode != 0:
-            logger.error(f"VEM [{job_id}] FFmpeg stitching failed")
+            logger.error(f"VEM [{job_id}] FFmpeg stitch failed with return code {result.returncode}")
+            logger.error(f"VEM [{job_id}] FFmpeg stitch failed with result {result}")
+            logger.error(f"VEM [{job_id}] FFmpeg stitch stderr:\n{result.stderr}")
+            logger.error(f"VEM [{job_id}] FFmpeg stitch stdout:\n{result.stdout}")
             redis_client.hset(job_key, 'status', 'FAILED')
             return {'status': 'FAILED'}
 
         # Cleanup
-        for pattern in ('chunk_*.ts', 'encoded_chunk_*.mp4'):
+        for pattern in ('chunk_*.ts', 'encoded_chunk_*.mp4', 'concat_list.txt'):
             for file in glob.glob(os.path.join(job_dir, pattern)):
                 try:
                     os.remove(file)
@@ -353,3 +403,4 @@ def stitch_video(self, job_id):
         logger.exception(f"VEM [{job_id}] Stitching error")
         redis_client.hset(job_key, 'status', 'FAILED')
         return {'status': 'FAILED', 'error': str(e)}
+
