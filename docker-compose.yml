@@ -1,0 +1,82 @@
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - vol_redis:/data
+
+  flaskapp:
+    image: 127.0.0.1:5000/transcoder/flaskapp
+    build:
+      context: ./flaskapp
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      CELERY_BROKER: redis://redis:6379/0
+      CELERY_BACKEND: redis://redis:6379/1
+    ports:
+      - "5005:5000"
+    depends_on:
+      - redis
+    volumes:
+      - vol_archives:/watch
+      - vol_chunks:/chunks
+
+  worker:
+    image: 127.0.0.1:5000/transcoder/worker
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: always
+    command: celery -A tasks worker --loglevel=info --concurrency=1
+    environment:
+      CELERY_BROKER: redis://redis:6379/0
+      CELERY_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+    volumes:
+      - vol_archives:/watch
+      - vol_chunks:/chunks
+    deploy:
+      replicas: 0
+
+  watchdog:
+    image: 127.0.0.1:5000/transcoder/watchdog
+    build:
+      context: ./watchdog
+      dockerfile: Dockerfile
+    restart: always
+    command: python watcher.py
+    environment:
+      CELERY_BROKER: redis://redis:6379/0
+      CELERY_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+      - flaskapp
+    volumes:
+      - vol_archives:/watch
+      - vol_chunks:/chunks
+
+volumes:
+
+  vol_redis:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/transcoder/redis
+
+  vol_archives:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/media/archive
+
+  vol_chunks:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/media/chunks
