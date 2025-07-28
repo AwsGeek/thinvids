@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir flask redis celery
+RUN pip install --no-cache-dir flask redis celery humanize
 
 EXPOSE 5000
 ENV FLASK_APP=app.py

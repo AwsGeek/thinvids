@@ -9,6 +9,9 @@
       padding: 0.5rem;
       border: 1px solid #e5e7eb;
     }
+    .fixed-progress-col {
+      width: 120px;
+    }
   </style>
 </head>
 <body class="bg-gray-100">
@@ -32,9 +35,10 @@
         <tr class="bg-gray-200">
           <th>Job ID</th>
           <th>Filename</th>
-          <th>Segment</th>
-          <th>Encode</th>
-          <th>Combine</th>
+          <th class="fixed-progress-col">Split</th>
+          <th class="fixed-progress-col">Encode</th>
+          <th class="fixed-progress-col">Stitch</th>
+          <th>Started</th>
           <th>Elapsed</th>
           <th>Status</th>
           <th>Actions</th>
@@ -44,13 +48,44 @@
     </table>
   </div>
 
+  <!-- Properties Modal -->
+  <div id="properties-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+    <div class="bg-white rounded shadow-lg w-full max-w-2xl p-6 relative">
+      <button onclick="closeModal()" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+        <span class="material-icons">close</span>
+      </button>
+      <h2 class="text-xl font-semibold mb-4">Job Properties</h2>
+      <div id="modal-content" class="space-y-2 text-sm font-mono whitespace-pre-wrap"></div>
+    </div>
+  </div>
+
   <script>
+    function closeModal() {
+      document.getElementById('properties-modal').classList.add('hidden');
+    }
+
+    async function showProperties(job_id) {
+      const res = await fetch(`/job_properties/${job_id}`);
+      if (!res.ok) return alert('Failed to load properties');
+
+      const data = await res.json();
+      const modal = document.getElementById('properties-modal');
+      const content = document.getElementById('modal-content');
+
+      content.innerText = JSON.stringify(data, null, 2);
+      modal.classList.remove('hidden');
+    }    
     function formatElapsed(seconds) {
       const mins = Math.floor(seconds / 60);
       const secs = seconds % 60;
       return `${mins}m ${secs}s`;
     }
 
+    function formatDateTime(timestamp) {
+      if (!timestamp || isNaN(timestamp)) return '';
+      const dt = new Date(timestamp * 1000);
+      return dt.toLocaleString();
+    }    
     async function fetchTasks() {
       const response = await fetch('/tasks');
       const jobs = await response.json();
@@ -62,10 +97,11 @@
         row.innerHTML = `
           <td class="text-xs break-all">${job.job_id}</td>
           <td>${job.filename}</td>
-          <td>${progressBar(job.segment_progress)}</td>
-          <td>${progressBar(job.encode_progress)}</td>
-          <td>${progressBar(job.combine_progress)}</td>
-          <td>${formatElapsed(job.elapsed)}</td>
+          <td class="fixed-progress-col">${progressBar(job.segment_progress)}</td>
+          <td class="fixed-progress-col">${progressBar(job.encode_progress)}</td>
+          <td class="fixed-progress-col">${progressBar(job.combine_progress)}</td>
+          <td>${formatDateTime(job.started)}</td>
+          <td>${formatElapsed(job.elapsed)}</td>                  
           <td>
             <span class="font-medium ${job.status === 'FAILED' ? 'text-red-600' : job.status === 'COMPLETED' ? 'text-green-600' : 'text-yellow-600'}">
               ${job.status}
@@ -78,6 +114,9 @@
             <button onclick="deleteTask('${job.job_id}')" title="Delete">
               <span class="material-icons text-red-600 hover:text-red-800">delete</span>
             </button>
+            <button onclick="showProperties('${job.job_id}')" title="Properties">
+              <span class="material-icons text-gray-700 hover:text-black">info</span>
+            </button>            
           </td>
         `;
         taskList.appendChild(row);
@@ -102,9 +141,6 @@
         </div>
       `;
     }
-
-
-
     async function addTask() {
       const filename = document.getElementById('filename').value;
       const response = await fetch('/add_task', {

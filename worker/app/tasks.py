@@ -4,6 +4,7 @@ import uuid
 import redis
 import time
 import math
+import json
 import os
 import subprocess
 import glob
@@ -25,6 +26,12 @@ def is_job_halted(job_id):
     if not status:
         return True
     return status.decode() in ("FAILED", "ABORTED")
+
+def get_video_codec(input_file):
+    cmd = ['ffprobe', '-v', 'error', '-show_streams', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'json', input_file]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    data = json.loads(result.stdout)
+    return data['streams'][0]['codec_name']
 
 @app.task(bind=True)
 def segment_video(self, job_id, file_path, filename):
@@ -76,6 +83,8 @@ def segment_video(self, job_id, file_path, filename):
             logger.warning(f"VEM [{job_id}] Duration estimate failed: {e}")
             estimated_chunks = 0
 
+        redis_client.hset(f"job:{job_id}", 'segment_duration', segment_duration)
+
         # Log video resolution and duration
         try:
             video_info = subprocess.check_output([
@@ -98,20 +107,24 @@ def segment_video(self, job_id, file_path, filename):
 
         redis_client.hset(f"job:{job_id}", mapping={
             'total_chunks': estimated_chunks,
-            'completed_chunks': 0
+            'completed_chunks': 0 
         })
 
         # segment based on keyframes explicitly: -segment_format mpegts -break_non_keyframes 0
         # -bsf:v h264_mp4toannexb \
         # -force_key_frames "expr:gte(t,n_forced*26)"
+
+        codec = get_video_codec(file_path)
+        bsf = 'hevc_mp4toannexb' if codec == 'hevc' else 'h264_mp4toannexb'
+
         cmd = [
             'ffmpeg', '-i', file_path,
             '-map', '0',  # all streams
             '-c', 'copy',
-            '-bsf:v', 'h264_mp4toannexb',
+            '-bsf:v', bsf,
             '-f', 'segment',
             '-segment_time', str(segment_duration),
-            '-force_key_frames', '"expr:gte(t,n_forced*26)"',
+            '-force_key_frames', f"expr:gte(t,n_forced*{segment_duration})",
             '-reset_timestamps', '1',
             chunk_prefix
         ]
@@ -221,7 +234,7 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
             encoded_path
         ]
         logger.info(f"VEM [{job_id}] Encoding chunk {chunk_index}")
-        logger.info(f"VEM [{job_id}] Encode command: {' '.join(cmd)}")
+        #logger.info(f"VEM [{job_id}] Encode command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:

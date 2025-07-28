@@ -5,6 +5,7 @@ from celery.utils import uuid
 import time
 import os
 import logging
+import humanize
 
 app = Flask(__name__)
 app.config['CELERY_BROKER_URL'] = 'redis://redis:6379/0'
@@ -56,6 +57,52 @@ def get_jobs():
         
     jobs.sort(key=lambda x: x['started'], reverse=True)
     return jsonify(jobs)
+
+import json
+import humanize
+
+@app.route('/job_properties/<job_id>')
+def job_properties(job_id):
+    key = f"job:{job_id}"
+    if not redis_client.exists(key):
+        return jsonify({'error': 'Job not found'}), 404
+
+    job_data = redis_client.hgetall(key)
+    filename = job_data.get(b'filename', b'UNKNOWN').decode()
+    job_dir = job_data.get(b'job_dir', b'').decode()
+    segment_duration = int(job_data.get(b'segment_duration', b'10').decode() or 10)
+
+    def get_media_info(path):
+        try:
+            out = subprocess.check_output([
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,duration',
+                '-of', 'json', path
+            ], text=True)
+            result = json.loads(out)['streams'][0]
+            return {
+                'file': os.path.basename(path),
+                'size': humanize.naturalsize(os.path.getsize(path)),
+                'width': result.get('width'),
+                'height': result.get('height'),
+                'duration': f"{float(result.get('duration', 0)):.1f} sec"
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    input_info = get_media_info(f"/watch/{filename}")
+    output_info = get_media_info(os.path.join(job_dir, 'output.mp4'))
+
+    return jsonify({
+        'Input File': input_info,
+        'Output File': output_info,
+        'Segment Length (sec)': segment_duration,
+        'Encoder': 'Intel VAAPI h264_vaapi',
+        'Quality': 'CQP QP=30',
+        'Audio': 'AAC 2ch 192k'
+    })
+
 
 @app.route('/add_task', methods=['POST'])
 def add_task():
