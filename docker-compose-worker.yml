@@ -11,7 +11,8 @@ services:
       CELERY_BACKEND: redis://192.168.0.120:6379/1
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks
+      - vol_library:/library
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
       - /dev/dri:/dev/dri
     devices:
       - /dev/dri/renderD128
@@ -26,10 +27,9 @@ volumes:
       o: addr=192.168.0.5,nolock,soft
       device: :/volume1/shared/projects/media/archive
 
-  vol_chunks:
+  vol_library:
     driver: local
     driver_opts:
       type: nfs
       o: addr=192.168.0.5,nolock,soft
-      device: :/volume1/shared/projects/media/chunks
-
+      device: :/volume1/shared/projects/media/library

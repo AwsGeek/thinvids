@@ -10,6 +10,7 @@ import subprocess
 import glob
 import logging
 import re
+import shutil
 
 app = Celery('tasks', broker='redis://192.168.0.120:6379/0', backend='redis://192.168.0.120:6379/1')
 redis_client = redis.Redis(host='192.168.0.120', port=6379, db=1)
@@ -27,11 +28,6 @@ def is_job_halted(job_id):
         return True
     return status.decode() in ("FAILED", "ABORTED")
 
-def get_video_codec(input_file):
-    cmd = ['ffprobe', '-v', 'error', '-show_streams', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'json', input_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    return data['streams'][0]['codec_name']
 
 @app.task(bind=True)
 def segment_video(self, job_id, file_path, filename):
@@ -40,11 +36,19 @@ def segment_video(self, job_id, file_path, filename):
             logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
             return {'status': 'ABORTED'}        
             
+        start_seg = time.time()
+
         logger.info(f"VEM Segmenting {file_path}")
 
         job_dir = os.path.join('/chunks', f"job_{job_id}")
         os.makedirs(job_dir, exist_ok=True)
         
+        log_path = os.path.join(job_dir, 'log.txt')
+        log_handler = logging.FileHandler(log_path)
+        log_handler.setLevel(logging.INFO)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(log_handler)
+
         chunk_prefix = os.path.join(job_dir, f"chunk_%03d.ts")
 
         redis_client.hset(f"job:{job_id}", mapping={
@@ -52,7 +56,10 @@ def segment_video(self, job_id, file_path, filename):
             'segment_progress': 0,
             'encode_progress': 0,
             'combine_progress': 0,
+            'encode_start_time': 0,
+            'encode_end_time': 0,
             'job_dir': job_dir,
+            'log_path': log_path,
             'started_at': time.time()
         })
 
@@ -114,12 +121,47 @@ def segment_video(self, job_id, file_path, filename):
         # -bsf:v h264_mp4toannexb \
         # -force_key_frames "expr:gte(t,n_forced*26)"
 
-        codec = get_video_codec(file_path)
-        bsf = 'hevc_mp4toannexb' if codec == 'hevc' else 'h264_mp4toannexb'
+        # Get stream info
+        probe = subprocess.check_output([
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,width,height,avg_frame_rate',
+            '-show_entries', 'format=duration,size',
+            '-of', 'json',
+            file_path
+        ], text=True)
+        probe_data = json.loads(probe)
+        video = probe_data['streams'][0]
+        fmt = probe_data['format']
 
+        codec = video.get('codec_name', '')
+        width = video.get('width', '')
+        height = video.get('height', '')
+        fps = eval(video.get('avg_frame_rate', '0'))  # safely evaluate "30000/1001"
+
+        duration = float(fmt.get('duration', 0))
+        file_size = int(fmt.get('size', 0))
+
+        segment_duration = max(10, int(duration / IDEAL_SEGMENT_COUNT))
+        total_chunks = math.ceil(duration / segment_duration)
+
+        redis_client.hset(f"job:{job_id}", mapping={
+            'source_codec': codec,
+            'source_resolution': f"{width}x{height}",
+            'source_duration': f"{duration:.2f}",
+            'source_fps': f"{fps:.2f}",
+            'source_file_size': file_size,
+            'segment_duration': segment_duration,
+            'total_chunks': total_chunks,
+            'completed_chunks': 0
+        })        
+        logger.info(f"VEM [{job_id}] Detected codec: {codec}")        
+
+        # Use copy method for supported codecs
+        bsf = 'hevc_mp4toannexb' if codec == 'hevc' else 'h264_mp4toannexb'
         cmd = [
             'ffmpeg', '-i', file_path,
-            '-map', '0',  # all streams
+            '-map', '0',
             '-c', 'copy',
             '-bsf:v', bsf,
             '-f', 'segment',
@@ -157,11 +199,10 @@ def segment_video(self, job_id, file_path, filename):
                     'segment_progress': int(((chunk_index + 1) / estimated_chunks) * 100)
                 })
 
-                if previous_chunk_path is not None:
+                if previous_chunk_index is not None:
                     encode_chunk.apply_async(args=[job_id, previous_chunk_path, previous_chunk_index])
                     queued_chunks.add(previous_chunk_index)
-                
-                logger.info(f"VEM [{job_id}] Segmented chunk {previous_chunk_index}")
+                    logger.info(f"VEM [{job_id}] Segmented chunk {previous_chunk_index}")  
 
                 previous_chunk_path = chunk_path
                 previous_chunk_index = chunk_index
@@ -194,6 +235,9 @@ def segment_video(self, job_id, file_path, filename):
             'segment_progress': 100
         })
 
+        end_seg = time.time()
+        redis_client.hset(f"job:{job_id}", 'segmentation_time', round(end_seg - start_seg, 2))
+
         monitor_encoding.apply_async(args=[job_id])
         return {'status': 'SEGMENTED', 'total_chunks': total_chunks}
 
@@ -209,9 +253,9 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
     try:
 
         if is_job_halted(job_id):
-            logger.warning(f"VEM [{job_id}] Job no longer exists. Aborting task.")
-            return {'status': 'ABORTED'}        
-
+            logger.warning(f"VEM [{job_id}] Job marked ABORTED before encoding chunk {chunk_index}. Exiting.")
+            return
+        
         # Check if chunk file exists
         if not os.path.exists(chunk_path):
             logger.warning(f"VEM [{job_id}] Missing chunk file: {chunk_path}. Aborting encode.")
@@ -236,12 +280,21 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
         logger.info(f"VEM [{job_id}] Encoding chunk {chunk_index}")
         #logger.info(f"VEM [{job_id}] Encode command: {' '.join(cmd)}")
 
+        start_time = float(redis_client.hget(f"job:{job_id}", "encode_start_time").decode())
+        if start_time == 0:
+            redis_client.hset(f"job:{job_id}", "encode_start_time", time.time())
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.error(f"VEM [{job_id}] Encoding chunk {chunk_index} FAILED")
             logger.error(f"VEM [{job_id}] Encode failed with return code {result.returncode}")
             logger.error(f"VEM [{job_id}] FFmpeg stderr:\n{result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+        now = time.time()
+        previous_end = float(redis_client.hget(f"job:{job_id}", "encode_end_time").decode())
+        if now > previous_end:
+            redis_client.hset(f"job:{job_id}", "encode_end_time", now)
 
         redis_client.hincrby(f"job:{job_id}", 'completed_chunks', 1)
 
@@ -266,6 +319,7 @@ def encode_chunk(self, job_id, chunk_path, chunk_index):
             raise
     except Exception as e:
         logger.exception(f"VEM [{job_id}] Unexpected encode error")
+        logger.exception(f"VEM [{job_id}] {e}")
         redis_client.hset(f"job:{job_id}", mapping={'status': 'FAILED'})
         raise
 
@@ -284,6 +338,11 @@ def monitor_encoding(self, job_id):
         completed = int(data.get(b'completed_chunks', b'0').decode())
 
         if completed >= total:
+            start = float(data.get(b'encode_start_time', b'0').decode())
+            end = float(data.get(b'encode_end_time', b'0').decode())
+            if start > 0 and end > 0:
+                redis_client.hset(job_key, 'encode_elapsed_time', end - start)
+
             logger.info(f"VEM [{job_id}] Encoding complete. Starting combine.")
             stitch_video.apply_async(args=[job_id])
             return {'status': 'DONE'}
@@ -293,6 +352,7 @@ def monitor_encoding(self, job_id):
 
     except Exception as e:
         logger.exception(f"VEM [{job_id}] Monitor failed")
+        logger.exception(f"VEM [{job_id}] {e}")
         redis_client.hset(job_key, 'status', 'FAILED')
         return {'status': 'FAILED', 'error': str(e)}
 
@@ -311,9 +371,7 @@ def stitch_video(self, job_id):
             return {'status': 'FAILED', 'reason': 'Missing job'}
 
         job_dir = job_data.get(b'job_dir', b'').decode()
-        input_filename = os.path.basename(job_data.get(b'filename', b'output.mp4').decode())
-        base_name, _ = os.path.splitext(input_filename)
-        output_path = os.path.join(job_dir, base_name + '.mp4')
+        output_path = os.path.join(job_dir, 'output.mp4')
         total_chunks = int(job_data[b'total_chunks'].decode())
         concat_file = os.path.join(job_dir, "concat_list.txt")
 
@@ -390,13 +448,36 @@ def stitch_video(self, job_id):
             redis_client.hset(job_key, 'status', 'FAILED')
             return {'status': 'FAILED'}
 
-        # Cleanup
-        for pattern in ('chunk_*.ts', 'encoded_chunk_*.mp4', 'concat_list.txt'):
-            for file in glob.glob(os.path.join(job_dir, pattern)):
-                try:
-                    os.remove(file)
-                except Exception as e:
-                    logger.warning(f"VEM [{job_id}] Failed to remove {file}: {e}")
+        redis_client.hset(job_key, mapping={'status': 'MOVING'})
+
+        # Final output path: /library/... (same structure as /watch input)
+        input_path = job_data.get(b'filename').decode()
+        logger.info(f"VEM input_path {input_path}")
+        base_path, _ = os.path.splitext(input_path)
+        logger.info(f"VEM base_path {base_path}")
+        final_path = os.path.join('/library', base_path + '.mp4')
+        logger.info(f"VEM final_path {final_path}")
+        final_dir = os.path.dirname(final_path)
+        logger.info(f"VEM final_dir {final_dir}")
+
+        try:
+            os.makedirs(final_dir, exist_ok=True)            
+            shutil.move(output_path, final_path) # use shutils because this is a cross device move
+            logger.info(f"VEM [{job_id}] Moved stitched file to {final_path}")
+            redis_client.hset(job_key, 'output_path', final_path)
+        except Exception as e:
+            logger.error(f"VEM [{job_id}] Failed to move output to {final_path}: {e}")
+            logger.exception(f"VEM [{job_id}] {e}")
+            redis_client.hset(job_key, 'status', 'FAILED')
+            return {'status': 'FAILED', 'error': str(e)}
+
+        # Cleanup entire project directory
+        redis_client.hset(job_key, 'status', 'CLEANUP')
+        try:
+            shutil.rmtree(job_dir)
+            logger.info(f"VEM [{job_id}] Removed job directory {job_dir}")
+        except Exception as e:
+            logger.warning(f"VEM [{job_id}] Failed to remove job dir {job_dir}: {e}")
 
         redis_client.hset(job_key, mapping={
             'status': 'COMPLETED',

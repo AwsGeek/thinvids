@@ -103,10 +103,18 @@
           <td>${formatDateTime(job.started)}</td>
           <td>${formatElapsed(job.elapsed)}</td>                  
           <td>
-            <span class="font-medium ${job.status === 'FAILED' ? 'text-red-600' : job.status === 'COMPLETED' ? 'text-green-600' : 'text-yellow-600'}">
-              ${job.status}
-            </span>
-          </td>
+            ${
+              job.status === 'FAILED' && job.log_path
+                ? `<a href="/log/${job.job_id}" class="font-medium text-red-600 underline">FAILED</a>`
+                : `<span class="font-medium ${
+                    job.status === 'COMPLETED'
+                      ? 'text-green-600'
+                      : job.status === 'FAILED'
+                      ? 'text-red-600'
+                      : 'text-yellow-600'
+                  }">${job.status}</span>`
+            }
+          </td>          
           <td class="text-center flex items-center justify-center gap-1">
             <button onclick="copyTask('${job.filename}')" title="Copy">
               <span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span>

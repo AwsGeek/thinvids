@@ -21,7 +21,7 @@ services:
       - redis
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
 
   worker:
     image: 127.0.0.1:5000/transcoder/worker
@@ -37,7 +37,7 @@ services:
       - redis
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
     deploy:
       replicas: 0
 
@@ -56,7 +56,7 @@ services:
       - flaskapp
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
 
 volumes:
 
@@ -74,9 +74,3 @@ volumes:
       o: addr=192.168.0.5,nolock,soft
       device: :/volume1/shared/projects/media/archive
 
-  vol_chunks:
-    driver: local
-    driver_opts:
-      type: nfs
-      o: addr=192.168.0.5,nolock,soft
-      device: :/volume1/shared/projects/media/chunks

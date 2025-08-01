@@ -6,6 +6,8 @@ import time
 import os
 import logging
 import humanize
+import shutil
+
 
 app = Flask(__name__)
 app.config['CELERY_BROKER_URL'] = 'redis://redis:6379/0'
@@ -28,33 +30,34 @@ def get_jobs():
     jobs = []
     for key in redis_client.scan_iter("job:*"):
         try:
-            job_id = key.decode().split(':')[1]
-            data = redis_client.hgetall(key)
-            started = float(data.get(b'started_at', b'0').decode() or 0)
-            ended = float(data.get(b'ended_at', b'0').decode() or 0)
+            job_id = key.decode().split(':', 1)[1]
+            raw_data = redis_client.hgetall(key)
+            job_data = {k.decode(): v.decode() for k, v in raw_data.items()}
+
+            started = float(job_data.get('started_at', '0') or 0)
+            ended = float(job_data.get('ended_at', '0') or 0)
             now = time.time()
             elapsed = int((ended if ended > 0 else now) - started) if started > 0 else 0
 
-            total = int(data.get(b'total_chunks', b'0').decode() or 0)
-            done = int(data.get(b'completed_chunks', b'0').decode() or 0)
+            total = int(job_data.get('total_chunks', '0') or 0)
+            done = int(job_data.get('completed_chunks', '0') or 0)
 
-            segment_progress = int(data.get(b'segment_progress', b'0').decode() or 0)
+            segment_progress = int(job_data.get('segment_progress', '0') or 0)
             encode_progress = int((done / total) * 100) if total > 0 else 0
-            combine_progress = int(data.get(b'combine_progress', b'0').decode() or '0')
+            combine_progress = int(job_data.get('combine_progress', '0') or 0)
 
             jobs.append({
                 'job_id': job_id,
-                'filename': data.get(b'filename', b'UNKNOWN').decode(),
-                'status': data.get(b'status', b'UNKNOWN').decode(),
+                **job_data,  # include all fields from Redis
                 'segment_progress': segment_progress,
                 'encode_progress': encode_progress,
                 'combine_progress': combine_progress,
                 'elapsed': elapsed,
                 'started': started
-            }) 
+            })
         except Exception as e:
-            logger.warning(f"[{key}] Job error, skipping: {e}")           
-        
+            logger.warning(f"[{key}] Job error, skipping: {e}")
+    
     jobs.sort(key=lambda x: x['started'], reverse=True)
     return jsonify(jobs)
 
@@ -67,41 +70,8 @@ def job_properties(job_id):
     if not redis_client.exists(key):
         return jsonify({'error': 'Job not found'}), 404
 
-    job_data = redis_client.hgetall(key)
-    filename = job_data.get(b'filename', b'UNKNOWN').decode()
-    job_dir = job_data.get(b'job_dir', b'').decode()
-    segment_duration = int(job_data.get(b'segment_duration', b'10').decode() or 10)
-
-    def get_media_info(path):
-        try:
-            out = subprocess.check_output([
-                'ffprobe', '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height,duration',
-                '-of', 'json', path
-            ], text=True)
-            result = json.loads(out)['streams'][0]
-            return {
-                'file': os.path.basename(path),
-                'size': humanize.naturalsize(os.path.getsize(path)),
-                'width': result.get('width'),
-                'height': result.get('height'),
-                'duration': f"{float(result.get('duration', 0)):.1f} sec"
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    input_info = get_media_info(f"/watch/{filename}")
-    output_info = get_media_info(os.path.join(job_dir, 'output.mp4'))
-
-    return jsonify({
-        'Input File': input_info,
-        'Output File': output_info,
-        'Segment Length (sec)': segment_duration,
-        'Encoder': 'Intel VAAPI h264_vaapi',
-        'Quality': 'CQP QP=30',
-        'Audio': 'AAC 2ch 192k'
-    })
+    job_data = {k.decode(): v.decode() for k, v in redis_client.hgetall(key).items()}
+    return jsonify(job_data)
 
 
 @app.route('/add_task', methods=['POST'])
@@ -132,6 +102,8 @@ def delete_task(job_id):
         job_data = redis_client.hgetall(job_key)
         job_dir = job_data.get(b'job_dir', b'').decode() if b'job_dir' in job_data else None
 
+        app.logger.info (f"[{job_id}] Deleting {job_dir}")
+
         # Delete job record from Redis
         redis_client.delete(job_key)
 
@@ -145,3 +117,16 @@ def delete_task(job_id):
 
         return jsonify({'status': 'deleted'}), 200
     return jsonify({'status': 'not found'}), 404
+
+@app.route("/log/<job_id>")
+def serve_log(job_id):
+    job_key = f"job:{job_id}"
+    log_path = redis_client.hget(job_key, 'log_path')
+    if not log_path:
+        abort(404)
+    log_path = log_path.decode()
+    if not os.path.isfile(log_path):
+        abort(404)
+    with open(log_path) as f:
+        content = f.read()
+    return f"<pre style='white-space: pre-wrap;'>{content}</pre>"    
