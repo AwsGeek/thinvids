@@ -15,8 +15,8 @@ services:
   flaskapp:
     image: 127.0.0.1:5000/transcoder/flaskapp
     build:
-      context: ./flaskapp
-      dockerfile: Dockerfile
+      context: .                    # was ./flaskapp
+      dockerfile: flaskapp/Dockerfile
     restart: always
     environment:
       CELERY_BROKER: redis://redis:6379/0
@@ -40,7 +40,7 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     restart: always
-    command: python tasks.py run_huey
+    command: huey_consumer tasks.huey -w 1
     environment:
       CELERY_BROKER: redis://redis:6379/0
       CELERY_BACKEND: redis://redis:6379/1
