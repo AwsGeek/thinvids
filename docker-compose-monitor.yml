@@ -7,10 +7,6 @@ services:
       - "6379:6379"
     volumes:
       - vol_redis:/data
-    deploy:
-      placement: 
-        constraints: 
-          - node.hostname == swarm1
 
   flaskapp:
     image: 127.0.0.1:5000/transcoder/flaskapp
@@ -27,12 +23,7 @@ services:
       - redis
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks      # ⬅️ GlusterFS mount from host
-    deploy:
-      replicas: 1
-      placement: 
-        constraints: 
-          - node.role == manager
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
 
   worker:
     image: 127.0.0.1:5000/transcoder/worker
@@ -40,7 +31,7 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     restart: always
-    command: python tasks.py run_huey
+    command: celery -A tasks worker --loglevel=info --concurrency=1
     environment:
       CELERY_BROKER: redis://redis:6379/0
       CELERY_BACKEND: redis://redis:6379/1
@@ -48,7 +39,7 @@ services:
       - redis
     volumes:
       - vol_archives:/watch
-      - vol_chunks:/chunks      # ⬅️ GlusterFS mount from host
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
     deploy:
       replicas: 0
 
@@ -67,10 +58,7 @@ services:
       - flaskapp
     volumes:
       - vol_archives:/watch
-    deploy:
-      placement: 
-        constraints: 
-          - node.role == manager
+      - /mnt/chunks:/chunks      # ⬅️ GlusterFS mount from host
 
   node_exporter:
     image: prom/node-exporter
@@ -90,9 +78,6 @@ services:
       - monitoring
     deploy:
       mode: global
-      placement: 
-        constraints: 
-          - node.role != manager
 
   prometheus:
     image: prom/prometheus
@@ -107,10 +92,6 @@ services:
         mode: host
     networks:
       - monitoring
-    deploy:
-      placement: 
-        constraints: 
-          - node.role == manager
 
   grafana:
     image: grafana/grafana
@@ -123,10 +104,19 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     networks:
       - monitoring
+
+  redis_exporter:
+    image: oliver006/redis_exporter
+    environment:
+      - REDIS_ADDR=redis://192.168.0.120:6379
+    ports:
+      - target: 9121
+        published: 9121
+        mode: host
+    networks:
+      - monitoring
     deploy:
-      placement: 
-        constraints: 
-          - node.role == manager
+      mode: global
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
@@ -143,15 +133,14 @@ services:
       - monitoring
     deploy:
       mode: global
-      placement: 
-        constraints: 
-          - node.role != manager
+
 
 networks:
   monitoring:
     driver: overlay
 
 volumes:
+
   vol_redis:
     driver: local
     driver_opts:
@@ -165,13 +154,6 @@ volumes:
       type: nfs
       o: addr=192.168.0.5,nolock,soft
       device: :/volume1/shared/projects/media/archive
-
-  vol_chunks:
-    driver: local
-    driver_opts:
-      type: nfs
-      o: addr=192.168.0.5,nolock,soft
-      device: :/volume1/shared/projects/media/chunks
 
   vol_prometheus:
     driver: local

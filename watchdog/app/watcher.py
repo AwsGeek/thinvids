@@ -25,12 +25,12 @@ class VideoFileHandler(PatternMatchingEventHandler):
             except Exception as e:
                 logger.error(f"Failed to submit job: {e}")
         else:
-            logger.warn(f"File never stabilized: {filename}, skipping.")
+            logger.warning(f"File never stabilized: {filename}, skipping.")
 
     def wait_until_stable(self, path, checks=5, delay=10):
         last_size = -1
         stable_count = 0
-        for _ in range(checks * 5):
+        while True:
             try:
                 current_size = os.path.getsize(path)
             except FileNotFoundError:

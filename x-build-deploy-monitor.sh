@@ -1,3 +1,13 @@
+#!/bin/bash
+
+# Require node name prefix and SSH username as arguments
+if [ $# -ne 2 ]; then
+  echo "Usage: $0 <node_name_prefix> <ssh_username>"
+  exit 1
+fi
+
+prefix="$1"
+ssh_user="$2"
 PROM_FILE="./prometheus/prometheus.yml"
 BACKUP_FILE="./prometheus/prometheus.yml.bak"
 
@@ -14,8 +24,9 @@ echo "Discovered ${#nodes[@]} nodes with prefix '$prefix'"
 node_targets=()
 cadvisor_targets=()
 for node in "${nodes[@]}"; do
-  node_targets+=("\"${node}:9100\"")     # node-exporter port
-  cadvisor_targets+=("\"${node}:8080\"") # cadvisor port
+  ip=$(docker node inspect "$node" --format '{{ .Status.Addr }}')
+  node_targets+=("\"${ip}:9100\"")     # node-exporter port
+  cadvisor_targets+=("\"${ip}:8080\"") # cadvisor port
 done
 
 # Join IPs into target lists
@@ -55,6 +66,7 @@ scrape_configs:
 EOF
 
 echo "Updated $PROM_FILE with new node and cadvisor targets."
+
 
 docker compose build && docker compose push && docker stack deploy --prune --compose-file ./docker-compose.yml transcoder
 

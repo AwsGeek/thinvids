@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Require node name prefix and SSH username as arguments
-if [ $# -ne 2 ]; then
-  echo "Usage: $0 <node_name_prefix> <ssh_username>"
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <node_name_prefix>"
   exit 1
 fi
 
 prefix="$1"
-ssh_user="$2"
+ssh_user="jerry"
 
 # Discover node names matching the prefix
 nodes=($(docker node ls --format '{{.Hostname}}' | grep "^${prefix}"))
@@ -20,10 +20,9 @@ fi
 # Collect lines: each will be hostname<TAB>IP<TAB>username
 host_ips=()
 for node in "${nodes[@]}"; do
-  ip=$(docker node inspect "$node" --format '{{ .Status.Addr }}')
-  host_ips+=("$node	$ip	$ssh_user")
+  host_ips+=("$node	$ssh_user")
 done
 
 # Run log tailing in parallel
 parallel --lb -j 0 --colsep '\t' --tagstring '{1}' \
-  'ssh -o LogLevel=ERROR -t {3}@{2} "sudo docker compose logs -f"' ::: "${host_ips[@]}"
+  'ssh -o LogLevel=ERROR -t {2}@{1} "sudo docker compose logs -f"' ::: "${host_ips[@]}"

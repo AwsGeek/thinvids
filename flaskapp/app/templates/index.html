@@ -5,32 +5,33 @@
   <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
   <style>
-    #task-table th, #task-table td {
-      padding: 0.5rem;
-      border: 1px solid #e5e7eb;
-    }
-    .fixed-progress-col {
-      width: 120px;
-    }
+    #job-table th, #job-table td { padding: 0.5rem; border: 1px solid #e5e7eb; }
+    .fixed-progress-col { width: 120px; }
+    .elapsed-time { font-size: 0.75rem; color: #4B5563; text-align: center; margin-top: 0.25rem; }
+    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: 0.5rem 1rem; border-radius: 0.25rem; color: white; z-index: 1000; }
   </style>
 </head>
 <body class="bg-gray-100">
   <div class="container mx-auto p-4">
-    <h1 class="text-2xl font-bold mb-4">Video Encoding Manager</h1>
-
-    <div class="mb-6">
-      <h2 class="text-xl font-semibold mb-2">Add New Job</h2>
-      <div class="flex gap-2">      
-        <input id="filename" type="text" placeholder="Enter filename (e.g., video.mp4)"
-               class="border p-2 rounded w-full">
-        <button onclick="addTask()" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">
-          Add Job
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-bold">Video Encoding Manager</h1>
+      <div class="flex items-center gap-2">
+        <label for="sort-by" class="text-sm text-gray-700">Sort by:</label>
+        <select id="sort-by" class="border rounded px-2 py-1 text-sm">
+          <option value="date" selected>Date</option>
+          <option value="filename">Filename</option>
+          <option value="status">Status</option>
+          <option value="encode">Encode %</option>
+        </select>
+        <button id="open-global-settings" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+          <span class="material-icons">settings</span>
+          Global Settings
         </button>
       </div>
     </div>
 
     <h2 class="text-xl font-semibold mb-2">Current Jobs</h2>
-    <table id="task-table" class="w-full border-collapse bg-white">
+    <table id="job-table" class="w-full border-collapse bg-white">
       <thead>
         <tr class="bg-gray-200">
           <th>Job ID</th>
@@ -44,104 +45,109 @@
           <th>Actions</th>
         </tr>
       </thead>
-      <tbody id="task-list"></tbody>
+      <tbody id="job-list"></tbody>
     </table>
   </div>
 
   <!-- Properties Modal -->
   <div id="properties-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
     <div class="bg-white rounded shadow-lg w-full max-w-2xl p-6 relative">
-      <button onclick="closeModal()" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+      <button onclick="closeModal('properties-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
         <span class="material-icons">close</span>
       </button>
       <h2 class="text-xl font-semibold mb-4">Job Properties</h2>
-      <div id="modal-content" class="space-y-2 text-sm font-mono whitespace-pre-wrap"></div>
+      <div id="properties-content" class="space-y-2 text-sm font-mono whitespace-pre-wrap"></div>
+    </div>
+  </div>
+
+  <!-- Per-Job Settings Modal -->
+  <div id="job-settings-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+    <div class="bg-white rounded shadow-lg w-full max-w-lg p-6 relative">
+      <button onclick="closeModal('job-settings-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+        <span class="material-icons">close</span>
+      </button>
+      <h2 class="text-xl font-semibold mb-4">Job Settings</h2>
+
+      <form id="job-settings-form" class="space-y-4" onsubmit="return false;">
+        <input type="hidden" id="settings-job-id" value="">
+        <div>
+          <label class="block text-sm font-medium mb-1" for="settings-filename">Filename</label>
+          <input id="settings-filename" type="text" class="border p-2 rounded w-full" disabled>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-sm font-medium mb-1" for="settings-segment-duration">Segment Length (s)</label>
+            <input id="settings-segment-duration" type="number" min="1" max="300" class="border p-2 rounded w-full">
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1" for="settings-number-parts">Number of Parts</label>
+            <input id="settings-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
+          </div>
+        </div>
+
+        <div class="flex gap-2 pt-2">
+          <button id="save-job-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 hidden">Save</button>
+          <button id="start-job-btn" class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 hidden">Start Job</button>
+          <button type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300" onclick="closeModal('job-settings-modal')">Close</button>
+        </div>
+        <div id="job-settings-help" class="text-xs text-gray-600"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Global Settings Modal -->
+  <div id="global-settings-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+    <div class="bg-white rounded shadow-lg w-full max-w-lg p-6 relative">
+      <button onclick="closeModal('global-settings-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+        <span class="material-icons">close</span>
+      </button>
+      <h2 class="text-xl font-semibold mb-4">Global Settings</h2>
+      <form id="global-settings-form" class="space-y-4" onsubmit="return false;">
+        <div>
+          <label class="block text-sm font-medium mb-1" for="global-segment-duration">Segment Length (seconds)</label>
+          <input id="global-segment-duration" type="number" min="1" max="300" class="border p-2 rounded w-full">
+          <div class="text-xs text-gray-600 mt-1">Enter 1–300 seconds. Default is 10.</div>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1" for="global-number-parts">Number of Parts</label>
+          <input id="global-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
+          <div class="text-xs text-gray-600 mt-1">Split the video into 1–8 parts. Default is 2.</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <input id="global-auto-start" type="checkbox" class="h-4 w-4">
+          <label for="global-auto-start" class="text-sm">Automatically start encode jobs</label>
+        </div>
+        <div class="flex gap-2 pt-2">
+          <button id="save-global-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Save</button>
+          <button type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300" onclick="closeModal('global-settings-modal')">Close</button>
+        </div>
+      </form>
     </div>
   </div>
 
   <script>
-    function closeModal() {
-      document.getElementById('properties-modal').classList.add('hidden');
+    // ---------- Utils ----------
+    function toast(message, ok=true) {
+      const el = document.createElement('div');
+      el.textContent = message;
+      el.className = `toast ${ok ? 'bg-green-500' : 'bg-red-500'}`;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 2000);
     }
-
-    async function showProperties(job_id) {
-      const res = await fetch(`/job_properties/${job_id}`);
-      if (!res.ok) return alert('Failed to load properties');
-
-      const data = await res.json();
-      const modal = document.getElementById('properties-modal');
-      const content = document.getElementById('modal-content');
-
-      content.innerText = JSON.stringify(data, null, 2);
-      modal.classList.remove('hidden');
-    }    
+    function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
     function formatElapsed(seconds) {
-      const mins = Math.floor(seconds / 60);
-      const secs = seconds % 60;
+      const s = Number(seconds || 0);
+      const mins = Math.floor(s / 60);
+      const secs = Math.floor(s % 60);
       return `${mins}m ${secs}s`;
     }
-
     function formatDateTime(timestamp) {
       if (!timestamp || isNaN(timestamp)) return '';
       const dt = new Date(timestamp * 1000);
       return dt.toLocaleString();
-    }    
-    async function fetchTasks() {
-      const response = await fetch('/tasks');
-      const jobs = await response.json();
-      const taskList = document.getElementById('task-list');
-      taskList.innerHTML = '';
-
-      jobs.forEach(job => {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-          <td class="text-xs break-all">${job.job_id}</td>
-          <td>${job.filename}</td>
-          <td class="fixed-progress-col">${progressBar(job.segment_progress)}</td>
-          <td class="fixed-progress-col">${progressBar(job.encode_progress)}</td>
-          <td class="fixed-progress-col">${progressBar(job.combine_progress)}</td>
-          <td>${formatDateTime(job.started)}</td>
-          <td>${formatElapsed(job.elapsed)}</td>                  
-          <td>
-            ${
-              job.status === 'FAILED' && job.log_path
-                ? `<a href="/log/${job.job_id}" class="font-medium text-red-600 underline">FAILED</a>`
-                : `<span class="font-medium ${
-                    job.status === 'COMPLETED'
-                      ? 'text-green-600'
-                      : job.status === 'FAILED'
-                      ? 'text-red-600'
-                      : 'text-yellow-600'
-                  }">${job.status}</span>`
-            }
-          </td>          
-          <td class="text-center flex items-center justify-center gap-1">
-            <button onclick="copyTask('${job.filename}')" title="Copy">
-              <span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span>
-            </button>
-            <button onclick="deleteTask('${job.job_id}')" title="Delete">
-              <span class="material-icons text-red-600 hover:text-red-800">delete</span>
-            </button>
-            <button onclick="showProperties('${job.job_id}')" title="Properties">
-              <span class="material-icons text-gray-700 hover:text-black">info</span>
-            </button>            
-          </td>
-        `;
-        taskList.appendChild(row);
-
-        const detailRow = document.createElement('tr');
-        detailRow.id = `job-${job.job_id}-details`;
-        detailRow.classList.add('hidden', 'bg-gray-50');
-        detailRow.innerHTML = `
-          <td colspan="7" class="p-2">
-            <div id="tasks-${job.job_id}" class="space-y-1 text-sm"></div>
-          </td>
-        `;
-        taskList.appendChild(detailRow);
-      });
     }
-
     function progressBar(percent) {
+      percent = Number(percent || 0);
       return `
         <div class="relative w-full h-4 bg-gray-200 rounded">
           <div class="absolute top-0 left-0 h-4 bg-blue-500 rounded" style="width: ${percent}%"></div>
@@ -149,43 +155,319 @@
         </div>
       `;
     }
-    async function addTask() {
-      const filename = document.getElementById('filename').value;
-      const response = await fetch('/add_task', {
+
+    // ---------- Global Settings ----------
+    async function showGlobalSettings() {
+      const res = await fetch('/global_settings');
+      if (!res.ok) return alert('Failed to load global settings');
+      const data = await res.json();
+      document.getElementById('global-segment-duration').value = data.segment_duration ?? 10;
+      document.getElementById('global-number-parts').value = data.number_parts ?? 2;
+      document.getElementById('global-auto-start').checked = !!data.auto_start;
+      document.getElementById('global-settings-modal').classList.remove('hidden');
+    }
+    async function saveGlobalSettings() {
+      const segment_duration = parseInt(document.getElementById('global-segment-duration').value, 10);
+      const number_parts = parseInt(document.getElementById('global-number-parts').value, 10);
+      const auto_start = document.getElementById('global-auto-start').checked;
+
+      const res = await fetch('/global_settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename })
+        body: JSON.stringify({ segment_duration, number_parts, auto_start })
       });
-      const result = await response.json();
-      if (result.status === 'success') {
-        document.getElementById('filename').value = '';
-        fetchTasks();
+      if (res.ok) {
+        toast('Saved global settings', true);
+        closeModal('global-settings-modal');
       } else {
-        alert(result.message);
+        const msg = await res.text();
+        toast(msg || 'Failed to save global settings', false);
       }
     }
-    async function copyTask(filename) {
-      if (!filename) return;
-      await fetch('/add_task', {
+    document.getElementById('open-global-settings').addEventListener('click', showGlobalSettings);
+    document.getElementById('save-global-settings-btn').addEventListener('click', saveGlobalSettings);
+
+    // ---------- Job Info / Properties ----------
+    async function showProperties(job_id) {
+      const res = await fetch(`/job_properties/${job_id}`);
+      if (!res.ok) return alert('Failed to load properties');
+      const data = await res.json();
+      document.getElementById('properties-content').innerText = JSON.stringify(data, null, 2);
+      document.getElementById('properties-modal').classList.remove('hidden');
+    }
+
+    // ---------- Per-Job Settings ----------
+    async function showJobSettings(job_id) {
+      const res = await fetch(`/job_settings/${job_id}`);
+      if (!res.ok) return alert('Failed to load settings');
+      const data = await res.json();
+      const paused = (data.status === 'PAUSED');
+
+      document.getElementById('settings-job-id').value = job_id;
+      document.getElementById('settings-filename').value = data.filename || '';
+      document.getElementById('settings-segment-duration').value = data.segment_duration || 10;
+      document.getElementById('settings-number-parts').value = data.number_parts || 2;
+
+      document.getElementById('settings-segment-duration').disabled = !paused;
+      document.getElementById('settings-number-parts').disabled = !paused;
+
+      document.getElementById('save-job-settings-btn').classList.toggle('hidden', !paused);
+      document.getElementById('start-job-btn').classList.toggle('hidden', !paused);
+
+      document.getElementById('job-settings-help').innerHTML = paused
+        ? 'This job is <strong>PAUSED</strong>. You can change settings and then start the job.'
+        : 'This job is active or finished. Settings are read-only.';
+
+      document.getElementById('save-job-settings-btn').onclick = saveJobSettings;
+      document.getElementById('start-job-btn').onclick = () => startJob(job_id);
+
+      document.getElementById('job-settings-modal').classList.remove('hidden');
+    }
+
+    async function saveJobSettings() {
+      const job_id = document.getElementById('settings-job-id').value;
+      const segment_duration = parseInt(document.getElementById('settings-segment-duration').value, 10);
+      const number_parts = parseInt(document.getElementById('settings-number-parts').value, 10);
+
+      const res = await fetch(`/job_settings/${job_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename })
+        body: JSON.stringify({ segment_duration, number_parts })
       });
-      fetchTasks();
-    }
-
-    async function deleteTask(job_id) {
-      if (!confirm('Are you sure you want to delete this job?')) return;
-      const response = await fetch(`/delete_task/${job_id}`, { method: 'DELETE' });
-      if (response.ok) {
-        fetchTasks();
+      if (res.ok) {
+        closeModal('job-settings-modal');
+        fetchJobs();
       } else {
-        alert('Failed to delete job');
+        const msg = await res.text();
+        alert(msg || 'Failed to save settings');
       }
     }
 
-    setInterval(fetchTasks, 5000);
-    fetchTasks();
+    // ---------- Jobs CRUD ----------
+    async function copyJob(job_id) {
+      try {
+        const response = await fetch('/copy_job', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id })
+        });
+        const result = await response.json();
+        if (response.ok && result.status === 'success') {
+          const toast = document.createElement('div');
+          toast.textContent = `Copied job ${job_id} → ${result.job_id} (PAUSED)`;
+          toast.className = 'toast bg-green-500';
+          document.body.appendChild(toast);
+          setTimeout(() => toast.remove(), 2000);
+          fetchJobs();
+        } else {
+          throw new Error(result.message || 'Failed to copy job');
+        }
+      } catch (err) {
+        console.error(err);
+        const toast = document.createElement('div');
+        toast.textContent = `Copy failed: ${err.message}`;
+        toast.className = 'toast bg-red-500';
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 2500);
+      }
+    }
+
+    async function deleteJob(job_id) {
+      if (!confirm('Delete this job?')) return;
+      const response = await fetch(`/delete_job/${job_id}`, { method: 'DELETE' });
+      if (response.ok) fetchJobs(); else alert('Failed to delete job');
+    }
+
+    async function stopJob(job_id) {
+      if (!confirm('Stop this job? This will abort all tasks but keep the project directory.')) return;
+      const response = await fetch(`/stop_job/${job_id}`, { method: 'POST' });
+      if (response.ok) fetchJobs(); else alert('Failed to stop job');
+    }
+
+    async function startJob(job_id) {
+      const response = await fetch(`/start_job/${job_id}`, { method: 'POST' });
+      if (response.ok) fetchJobs(); else alert('Failed to start job');
+    }
+
+    async function restartJob(job_id) {
+      const response = await fetch(`/restart_job/${job_id}`, { method: 'POST' });
+      if (response.ok) fetchJobs(); else alert('Failed to restart job');
+    }
+
+    // ---------- Sorting ----------
+    let CURRENT_SORT = 'date'; // default
+
+    function statusRank(s) {
+      const order = {
+        'PAUSED': 0,
+        'QUEUED': 1,
+        'SEGMENTING': 2, 'SEG': 2,
+        'ENCODING': 3, 'ENC': 3,
+        'STITCHING': 4, 'FINAL_STITCHING': 4,
+        'MOVING': 5, 'CLEANUP': 6,
+        'COMPLETED': 7,
+        'FAILED': 8,
+        'ABORTED': 9
+      };
+      const key = Object.keys(order).find(k => s && s.startsWith(k)) || s;
+      return order[key] ?? 99;
+    }
+
+    function compareJobs(a, b) {
+      switch (CURRENT_SORT) {
+        case 'filename': {
+          const af = (a.filename || '').toLowerCase();
+          const bf = (b.filename || '').toLowerCase();
+          if (af < bf) return -1;
+          if (af > bf) return 1;
+          return 0;
+        }
+        case 'status': {
+          const ar = statusRank(a.status || '');
+          const br = statusRank(b.status || '');
+          if (ar !== br) return ar - br;
+          const af = (a.filename || '').toLowerCase();
+          const bf = (b.filename || '').toLowerCase();
+          if (af < bf) return -1;
+          if (af > bf) return 1;
+          return 0;
+        }
+        case 'encode': {
+          const ae = Number(a.encode_progress || 0);
+          const be = Number(b.encode_progress || 0);
+          if (ae !== be) return be - ae;
+          if (a.started !== b.started) return b.started - a.started;
+          const af = (a.filename || '').toLowerCase();
+          const bf = (b.filename || '').toLowerCase();
+          if (af < bf) return -1;
+          if (af > bf) return 1;
+          return 0;
+        }
+        case 'date':
+        default: {
+          const aPaused = Number(a.started || 0) === 0;
+          const bPaused = Number(b.started || 0) === 0;
+          if (aPaused && bPaused) {
+            return Number(b.created || 0) - Number(a.created || 0);
+          }
+          if (aPaused && !bPaused) return -1;
+          if (!aPaused && bPaused) return 1;
+          return Number(b.started || 0) - Number(a.started || 0);
+        }
+      }
+    }
+
+    document.getElementById('sort-by').addEventListener('change', (e) => {
+      CURRENT_SORT = e.target.value || 'date';
+      fetchJobs(true); // re-render using cache
+    });
+
+    // ---------- Table render ----------
+    async function fetchJobs(skipFetch = false) {
+      let jobs;
+      if (!skipFetch) {
+        const response = await fetch('/jobs');
+        jobs = await response.json();
+        window.__JOBS_CACHE__ = jobs;
+      } else {
+        jobs = window.__JOBS_CACHE__ || [];
+      }
+
+      jobs = jobs.slice().sort(compareJobs);
+
+      const jobList = document.getElementById('job-list');
+      jobList.innerHTML = '';
+
+      jobs.forEach(job => {
+        const row = document.createElement('tr');
+        const isTerminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(job.status);
+        const canStart = job.status === 'PAUSED';
+        const canStop  = !isTerminal && !canStart; // running/queued
+        const canRestart = isTerminal;
+
+        const vcrBtnHtml = canStart
+          ? `<button class="vcr-start-btn" title="Start"><span class="material-icons text-green-600 hover:text-green-800">play_circle</span></button>`
+          : (canStop
+              ? `<button class="vcr-stop-btn" title="Stop"><span class="material-icons text-orange-600 hover:text-orange-800">stop_circle</span></button>`
+              : (canRestart
+                ? `<button class="vcr-restart-btn" title="Restart"><span class="material-icons text-orange-600 hover:text-orange-800">change_circle</span></button>`
+                : ''));
+
+        row.innerHTML = `
+          <td class="text-xs break-all">${job.job_id}</td>
+          <td>${job.filename || 'N/A'}</td>
+          <td class="fixed-progress-col">
+            ${progressBar(job.segment_progress || 0)}
+            <div class="elapsed-time">${formatElapsed(job.segment_elapsed || 0)}</div>
+          </td>
+          <td class="fixed-progress-col">
+            ${progressBar(job.encode_progress || 0)}
+            <div class="elapsed-time">${formatElapsed(job.encode_elapsed || 0)}</div>
+          </td>
+          <td class="fixed-progress-col">
+            ${progressBar(job.combine_progress || 0)}
+            <div class="elapsed-time">${formatElapsed(job.combine_elapsed || 0)}</div>
+          </td>
+          <td>${formatDateTime(job.started)}</td>
+          <td>${formatElapsed(job.elapsed)}</td>
+          <td>
+            ${
+              job.status === 'FAILED' && job.log_path
+                ? `<a href="/log/${job.job_id}" class="font-medium text-red-600 underline">FAILED</a>`
+                : job.status === 'ABORTED' && job.job_dir
+                ? `<a href="/job_files/${job.job_id}" class="font-medium text-orange-600 underline">ABORTED</a>`
+                : `<span class="font-medium ${
+                    job.status === 'COMPLETED'
+                      ? 'text-green-600'
+                      : job.status === 'FAILED'
+                      ? 'text-red-600'
+                      : job.status === 'ABORTED'
+                      ? 'text-orange-600'
+                      : job.status === 'PAUSED'
+                      ? 'text-gray-600'
+                      : (job.status === 'STITCHING' || job.status === 'FINAL_STITCHING')
+                      ? 'text-blue-600'
+                      : 'text-yellow-600'
+                  }">${job.status}</span>`
+            }
+          </td>
+          <td class="text-center flex items-center justify-center gap-1">
+            ${job.filename && job.filename !== 'undefined'
+              ? `<button class="copy-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>`
+              : ''}
+            <button class="delete-btn" title="Delete">
+              <span class="material-icons text-red-600 hover:text-red-800">delete</span>
+            </button>
+            <button class="properties-btn" title="Properties">
+              <span class="material-icons text-gray-700 hover:text-black">info</span>
+            </button>
+            <button class="settings-btn" title="Settings">
+              <span class="material-icons text-gray-700 hover:text-black">settings</span>
+            </button>
+            ${vcrBtnHtml}
+          </td>
+        `;
+        jobList.appendChild(row);
+
+        const copyBtn = row.querySelector('.copy-btn');
+        if (copyBtn) {
+          copyBtn.addEventListener('click', () => {
+            // Copy this job by ID (always creates a PAUSED job)
+            copyJob(job.job_id);
+          });
+        }        
+        row.querySelector('.delete-btn').addEventListener('click', () => deleteJob(job.job_id));
+        row.querySelector('.properties-btn').addEventListener('click', () => showProperties(job.job_id));
+        row.querySelector('.settings-btn').addEventListener('click', () => showJobSettings(job.job_id));
+        row.querySelector('.vcr-start-btn')?.addEventListener('click', () => startJob(job.job_id));
+        row.querySelector('.vcr-stop-btn')?.addEventListener('click', () => stopJob(job.job_id));
+        row.querySelector('.vcr-restart-btn')?.addEventListener('click', () => restartJob(job.job_id));
+      });
+    }
+
+    // poll
+    setInterval(() => fetchJobs(false), 5000);
+    fetchJobs(false);
   </script>
 </body>
 </html>
