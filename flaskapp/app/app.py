@@ -21,6 +21,12 @@ redis_client = redis.Redis(host='redis', port=6379, db=1, decode_responses=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+STATUS_READY = 'READY'
+STATUS_RUNNING = 'RUNNING'
+STATUS_STOPPED = 'STOPPED'
+STATUS_FAILED = 'FAILED'
+STATUS_DONE    = 'DONE'
+
 # -------------------------- Views --------------------------
 @app.route('/')
 def index():
@@ -129,11 +135,11 @@ def add_job():
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
 
-    # Placeholders until worker probes the source
+    status = STATUS_RUNNING if auto_start_effective else STATUS_READY
     job_settings = {
         'job_id': job_id,
         'filename': filename,
-        'status': 'QUEUED' if auto_start_effective else 'PAUSED',
+        'status': status,
         'created_at': now,
         'started_at': now if auto_start_effective else '0',
         'total_chunks': 0,
@@ -205,9 +211,9 @@ def copy_job():
     new_job = {
         'job_id': new_job_id,
         'filename': filename,
-        'status': 'PAUSED',              # always paused when copied
+        'status': STATUS_READY,
         'created_at': str(now),
-        'started_at': '0',               # not started yet
+        'started_at': '0',
         'segment_duration': segment_duration,
         'number_parts': number_parts,
         'total_chunks': 0,
@@ -229,16 +235,17 @@ def start_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if job.get('status') != 'PAUSED':
-        return jsonify({'status': 'invalid', 'message': 'Job is not in PAUSED state'}), 400
+    if job.get('status') != STATUS_READY:
+        return jsonify({'status': 'invalid', 'message': 'Job is not in READY state'}), 400
 
     filename = job.get('filename')
     if not filename:
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
     now = str(time.time())
-    redis_client.hset(job_key, mapping={'status': 'QUEUED', 'started_at': now})
+    redis_client.hset(job_key, mapping={'status': STATUS_RUNNING, 'started_at': now})
     segment_video(job_id, f'/watch/{filename}', filename)
+
     return jsonify({'status': 'started'}), 200
 
 @app.post('/restart_job/<job_id>')
@@ -248,8 +255,8 @@ def restart_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if not job.get('status') in ['COMPLETED', 'FAILED', 'ABORTED']:
-        return jsonify({'status': 'invalid', 'message': 'Job is not in terminal state.'}), 400
+    if job.get('status') not in [STATUS_STOPPED, STATUS_FAILED]:
+        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED state.'}), 400
 
     filename = job.get('filename')
     if not filename:
@@ -289,7 +296,7 @@ def restart_job(job_id):
     new_job = {
         'job_id': job_id,
         'filename': filename,
-        'status': 'QUEUED',
+        'status': STATUS_RUNNING,
         'created_at': str(now),
         'started_at': str(now),
         'segment_duration': segment_duration,
@@ -311,11 +318,9 @@ def stop_job(job_id):
     if not redis_client.exists(job_key):
         return jsonify({'status': 'not found'}), 404
 
-    redis_client.hset(job_key, 'status', 'ABORTED')
-    # best-effort revoke; background task ids differ, but keep parity with prior behavior
+    redis_client.hset(job_key, 'status', STATUS_STOPPED)
     huey.revoke_by_id(job_id)
-    logger.info(f"[{job_id}] Stopped job and attempted to revoke tasks")
-    return jsonify({'status': 'aborted'}), 200
+    return jsonify({'status': 'stopped'}), 200
 
 
 @app.delete('/delete_job/<job_id>')

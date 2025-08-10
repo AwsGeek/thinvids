@@ -140,10 +140,10 @@
     }
     function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
     function formatElapsed(seconds) {
-      const s = Number(seconds || 0);
-      const mins = Math.floor(s / 60);
-      const secs = Math.floor(s % 60);
-      return `${mins}m ${secs}s`;
+      if (seconds == null || isNaN(seconds)) return '';
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${m}:${String(s).padStart(2, '0')}`;
     }
     function formatDateTime(timestamp) {
       if (!timestamp || isNaN(timestamp)) return '';
@@ -316,18 +316,13 @@
 
     function statusRank(s) {
       const order = {
-        'PAUSED': 0,
-        'QUEUED': 1,
-        'SEGMENTING': 2, 'SEG': 2,
-        'ENCODING': 3, 'ENC': 3,
-        'STITCHING': 4, 'FINAL_STITCHING': 4,
-        'MOVING': 5, 'CLEANUP': 6,
-        'COMPLETED': 7,
-        'FAILED': 8,
-        'ABORTED': 9
+        'READY': 0,
+        'RUNNING': 1,
+        'STOPPED': 2,
+        'FAILED': 3,
+        'DONE': 4
       };
-      const key = Object.keys(order).find(k => s && s.startsWith(k)) || s;
-      return order[key] ?? 99;
+      return order[s] ?? 99;
     }
 
     function compareJobs(a, b) {
@@ -408,10 +403,16 @@
         const codecDisp = job.source_codec || '…';
         const fpsDisp = formatFPS(job.source_fps);
 
-        const isTerminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(job.status);
-        const canStart = job.status === 'PAUSED';
-        const canStop  = !isTerminal && !canStart; // running/queued
-        const canRestart = isTerminal;
+        const isTerminal = (job.status === 'FAILED'); // no completed state now
+        const canStart   = job.status === 'READY';
+        const canStop    = job.status === 'RUNNING';
+        const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED');
+
+        const totalChunks = Number(job.total_chunks || 0);
+        const segCount    = Number(job.segmented_chunks || 0);
+        const encCount    = Number(job.completed_chunks || 0);
+        // For stitch, we approximate based on progress (ffmpeg concat doesn’t emit file index)
+        const stitchedApprox = totalChunks > 0 ? Math.floor((Number(job.combine_progress || 0) / 100) * totalChunks) : 0;
 
         const vcrBtnHtml = canStart
           ? `<button class="vcr-start-btn" title="Start"><span class="material-icons text-green-600 hover:text-green-800">play_circle</span></button>`
@@ -432,39 +433,36 @@
 
           <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.segment_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.segment_elapsed || 0)}</div>
-          </td>
-          <td class="px-2 py-1 text-center w-28">
-            ${progressBar(job.encode_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.encode_elapsed || 0)}</div>
-          </td>
-          <td class="px-2 py-1 text-center w-28">
-            ${progressBar(job.combine_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.combine_elapsed || 0)}</div>
+            <div class="text-gray-600 text-xs text-center mt-1">
+              ${formatElapsed(job.segment_elapsed || 0)} ${segCount}/${totalChunks || '…'}
+            </div>
           </td>
 
+          <td class="px-2 py-1 text-center w-28">
+            ${progressBar(job.encode_progress || 0)}
+            <div class="text-gray-600 text-xs text-center mt-1">
+              ${formatElapsed(job.encode_elapsed || 0)} ${encCount}/${totalChunks || '…'}
+            </div>
+          </td>
+
+          <td class="px-2 py-1 text-center w-28">
+            ${progressBar(job.combine_progress || 0)}
+            <div class="text-gray-600 text-xs text-center mt-1">
+              ${formatElapsed(job.combine_elapsed || 0)} ${stitchedApprox}/${totalChunks || '…'}
+            </div>
+          </td>
           <td class="px-2 py-1 whitespace-normal break-words">${formatDateTime(job.started)}</td>
           <td class="px-2 py-1">${formatElapsed(job.elapsed)}</td>
           <td class="px-2 py-1">
-            ${
-              job.status === 'FAILED' && job.log_path
-                ? `<a href="/log/${job.job_id}" class="font-medium text-red-600 underline">FAILED</a>`
-                : job.status === 'ABORTED' && job.job_dir
-                ? `<a href="/job_files/${job.job_id}" class="font-medium text-orange-600 underline">ABORTED</a>`
-                : `<span class="font-medium ${
-                    job.status === 'COMPLETED'
-                      ? 'text-green-600'
-                      : job.status === 'FAILED'
-                      ? 'text-red-600'
-                      : job.status === 'ABORTED'
-                      ? 'text-orange-600'
-                      : job.status === 'PAUSED'
-                      ? 'text-gray-600'
-                      : (job.status === 'STITCHING' || job.status === 'FINAL_STITCHING')
-                      ? 'text-blue-600'
-                      : 'text-yellow-600'
-                  }">${job.status}</span>`
-            }
+            <span class="font-medium ${
+              job.status === 'READY'  ? 'text-gray-700'  :
+              job.status === 'RUNNING'? 'text-blue-600' :
+              job.status === 'STOPPED'? 'text-orange-600' :
+              job.status === 'FAILED' ? 'text-red-600'  :
+              job.status === 'DONE'   ? 'text-green-600':
+                                        'text-gray-700'
+            }">${job.status || 'READY'}
+            </span>          
           </td>
           <td class="px-2 py-1">
             <div class="flex items-center justify-center gap-1">
