@@ -21,7 +21,7 @@ redis_client = redis.Redis(host='redis', port=6379, db=1, decode_responses=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-STATUS_READY = 'READY'
+STATUS_READY = 'READY' 
 STATUS_RUNNING = 'RUNNING'
 STATUS_STOPPED = 'STOPPED'
 STATUS_FAILED = 'FAILED'
