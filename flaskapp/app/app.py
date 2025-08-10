@@ -9,7 +9,7 @@ import humanize
 import shutil
 
 # import backend task planner
-from tasks import segment_video
+from tasks import segment_video, probe_source
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -109,8 +109,6 @@ def list_jobs():
 
     return jsonify(jobs)
 
-
-
 @app.post('/add_job')
 def add_job():
     data = request.get_json(silent=True) or {}
@@ -120,18 +118,18 @@ def add_job():
     if not filename or not filename.endswith(('.mkv', '.mp4')):
         return jsonify({'status': 'error', 'message': 'Invalid file format'}), 400
 
+    full_path = os.path.join("/watch", filename.lstrip('/'))
     job_id = str(uuid.uuid4())
     now = str(time.time())
     global_settings = redis_client.hgetall('settings:global') or {}
-    logger.info(f"[{job_id}] Global settings: {global_settings}")
 
     auto_start_global = global_settings.get('auto_start', '1') == '1'
-    # If force_paused, we ignore global auto start
     auto_start_effective = (auto_start_global and not force_paused)
 
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
 
+    # Placeholders until worker probes the source
     job_settings = {
         'job_id': job_id,
         'filename': filename,
@@ -142,10 +140,21 @@ def add_job():
         'completed_chunks': 0,
         'stitched_chunks': 0,
         'segment_duration': segment_duration,
-        'number_parts': number_parts
+        'number_parts': number_parts,
+        # placeholders (worker fills in)
+        'source_codec': '',
+        'source_resolution': '',
+        'source_duration': '0',
+        'source_fps': '0',
+        'source_file_size': 0,
+        'total_frames': 0
     }
     redis_client.hset(f"job:{job_id}", mapping=job_settings)
 
+    # Kick off async probe on a worker
+    probe_source(job_id, full_path)
+
+    # Optionally auto-start segmentation
     if auto_start_effective:
         segment_video(job_id, f'/watch/{filename}', filename)
 

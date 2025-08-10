@@ -26,6 +26,118 @@ def is_job_halted(job_id):
         return True
     return status in ("FAILED", "ABORTED")
 
+# --- add near the top with the other imports in worker/app/tasks.py ---
+import shlex
+
+# --- add alongside other @huey.task() defs ---
+@huey.task()
+def probe_source(job_id: str, file_path: str):
+    """
+    Lightweight async probe task. Extracts file size, duration, codec, resolution, fps
+    and stores them into job:{job_id} as:
+      - source_file_size (int bytes)
+      - source_duration (float seconds)
+      - source_codec (str)
+      - source_resolution (e.g., "1920x1080")
+      - source_fps (float)
+      - total_frames (int, if available / best-effort)
+    Safe to run before or without starting segmentation.
+    """
+    job_key = f"job:{job_id}"
+    try:
+        if not os.path.exists(file_path):
+            # If path isn't accessible on this node, try a direct path from job (if any)
+            job = redis_client.hgetall(job_key) or {}
+            alt = job.get('filename')
+            if alt and os.path.exists(alt):
+                file_path = alt
+
+        # Format & stream probes
+        fmt_cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration,size',
+            '-of', 'json',
+            file_path
+        ]
+        v_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,width,height,avg_frame_rate,nb_frames',
+            '-of', 'json',
+            file_path
+        ]
+
+        def _run(cmd):
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+            return json.loads(res.stdout or '{}')
+
+        fmt = {}
+        vid = {}
+        try:
+            fmt = _run(fmt_cmd).get('format', {}) or {}
+        except Exception as e:
+            logger.warning(f"VEM [{job_id}] ffprobe format failed: {e}")
+
+        try:
+            streams = _run(v_cmd).get('streams', []) or []
+            vid = streams[0] if streams else {}
+        except Exception as e:
+            logger.warning(f"VEM [{job_id}] ffprobe video stream failed: {e}")
+
+        # Parse values
+        size_b = int(fmt.get('size', 0)) if str(fmt.get('size', '')).isdigit() else 0
+        try:
+            duration_s = float(fmt.get('duration', 0) or 0)
+        except Exception:
+            duration_s = 0.0
+
+        codec = vid.get('codec_name') or ''
+        width = vid.get('width') or 0
+        height = vid.get('height') or 0
+        reso = f"{width}x{height}" if width and height else ''
+
+        # fps: avg_frame_rate can be "30000/1001"
+        afr = vid.get('avg_frame_rate') or '0'
+        try:
+            if '/' in afr:
+                num, den = afr.split('/', 2)
+                fps = float(num) / float(den) if float(den) != 0 else 0.0
+            else:
+                fps = float(afr)
+        except Exception:
+            fps = 0.0
+
+        # frames best-effort
+        nb_frames = vid.get('nb_frames')
+        try:
+            total_frames = int(nb_frames) if (nb_frames is not None and str(nb_frames).isdigit()) else 0
+        except Exception:
+            total_frames = 0
+        if total_frames == 0 and duration_s and fps:
+            total_frames = int(duration_s * fps)
+
+        # Store to Redis
+        mapping = {
+            'source_file_size': size_b,
+            'source_duration': f"{duration_s:.2f}" if duration_s else '0',
+            'source_codec': codec,
+            'source_resolution': reso,
+            'source_fps': f"{fps:.2f}" if fps else '0',
+        }
+        if total_frames:
+            mapping['total_frames'] = total_frames
+
+        redis_client.hset(job_key, mapping=mapping)
+        logger.info(f"VEM [{job_id}] Metadata populated via ffprobe: {mapping}")
+        return {'status': 'OK', **mapping}
+
+    except Exception as e:
+        logger.exception(f"VEM [{job_id}] ffprobe metadata error")
+        return {'status': 'ERROR', 'error': str(e)}
+
+
 @huey.task()
 def segment_video(job_id, file_path, filename):
     try:

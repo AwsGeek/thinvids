@@ -4,12 +4,6 @@
   <title>Video Encoding Manager</title>
   <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-  <style>
-    #job-table th, #job-table td { padding: 0.5rem; border: 1px solid #e5e7eb; }
-    .fixed-progress-col { width: 120px; }
-    .elapsed-time { font-size: 0.75rem; color: #4B5563; text-align: center; margin-top: 0.25rem; }
-    .toast { position: fixed; bottom: 1rem; right: 1rem; padding: 0.5rem 1rem; border-radius: 0.25rem; color: white; z-index: 1000; }
-  </style>
 </head>
 <body class="bg-gray-100">
   <div class="container mx-auto p-4">
@@ -31,26 +25,35 @@
     </div>
 
     <h2 class="text-xl font-semibold mb-2">Current Jobs</h2>
+
     <table id="job-table" class="w-full border-collapse bg-white">
       <thead>
         <tr class="bg-gray-200">
-          <th>Job ID</th>
-          <th>Filename</th>
-          <th class="fixed-progress-col">Split</th>
-          <th class="fixed-progress-col">Encode</th>
-          <th class="fixed-progress-col">Stitch</th>
-          <th>Started</th>
-          <th>Elapsed</th>
-          <th>Status</th>
-          <th>Actions</th>
+          <th class="px-2 py-1 text-left">ID</th>
+          <th class="px-2 py-1 text-left">Name</th>
+          <th class="px-2 py-1 text-left">Size</th>
+          <th class="px-2 py-1 text-left">Dim</th>
+          <th class="px-2 py-1 text-left">Dur</th>
+          <th class="px-2 py-1 text-left">Codec</th>
+          <th class="px-2 py-1 text-left">FPS</th>
+          <th class="px-2 py-1 text-center">Split</th>
+          <th class="px-2 py-1 text-center">Encode</th>
+          <th class="px-2 py-1 text-center">Stitch</th>
+          <th class="px-2 py-1 text-left">Started</th>
+          <th class="px-2 py-1 text-left">Elapsed</th>
+          <th class="px-2 py-1 text-left">Status</th>
+          <th class="px-2 py-1 text-left">Actions</th>
         </tr>
       </thead>
       <tbody id="job-list"></tbody>
     </table>
   </div>
 
+  <!-- Toast container -->
+  <div id="toast-root" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
+
   <!-- Properties Modal -->
-  <div id="properties-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+  <div id="properties-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
     <div class="bg-white rounded shadow-lg w-full max-w-2xl p-6 relative">
       <button onclick="closeModal('properties-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
         <span class="material-icons">close</span>
@@ -61,7 +64,7 @@
   </div>
 
   <!-- Per-Job Settings Modal -->
-  <div id="job-settings-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+  <div id="job-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
     <div class="bg-white rounded shadow-lg w-full max-w-lg p-6 relative">
       <button onclick="closeModal('job-settings-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
         <span class="material-icons">close</span>
@@ -96,7 +99,7 @@
   </div>
 
   <!-- Global Settings Modal -->
-  <div id="global-settings-modal" class="fixed inset-0 bg-gray-800 bg-opacity-50 flex items-center justify-center z-50 hidden">
+  <div id="global-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
     <div class="bg-white rounded shadow-lg w-full max-w-lg p-6 relative">
       <button onclick="closeModal('global-settings-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
         <span class="material-icons">close</span>
@@ -127,12 +130,13 @@
 
   <script>
     // ---------- Utils ----------
-    function toast(message, ok=true) {
+    function toast(message, ok = true) {
+      const root = document.getElementById('toast-root');
       const el = document.createElement('div');
+      el.className = `px-3 py-2 rounded text-white shadow ${ok ? 'bg-green-600' : 'bg-red-600'}`;
       el.textContent = message;
-      el.className = `toast ${ok ? 'bg-green-500' : 'bg-red-500'}`;
-      document.body.appendChild(el);
-      setTimeout(() => el.remove(), 2000);
+      root.appendChild(el);
+      setTimeout(() => el.remove(), 2200);
     }
     function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
     function formatElapsed(seconds) {
@@ -146,12 +150,34 @@
       const dt = new Date(timestamp * 1000);
       return dt.toLocaleString();
     }
+    function formatBytes(bytes) {
+      const b = Number(bytes);
+      if (!b || b < 0) return '…';
+      const units = ['B','KB','MB','GB','TB'];
+      const i = Math.floor(Math.log(b) / Math.log(1024));
+      const v = b / Math.pow(1024, i);
+      return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+    }
+    function formatDurationSeconds(secStr) {
+      const s = parseFloat(secStr);
+      if (!isFinite(s) || s <= 0) return '…';
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const s2 = Math.floor(s % 60);
+      return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s2).padStart(2,'0')}`
+                   : `${m}:${String(s2).padStart(2,'0')}`;
+    }
+    function formatFPS(val) {
+      const n = parseFloat(val);
+      if (!isFinite(n) || n <= 0) return '…';
+      return n.toFixed(n >= 100 ? 0 : 2);
+    }
     function progressBar(percent) {
       percent = Number(percent || 0);
       return `
         <div class="relative w-full h-4 bg-gray-200 rounded">
-          <div class="absolute top-0 left-0 h-4 bg-blue-500 rounded" style="width: ${percent}%"></div>
-          <div class="absolute w-full text-center text-xs leading-4 font-medium text-black">${percent}%</div>
+          <div class="absolute top-0 left-0 h-4 rounded bg-blue-500" style="width: ${percent}%"></div>
+          <div class="absolute inset-0 text-center text-xs leading-4 font-medium text-black">${percent}%</div>
         </div>
       `;
     }
@@ -253,22 +279,13 @@
         });
         const result = await response.json();
         if (response.ok && result.status === 'success') {
-          const toast = document.createElement('div');
-          toast.textContent = `Copied job ${job_id} → ${result.job_id} (PAUSED)`;
-          toast.className = 'toast bg-green-500';
-          document.body.appendChild(toast);
-          setTimeout(() => toast.remove(), 2000);
+          toast(`Copied job ${job_id.split('-')[0]} → ${result.job_id.split('-')[0]} (PAUSED)`, true);
           fetchJobs();
         } else {
           throw new Error(result.message || 'Failed to copy job');
         }
       } catch (err) {
-        console.error(err);
-        const toast = document.createElement('div');
-        toast.textContent = `Copy failed: ${err.message}`;
-        toast.className = 'toast bg-red-500';
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 2500);
+        toast(`Copy failed: ${err.message}`, false);
       }
     }
 
@@ -380,6 +397,17 @@
 
       jobs.forEach(job => {
         const row = document.createElement('tr');
+
+        const idShort = (job.job_id || '').split('-')[0] || '';
+        const displayName = (job.filename || '').split('/').pop() || 'N/A';
+
+        // metadata (placeholder-friendly)
+        const sizeDisp = formatBytes(job.source_file_size);
+        const dimDisp = job.source_resolution || '…';
+        const durDisp = formatDurationSeconds(job.source_duration);
+        const codecDisp = job.source_codec || '…';
+        const fpsDisp = formatFPS(job.source_fps);
+
         const isTerminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(job.status);
         const canStart = job.status === 'PAUSED';
         const canStop  = !isTerminal && !canStart; // running/queued
@@ -394,23 +422,30 @@
                 : ''));
 
         row.innerHTML = `
-          <td class="text-xs break-all">${job.job_id}</td>
-          <td>${job.filename || 'N/A'}</td>
-          <td class="fixed-progress-col">
+          <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
+          <td class="px-2 py-1 text-blue-600 font-bold">${displayName}</td>
+          <td class="px-2 py-1 whitespace-nowrap">${sizeDisp}</td>
+          <td class="px-2 py-1 whitespace-nowrap">${dimDisp}</td>
+          <td class="px-2 py-1 whitespace-nowrap">${durDisp}</td>
+          <td class="px-2 py-1 whitespace-nowrap">${codecDisp}</td>
+          <td class="px-2 py-1 whitespace-nowrap">${fpsDisp}</td>
+
+          <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.segment_progress || 0)}
-            <div class="elapsed-time">${formatElapsed(job.segment_elapsed || 0)}</div>
+            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.segment_elapsed || 0)}</div>
           </td>
-          <td class="fixed-progress-col">
+          <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.encode_progress || 0)}
-            <div class="elapsed-time">${formatElapsed(job.encode_elapsed || 0)}</div>
+            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.encode_elapsed || 0)}</div>
           </td>
-          <td class="fixed-progress-col">
+          <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.combine_progress || 0)}
-            <div class="elapsed-time">${formatElapsed(job.combine_elapsed || 0)}</div>
+            <div class="text-gray-600 text-xs text-center mt-1">${formatElapsed(job.combine_elapsed || 0)}</div>
           </td>
-          <td>${formatDateTime(job.started)}</td>
-          <td>${formatElapsed(job.elapsed)}</td>
-          <td>
+
+          <td class="px-2 py-1 whitespace-normal break-words">${formatDateTime(job.started)}</td>
+          <td class="px-2 py-1">${formatElapsed(job.elapsed)}</td>
+          <td class="px-2 py-1">
             ${
               job.status === 'FAILED' && job.log_path
                 ? `<a href="/log/${job.job_id}" class="font-medium text-red-600 underline">FAILED</a>`
@@ -431,31 +466,28 @@
                   }">${job.status}</span>`
             }
           </td>
-          <td class="text-center flex items-center justify-center gap-1">
-            ${job.filename && job.filename !== 'undefined'
-              ? `<button class="copy-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>`
-              : ''}
-            <button class="delete-btn" title="Delete">
-              <span class="material-icons text-red-600 hover:text-red-800">delete</span>
-            </button>
-            <button class="properties-btn" title="Properties">
-              <span class="material-icons text-gray-700 hover:text-black">info</span>
-            </button>
-            <button class="settings-btn" title="Settings">
-              <span class="material-icons text-gray-700 hover:text-black">settings</span>
-            </button>
-            ${vcrBtnHtml}
+          <td class="px-2 py-1">
+            <div class="flex items-center justify-center gap-1">
+              ${job.filename && job.filename !== 'undefined'
+                ? `<button class="copy-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>`
+                : ''}
+              <button class="delete-btn" title="Delete">
+                <span class="material-icons text-red-600 hover:text-red-800">delete</span>
+              </button>
+              <button class="properties-btn" title="Properties">
+                <span class="material-icons text-gray-700 hover:text-black">info</span>
+              </button>
+              <button class="settings-btn" title="Settings">
+                <span class="material-icons text-gray-700 hover:text-black">settings</span>
+              </button>
+              ${vcrBtnHtml}
+            </div>
           </td>
         `;
         jobList.appendChild(row);
 
         const copyBtn = row.querySelector('.copy-btn');
-        if (copyBtn) {
-          copyBtn.addEventListener('click', () => {
-            // Copy this job by ID (always creates a PAUSED job)
-            copyJob(job.job_id);
-          });
-        }        
+        if (copyBtn) copyBtn.addEventListener('click', () => copyJob(job.job_id));
         row.querySelector('.delete-btn').addEventListener('click', () => deleteJob(job.job_id));
         row.querySelector('.properties-btn').addEventListener('click', () => showProperties(job.job_id));
         row.querySelector('.settings-btn').addEventListener('click', () => showJobSettings(job.job_id));
