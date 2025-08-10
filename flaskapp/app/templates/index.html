@@ -130,6 +130,41 @@
 
   <script>
     // ---------- Utils ----------
+    function statusColorClass(status = '') {
+      const s = String(status || '').toUpperCase();
+      // New unified states
+      if (s === 'READY') return 'text-yellow-600';
+      if (s === 'RUNNING') return 'text-blue-600';
+      if (s === 'STOPPED') return 'text-gray-600';
+      if (s === 'FAILED') return 'text-red-600';
+      if (s === 'DONE' || s === 'COMPLETED') return 'text-green-600';
+
+      // Legacy / transitional states (fallbacks)
+      if (s.startsWith('SEG') || s.startsWith('ENC') || s.includes('STITCH')) return 'text-blue-600';
+      if (s === 'ABORTED') return 'text-gray-600';
+      if (s === 'QUEUED' || s === 'PAUSED') return 'text-yellow-600';
+      return 'text-black';
+    }
+
+    function prettyTitleFromPath(path = '') {
+      const base = (path.split('/').pop() || '').replace(/\.[^.]+$/, '').trim();
+
+      // TV: "Show - S01E03 - Episode Title"  => "Show - S01E03"
+      //     "Show - 1x03 - Episode Title"    => "Show - 1x03"
+      //     "Show - 2023-05-01 - Title"      => "Show - 2023-05-01"
+      const tvMatch = base.match(/^(.+?)\s*-\s*([^-\n]+)\s*-\s*.*$/);
+      if (tvMatch) {
+        const show = tvMatch[1].trim();
+        const ep   = tvMatch[2].trim();
+        return `${show} - ${ep}`;
+      }
+
+      // Movie: "Name [2021, PG-13, ...]" => "Name"
+      const movieMatch = base.match(/^(.+?)\s*\[\s*\d{4}.*\]$/);
+      if (movieMatch) return movieMatch[1].trim();
+
+      return base || path.split('/').pop() || 'N/A';
+    }
     function toast(message, ok = true) {
       const root = document.getElementById('toast-root');
       const el = document.createElement('div');
@@ -181,7 +216,6 @@
         </div>
       `;
     }
-
     // ---------- Global Settings ----------
     async function showGlobalSettings() {
       const res = await fetch('/global_settings');
@@ -394,8 +428,9 @@
         const row = document.createElement('tr');
 
         const idShort = (job.job_id || '').split('-')[0] || '';
-        const displayName = (job.filename || '').split('/').pop() || 'N/A';
-
+        const displayName = prettyTitleFromPath(job.filename || '');
+        const nameColor = statusColorClass(job.status || '');
+        
         // metadata (placeholder-friendly)
         const sizeDisp = formatBytes(job.source_file_size);
         const dimDisp = job.source_resolution || '…';
@@ -424,7 +459,7 @@
 
         row.innerHTML = `
           <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
-          <td class="px-2 py-1 text-blue-600 font-bold">${displayName}</td>
+          <td class="px-2 py-1 font-bold ${nameColor}">${displayName}</td>          
           <td class="px-2 py-1 whitespace-nowrap">${sizeDisp}</td>
           <td class="px-2 py-1 whitespace-nowrap">${dimDisp}</td>
           <td class="px-2 py-1 whitespace-nowrap">${durDisp}</td>
