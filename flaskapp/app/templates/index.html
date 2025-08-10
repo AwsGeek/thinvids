@@ -128,18 +128,41 @@
     </div>
   </div>
 
+  <!-- Video Preview Modal -->
+  <div id="video-modal" class="fixed inset-0 bg-black bg-opacity-70 hidden z-50 items-center justify-center">
+    <div class="bg-white rounded shadow-xl w-full max-w-5xl relative">
+      <button onclick="closeVideoModal()" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+        <span class="material-icons">close</span>
+      </button>
+
+      <div class="p-4">
+        <h3 id="video-title" class="text-lg font-semibold mb-2"></h3>
+        <video id="video-player" class="w-full bg-black" controls playsinline></video>
+
+        <div class="flex items-center gap-2 mt-3">
+          <button id="btn-back-frame" class="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded text-sm">
+            <span class="material-icons align-middle">skip_previous</span> Frame -
+          </button>
+          <button id="btn-fwd-frame" class="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded text-sm">
+            Frame + <span class="material-icons align-middle">skip_next</span>
+          </button>
+          <div class="ml-auto text-xs text-gray-600">
+            <span id="video-fps-label"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     // ---------- Utils ----------
     function statusColorClass(status = '') {
       const s = String(status || '').toUpperCase();
-      // New unified states
       if (s === 'READY') return 'text-yellow-600';
       if (s === 'RUNNING') return 'text-blue-600';
       if (s === 'STOPPED') return 'text-gray-600';
       if (s === 'FAILED') return 'text-red-600';
       if (s === 'DONE' || s === 'COMPLETED') return 'text-green-600';
-
-      // Legacy / transitional states (fallbacks)
       if (s.startsWith('SEG') || s.startsWith('ENC') || s.includes('STITCH')) return 'text-blue-600';
       if (s === 'ABORTED') return 'text-gray-600';
       if (s === 'QUEUED' || s === 'PAUSED') return 'text-yellow-600';
@@ -148,21 +171,14 @@
 
     function prettyTitleFromPath(path = '') {
       const base = (path.split('/').pop() || '').replace(/\.[^.]+$/, '').trim();
-
-      // TV: "Show - S01E03 - Episode Title"  => "Show - S01E03"
-      //     "Show - 1x03 - Episode Title"    => "Show - 1x03"
-      //     "Show - 2023-05-01 - Title"      => "Show - 2023-05-01"
       const tvMatch = base.match(/^(.+?)\s*-\s*([^-\n]+)\s*-\s*.*$/);
       if (tvMatch) {
         const show = tvMatch[1].trim();
         const ep   = tvMatch[2].trim();
         return `${show} - ${ep}`;
       }
-
-      // Movie: "Name [2021, PG-13, ...]" => "Name"
       const movieMatch = base.match(/^(.+?)\s*\[\s*\d{4}.*\]$/);
       if (movieMatch) return movieMatch[1].trim();
-
       return base || path.split('/').pop() || 'N/A';
     }
     function toast(message, ok = true) {
@@ -216,6 +232,7 @@
         </div>
       `;
     }
+
     // ---------- Global Settings ----------
     async function showGlobalSettings() {
       const res = await fetch('/global_settings');
@@ -345,6 +362,72 @@
       if (response.ok) fetchJobs(); else alert('Failed to restart job');
     }
 
+    // ---------- Video preview helpers ----------
+    let __videoFPS__ = 30;
+    function openVideoModal(title, jobId, fps) {
+      // FPS (fallback to 30 if invalid)
+      __videoFPS__ = (Number(fps) > 0) ? Number(fps) : 30;
+
+      const modal  = document.getElementById('video-modal');
+      const player = document.getElementById('video-player');
+      const label  = document.getElementById('video-fps-label');
+      const titleEl = document.getElementById('video-title');
+
+      // Set UI text
+      titleEl.textContent = String(title || '');
+      label.textContent   = `FPS: ${__videoFPS__.toFixed(2)}`;
+
+      // Prepare player
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+
+      // Safe, encoded preview URL
+      const url = `/preview/${encodeURIComponent(jobId)}`;
+      player.src = url;
+
+      // Reset time & load fresh
+      player.currentTime = 0;
+      player.load();
+
+      // Show modal
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+
+      // Try autoplay (ignore if blocked)
+      player.play().catch(() => { /* autoplay might be blocked; that's fine */ });
+
+      // Focus for key controls
+      player.focus();
+    }
+    function closeVideoModal() {
+      const modal  = document.getElementById('video-modal');
+      const player = document.getElementById('video-player');
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    }
+    function stepFrame(delta) {
+      const player = document.getElementById('video-player');
+      if (!player) return;
+      const step = 1 / (__videoFPS__ || 30);
+      player.pause();
+      const target = Math.max(0, player.currentTime + delta * step);
+      player.currentTime = target;
+    }
+    window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('btn-back-frame').addEventListener('click', () => stepFrame(-1));
+      document.getElementById('btn-fwd-frame').addEventListener('click', () => stepFrame(1));
+      document.addEventListener('keydown', (e) => {
+        const modal = document.getElementById('video-modal');
+        if (modal.classList.contains('hidden')) return;
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); stepFrame(-1); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(1);  }
+      });
+    });
+
     // ---------- Sorting ----------
     let CURRENT_SORT = 'date'; // default
 
@@ -430,7 +513,7 @@
         const idShort = (job.job_id || '').split('-')[0] || '';
         const displayName = prettyTitleFromPath(job.filename || '');
         const nameColor = statusColorClass(job.status || '');
-        
+
         // metadata (placeholder-friendly)
         const sizeDisp = formatBytes(job.source_file_size);
         const dimDisp = job.source_resolution || '…';
@@ -438,7 +521,6 @@
         const codecDisp = job.source_codec || '…';
         const fpsDisp = formatFPS(job.source_fps);
 
-        const isTerminal = (job.status === 'FAILED'); // no completed state now
         const canStart   = job.status === 'READY';
         const canStop    = job.status === 'RUNNING';
         const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED');
@@ -446,7 +528,6 @@
         const totalChunks = Number(job.total_chunks || 0);
         const segCount    = Number(job.segmented_chunks || 0);
         const encCount    = Number(job.completed_chunks || 0);
-        // For stitch, we approximate based on progress (ffmpeg concat doesn’t emit file index)
         const stitchedApprox = totalChunks > 0 ? Math.floor((Number(job.combine_progress || 0) / 100) * totalChunks) : 0;
 
         const vcrBtnHtml = canStart
@@ -457,9 +538,20 @@
                 ? `<button class="vcr-restart-btn" title="Restart"><span class="material-icons text-orange-600 hover:text-orange-800">change_circle</span></button>`
                 : ''));
 
+        const isDone = String(job.status || '').toUpperCase() === 'DONE';
+        const nameCellHTML = isDone
+          ? `<button class="font-bold underline ${nameColor} hover:opacity-80 name-preview"
+              title="Preview"
+              data-title="${displayName.replace(/"/g, '&quot;')}"
+              data-jobid="${job.job_id}"
+              data-fps="${Number(job.source_fps || 0)}">
+              ${displayName}
+            </button>`
+          : `<span class="font-bold ${nameColor}">${displayName}</span>`;
+
         row.innerHTML = `
           <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
-          <td class="px-2 py-1 font-bold ${nameColor}">${displayName}</td>          
+          <td class="px-2 py-1">${nameCellHTML}</td>
           <td class="px-2 py-1 whitespace-nowrap">${sizeDisp}</td>
           <td class="px-2 py-1 whitespace-nowrap">${dimDisp}</td>
           <td class="px-2 py-1 whitespace-nowrap">${durDisp}</td>
@@ -496,8 +588,7 @@
               job.status === 'FAILED' ? 'text-red-600'  :
               job.status === 'DONE'   ? 'text-green-600':
                                         'text-gray-700'
-            }">${job.status || 'READY'}
-            </span>          
+            }">${job.status || 'READY'}</span>
           </td>
           <td class="px-2 py-1">
             <div class="flex items-center justify-center gap-1">
@@ -518,6 +609,16 @@
           </td>
         `;
         jobList.appendChild(row);
+        const previewBtn = row.querySelector('.name-preview');
+        if (previewBtn) {
+          previewBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const title = previewBtn.dataset.title || displayName;
+            const jobId = previewBtn.dataset.jobid;
+            const fps   = Number(previewBtn.dataset.fps || job.source_fps || 0);
+            if (jobId) openVideoModal(title, jobId, fps);
+          });
+        }
 
         const copyBtn = row.querySelector('.copy-btn');
         if (copyBtn) copyBtn.addEventListener('click', () => copyJob(job.job_id));

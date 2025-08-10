@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, abort
+from flask import Flask, render_template, request, jsonify, abort, send_file
 import redis
 from huey import RedisHuey
 import uuid
@@ -345,6 +345,22 @@ def delete_job(job_id):
 
     return jsonify({'status': 'deleted'}), 200
 
+@app.get('/preview/<job_id>')
+def preview_video(job_id):
+
+    job_key = f"job:{job_id}"
+    if not redis_client.exists(job_key):
+        logger.warning(f"[{job_id}] Key not found '{job_key}'")
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = redis_client.hgetall(job_key) or {}
+    output_path = job.get('output_path')
+    if not output_path or not os.path.isfile(output_path):
+        logger.warning(f"[{job_id}] 'Output not found '{output_path}'")
+        return jsonify({'error': 'Output not found'}), 404
+
+    # Let the browser seek; Werkzeug/Flask will handle range requests for local files.
+    return send_file(output_path, mimetype='video/mp4', conditional=True)
 
 # ------------------ Job info / utilities -------------------
 @app.get('/job_properties/<job_id>')
@@ -404,7 +420,6 @@ def job_file_content(job_id, filename):
         logger.error(f"[{job_id}] Failed to read file {file_path}: {e}")
         return jsonify({'error': 'Failed to read file'}), 500
 
-
 @app.get("/log/<job_id>")
 def serve_log(job_id):
     job_key = f"job:{job_id}"
@@ -414,7 +429,6 @@ def serve_log(job_id):
     with open(log_path) as f:
         content = f.read()
     return f"<pre style='white-space: pre-wrap;'>{content}</pre>"
-
 
 # ---------------- Per-job settings (PAUSED only) ------------
 @app.route('/job_settings/<job_id>', methods=['GET', 'POST'])
