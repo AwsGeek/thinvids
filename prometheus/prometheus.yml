@@ -9,11 +9,11 @@ scrape_configs:
 
   - job_name: 'node-exporter'
     static_configs:
-      - targets: ["swarm1:9100","swarm3:9100","swarm4:9100","thinman01:9100","thinman02:9100","thinman03:9100","thinman04:9100","thinman05:9100","thinman06:9100","thinman07:9100","thinman08:9100","thinman09:9100","thinman10:9100","thinman11:9100","thinman12:9100","thinman13:9100","thinman14:9100","thinman15:9100","thinman17:9100","thinman18:9100","thinman19:9100","thinman20:9100","thinman21:9100","thinman22:9100","thinman23:9100"]
+      - targets: ["swarm1:9100","swarm3:9100","swarm4:9100","thinman01:9100","thinman02:9100","thinman03:9100","thinman04:9100","thinman05:9100","thinman06:9100","thinman07:9100","thinman08:9100","thinman09:9100","thinman10:9100","thinman11:9100","thinman12:9100","thinman13:9100","thinman14:9100","thinman15:9100","thinman16:9100","thinman17:9100","thinman18:9100","thinman19:9100","thinman20:9100","thinman21:9100","thinman22:9100","thinman23:9100"]
 
   - job_name: 'cadvisor'
     static_configs:
-      - targets: ["swarm1:8080","swarm3:8080","swarm4:8080","thinman01:8080","thinman02:8080","thinman03:8080","thinman04:8080","thinman05:8080","thinman06:8080","thinman07:8080","thinman08:8080","thinman09:8080","thinman10:8080","thinman11:8080","thinman12:8080","thinman13:8080","thinman14:8080","thinman15:8080","thinman17:8080","thinman18:8080","thinman19:8080","thinman20:8080","thinman21:8080","thinman22:8080","thinman23:8080"]
+      - targets: ["swarm1:8080","swarm3:8080","swarm4:8080","thinman01:8080","thinman02:8080","thinman03:8080","thinman04:8080","thinman05:8080","thinman06:8080","thinman07:8080","thinman08:8080","thinman09:8080","thinman10:8080","thinman11:8080","thinman12:8080","thinman13:8080","thinman14:8080","thinman15:8080","thinman16:8080","thinman17:8080","thinman18:8080","thinman19:8080","thinman20:8080","thinman21:8080","thinman22:8080","thinman23:8080"]
 
   - job_name: 'redis'
     static_configs:

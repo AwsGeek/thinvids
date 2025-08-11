@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Cluster Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+</head>
+<body class="bg-gray-100">
+  <div class="container mx-auto p-4 space-y-6">
+    <div class="flex items-center justify-between">
+      <h1 class="text-2xl font-bold">Cluster Dashboard</h1>
+      <a href="/" class="text-blue-600 underline">Back to Jobs</a>
+    </div>
+
+    <!-- Running jobs -->
+    <div class="bg-white rounded shadow p-4">
+      <h2 class="text-xl font-semibold mb-2">Running Jobs</h2>
+      <div id="running-jobs" class="text-sm grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2"></div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 gap-6">
+      <div class="bg-white rounded shadow p-4">
+        <div class="flex items-baseline justify-between"><h3 class="font-semibold">CPU %</h3><span id="cpu-updated" class="text-xs text-gray-500"></span></div>
+        <div class="w-full h-20">
+          <canvas id="cpuChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-white rounded shadow p-4">
+        <div class="flex items-baseline justify-between"><h3 class="font-semibold">GPU % (Intel)</h3><span id="gpu-updated" class="text-xs text-gray-500"></span></div>
+        <div class="w-full h-20">
+          <canvas id="gpuChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-white rounded shadow p-4">
+        <div class="flex items-baseline justify-between"><h3 class="font-semibold">Memory %</h3><span id="mem-updated" class="text-xs text-gray-500"></span></div>
+        <div class="w-full h-20">
+          <canvas id="memChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-white rounded shadow p-4">
+        <div class="flex items-baseline justify-between"><h3 class="font-semibold">RX Mbps</h3><span id="rx-updated" class="text-xs text-gray-500"></span></div>
+        <div class="w-full h-20">
+          <canvas id="rxChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-white rounded shadow p-4">
+        <div class="flex items-baseline justify-between"><h3 class="font-semibold">TX Mbps</h3><span id="tx-updated" class="text-xs text-gray-500"></span></div>
+        <div class="w-full h-20">
+          <canvas id="txChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ---- helpers ----
+    function fmtMbps(bps){ return (bps*8/1e6).toFixed(1); }
+    function tsStr(ts){ return new Date(ts*1000).toLocaleTimeString(); }
+    function barOpts(title='%'){
+      return {
+        indexAxis: 'x',
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,   // key for short & wide
+        plugins: { legend: { display:false }, tooltip:{mode:'index', intersect:false} },
+        scales: {
+          x: { ticks: { autoSkip: false, maxRotation: 90, minRotation: 0 } },
+          y: { beginAtZero: true, suggestedMax: 100 }
+        }
+      };
+    }
+    function barOptsMbps(){
+      const o = barOpts('Mbps');
+      o.scales.y.suggestedMax = undefined;
+      return o;
+    }
+    function mkChart(ctx){
+      return new Chart(ctx, {
+        type: 'bar',
+        data: { labels: [], datasets: [{ label:'', data: [] }] },
+        options: barOpts()
+      });
+    }
+
+    const cpuChart = mkChart(document.getElementById('cpuChart').getContext('2d'));
+    const gpuChart = mkChart(document.getElementById('gpuChart').getContext('2d'));
+    const memChart = mkChart(document.getElementById('memChart').getContext('2d'));
+    const rxChart  = new Chart(document.getElementById('rxChart').getContext('2d'), {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label:'', data: [] }] },
+      options: barOptsMbps()
+    });
+    const txChart  = new Chart(document.getElementById('txChart').getContext('2d'), {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label:'', data: [] }] },
+      options: barOptsMbps()
+    });
+
+    function updateBars(chart, labels, values, suggestedMax) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      if (suggestedMax !== undefined) chart.options.scales.y.suggestedMax = suggestedMax;
+      chart.update();
+    }
+
+    async function fetchMetrics() {
+      const res = await fetch('/metrics_snapshot');
+      if (!res.ok) return;
+      const { nodes } = await res.json();
+
+      const labels = nodes.map(n => n.hostname);
+
+      const cpu = nodes.map(n => Number(n.cpu?.toFixed(1) || 0));
+      const gpu = nodes.map(n => (n.gpu >= 0 ? Number(n.gpu.toFixed(1)) : 0));  // -1 => unavailable
+      const mem = nodes.map(n => {
+        const pct = n.mem_total ? (n.mem_used / n.mem_total) * 100 : 0;
+        return Number(pct.toFixed(1));
+      });
+      const rx  = nodes.map(n => Number(fmtMbps(n.rx_bps)));
+      const tx  = nodes.map(n => Number(fmtMbps(n.tx_bps)));
+
+      updateBars(cpuChart, labels, cpu, 100);
+      updateBars(gpuChart, labels, gpu, 100);
+      updateBars(memChart, labels, mem, 100);
+      updateBars(rxChart,  labels, rx);
+      updateBars(txChart,  labels, tx);
+
+      const latestTs = nodes.length ? Math.max(...nodes.map(n => n.ts)) : 0;
+      const s = latestTs ? tsStr(latestTs) : '';
+      document.getElementById('cpu-updated').textContent = s;
+      document.getElementById('gpu-updated').textContent = s;
+      document.getElementById('mem-updated').textContent = s;
+      document.getElementById('rx-updated').textContent  = s;
+      document.getElementById('tx-updated').textContent  = s;
+    }
+
+    async function fetchRunningJobs() {
+      const res = await fetch('/jobs');
+      if (!res.ok) return;
+      const jobs = await res.json();
+      const running = jobs.filter(j => String(j.status).toUpperCase() === 'RUNNING');
+      const root = document.getElementById('running-jobs');
+      root.innerHTML = '';
+      running.forEach(j => {
+        const el = document.createElement('div');
+        el.className = 'p-2 border rounded';
+        el.textContent = `${(j.job_id||'').split('-')[0]} · ${j.filename || ''}`;
+        root.appendChild(el);
+      });
+    }
+
+    setInterval(fetchMetrics, 1000);
+    setInterval(fetchRunningJobs, 3000);
+    fetchMetrics();
+    fetchRunningJobs();
+  </script>
+</body>
+</html>

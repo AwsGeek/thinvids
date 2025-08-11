@@ -4,6 +4,7 @@ from huey import RedisHuey
 import uuid
 import time
 import os
+import json
 import logging
 import humanize
 import shutil
@@ -31,6 +32,43 @@ STATUS_DONE    = 'DONE'
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+# --- imports at top ---
+from flask import Flask, render_template, request, jsonify, abort, send_file
+# ... (existing)
+import json
+
+# --- new route: dashboard page ---
+@app.get('/dashboard')
+def dashboard():
+    return render_template('dashboard.html')
+
+# --- new route: metrics snapshot (all nodes) ---
+@app.get('/metrics_snapshot')
+def metrics_snapshot():
+    nodes = []
+    for key in redis_client.scan_iter("metrics:node:*"):
+        try:
+            data = redis_client.hgetall(key) or {}
+            # coerce numeric fields
+            out = {
+                "key": key,
+                "hostname": data.get("hostname") or key.split(":")[-1],
+                "ts": int(float(data.get("ts", 0))),
+                "cpu": float(data.get("cpu", 0.0)),
+                "gpu": float(data.get("gpu", -1.0)),
+                "mem_used": int(float(data.get("mem_used", 0))),
+                "mem_total": int(float(data.get("mem_total", 0))),
+                "rx_bps": int(float(data.get("rx_bps", 0))),
+                "tx_bps": int(float(data.get("tx_bps", 0)))
+            }
+            nodes.append(out)
+        except Exception:
+            pass
+    # sort by hostname for stable bar order
+    nodes.sort(key=lambda n: n["hostname"])
+    return jsonify({"nodes": nodes})
 
 
 # ------------------- Global settings API -------------------
@@ -484,25 +522,6 @@ def job_settings(job_id):
 
         v_sel = int(v_sel)
         a_sel = int(a_sel)
-
-        if not (1 <= seg <= 300):
-            return jsonify({'error': 'segment_duration must be between 1 and 300'}), 400
-        if not (1 <= parts <= 8):
-            return jsonify({'error': 'number_parts must be between 1 and 8'}), 400
-
-        # (Optional) validate indices against probed streams
-        streams_json = job.get('streams_json') or '{"video":[],"audio":[]}'
-        try:
-            streams = json.loads(streams_json)
-        except Exception:
-            streams = {'video': [], 'audio': []}
-        video_indices = {int(s.get('index', -1)) for s in (streams.get('video') or [])}
-        audio_indices = {int(s.get('index', -1)) for s in (streams.get('audio') or [])}
- 
-        if video_indices and v_sel not in video_indices:
-            return jsonify({'error': f'Invalid video stream index {v_sel}'}), 400
-        if a_sel >= 0 and audio_indices and a_sel not in audio_indices:
-            return jsonify({'error': f'Invalid audio stream index {a_sel}'}), 400
 
         mapping = {
             'segment_duration': seg,
