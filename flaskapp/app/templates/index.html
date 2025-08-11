@@ -74,6 +74,15 @@
       </thead>
       <tbody id="job-list"></tbody>
     </table>
+
+    <!-- Pagination (server-side) -->
+    <div id="pagination" class="flex items-center justify-end gap-2 mt-3">
+      <button id="pg-first" class="px-2 py-1 border rounded text-sm">« First</button>
+      <button id="pg-prev"  class="px-2 py-1 border rounded text-sm">‹ Prev</button>
+      <span id="pg-status"  class="text-sm text-gray-700 mx-2">Page 1 / 1</span>
+      <button id="pg-next"  class="px-2 py-1 border rounded text-sm">Next ›</button>
+      <button id="pg-last"  class="px-2 py-1 border rounded text-sm">Last »</button>
+    </div>    
   </div>
 
   <!-- Toast container -->
@@ -280,6 +289,55 @@
   </script>
 
   <script>
+
+    // ---- Server-side pagination + sorting ----
+    let CURRENT_PAGE = 1;            // 1-based
+    const PAGE_SIZE = 10;            // fixed as requested
+    let CURRENT_SORT = 'date';       // 'date'|'filename'|'status'|'encode'
+    let CURRENT_DIR  = 'desc';       // 'asc'|'desc'
+
+    function applyPagerState(meta) {
+      const { page, total_pages } = meta;
+      CURRENT_PAGE = page;
+
+      const status = document.getElementById('pg-status');
+      status.textContent = `Page ${page} / ${total_pages}`;
+
+      document.getElementById('pg-first').disabled = page <= 1;
+      document.getElementById('pg-prev').disabled  = page <= 1;
+      document.getElementById('pg-next').disabled  = page >= total_pages;
+      document.getElementById('pg-last').disabled  = page >= total_pages;
+
+      // store last meta for next/last buttons
+      window.__PAGER_META__ = meta;
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('pg-first').addEventListener('click', () => { CURRENT_PAGE = 1; fetchJobs(false); });
+      document.getElementById('pg-prev').addEventListener('click',  () => { CURRENT_PAGE = Math.max(1, CURRENT_PAGE - 1); fetchJobs(false); });
+      document.getElementById('pg-next').addEventListener('click',  () => {
+        const meta = window.__PAGER_META__ || { total_pages: CURRENT_PAGE };
+        CURRENT_PAGE = Math.min(meta.total_pages, CURRENT_PAGE + 1);
+        fetchJobs(false);
+      });
+      document.getElementById('pg-last').addEventListener('click',  () => {
+        const meta = window.__PAGER_META__ || { total_pages: CURRENT_PAGE };
+        CURRENT_PAGE = meta.total_pages;
+        fetchJobs(false);
+      });
+
+      // If you already have a sort <select id="sort-by">, map to server fields:
+      const sortSel = document.getElementById('sort-by');
+      if (sortSel) {
+        sortSel.addEventListener('change', (e) => {
+          const v = e.target.value || 'date';
+          CURRENT_SORT = v;    // our server expects same enum names you used
+          CURRENT_PAGE = 1;    // reset to first page on sort change
+          fetchJobs(false);
+        });
+      }
+    });
+
     // ---------- Utils ----------
     function statusColorClass(status = '') {
       const s = String(status || '').toUpperCase();
@@ -617,7 +675,6 @@
     });
 
     // ---------- Sorting ----------
-    let CURRENT_SORT = 'date'; // default
 
     function statusRank(s) {
       const order = {
@@ -681,28 +738,36 @@
 
     // ---------- Table render ----------
     async function fetchJobs(skipFetch = false) {
-      let jobs;
-      if (!skipFetch) {
-        const response = await fetch('/jobs');
-        jobs = await response.json();
-        window.__JOBS_CACHE__ = jobs;
-      } else {
-        jobs = window.__JOBS_CACHE__ || [];
-      }
+      // skipFetch is ignored now; we always ask the server for the current page
+      const params = new URLSearchParams({
+        page: String(CURRENT_PAGE),
+        page_size: String(PAGE_SIZE),
+        sort_by: CURRENT_SORT,
+        sort_dir: CURRENT_DIR
+      });
+      const response = await fetch(`/jobs?${params.toString()}`);
+      if (!response.ok) return;
+      const payload = await response.json();
 
-      jobs = jobs.slice().sort(compareJobs);
+      // Back-compat path (if server returned a raw array)
+      const items = Array.isArray(payload) ? payload : (payload.items || []);
+      const meta  = Array.isArray(payload)
+        ? { page: 1, total_pages: 1, total: items.length, page_size: items.length }
+        : { page: payload.page, total_pages: payload.total_pages, total: payload.total, page_size: payload.page_size };
+
+      // cache only current page if you want
+      window.__JOBS_CACHE__ = items;
 
       const jobList = document.getElementById('job-list');
       jobList.innerHTML = '';
 
-      jobs.forEach(job => {
+      items.forEach(job => {
         const row = document.createElement('tr');
 
         const idShort = (job.job_id || '').split('-')[0] || '';
         const displayName = prettyTitleFromPath(job.filename || '');
         const nameColor = statusColorClass(job.status || '');
 
-        // metadata (placeholder-friendly)
         const sizeDisp = formatBytes(job.source_file_size);
         const dimDisp = job.source_resolution || '…';
         const durDisp = formatDurationSeconds(job.source_duration);
@@ -797,6 +862,7 @@
           </td>
         `;
         jobList.appendChild(row);
+
         const previewBtn = row.querySelector('.name-preview');
         if (previewBtn) {
           previewBtn.addEventListener('click', (e) => {
@@ -807,7 +873,6 @@
             if (jobId) openVideoModal(title, jobId, fps);
           });
         }
-
         const copyBtn = row.querySelector('.copy-btn');
         if (copyBtn) copyBtn.addEventListener('click', () => copyJob(job.job_id));
         row.querySelector('.delete-btn').addEventListener('click', () => deleteJob(job.job_id));
@@ -817,6 +882,8 @@
         row.querySelector('.vcr-stop-btn')?.addEventListener('click', () => stopJob(job.job_id));
         row.querySelector('.vcr-restart-btn')?.addEventListener('click', () => restartJob(job.job_id));
       });
+
+      applyPagerState(meta);
     }
 
     // poll

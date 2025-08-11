@@ -8,6 +8,7 @@ import json
 import logging
 import humanize
 import shutil
+from math import ceil
 
 # import backend task planner
 from tasks import segment_video, probe_source
@@ -112,6 +113,7 @@ def post_global_settings():
 # ------------------------ Jobs API -------------------------
 @app.get('/jobs')
 def list_jobs():
+    # --- gather all jobs (unchanged logic) ---
     jobs = []
     for key in redis_client.scan_iter("job:*"):
         try:
@@ -121,7 +123,7 @@ def list_jobs():
 
             started = float(job_data.get('started_at', '0') or 0)
             ended = float(job_data.get('ended_at', '0') or 0)
-            created = float(job_data.get('created_at', '0') or 0)  # <-- NEW
+            created = float(job_data.get('created_at', '0') or 0)
             now = time.time()
             elapsed = int((ended if ended > 0 else now) - started) if started > 0 else 0
 
@@ -141,17 +143,84 @@ def list_jobs():
                 'combine_progress': combine_progress,
                 'elapsed': elapsed,
                 'started': started,
-                'created': created,            # <-- NEW
+                'created': created,
                 'stitched_chunks': stitched
             })
-        except Exception as e:            
-            #logger.warning(f"[{key}] list_jobs error, skipping: {e}")
+        except Exception:
             pass
 
-    # REMOVED backend sort; frontend handles it:
-    # jobs.sort(key=lambda x: x['started'], reverse=True)
+    # --- if no pagination params, return full list (back-compat) ---
+    if 'page' not in request.args:
+        return jsonify(jobs)
 
-    return jsonify(jobs)
+    # --- pagination + sorting ---
+    # inputs
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except Exception:
+        page = 1
+    try:
+        page_size = int(request.args.get('page_size', 10))
+        page_size = min(max(1, page_size), 50)  # clamp 1..50
+    except Exception:
+        page_size = 10
+
+    sort_by = (request.args.get('sort_by') or 'date').lower()  # 'date'|'filename'|'status'|'encode'
+    sort_dir = (request.args.get('sort_dir') or 'desc').lower()  # 'asc' or 'desc'
+
+    # sorting helpers to mirror your frontend logic
+    status_order = {'READY': 0, 'RUNNING': 1, 'STOPPED': 2, 'FAILED': 3, 'DONE': 4}
+
+    def sort_key(job):
+        s = (job.get('status') or '').upper()
+        filename = (job.get('filename') or '').lower()
+        started = float(job.get('started') or 0)
+        created = float(job.get('created') or 0)
+        encode = int(job.get('encode_progress') or 0)
+
+        if sort_by == 'filename':
+            return (filename,)
+        elif sort_by == 'status':
+            return (status_order.get(s, 99), filename)
+        elif sort_by == 'encode':
+            # primary: encode %, secondary: started, tertiary: filename
+            return (encode, started, filename)
+        else:  # 'date' default
+            paused_bucket = 0 if started == 0 else 1  # paused first, then running
+            secondary = created if started == 0 else started
+            return (paused_bucket, secondary)
+
+    reverse = (sort_dir != 'asc')
+
+    # For the 'date' sort we need custom direction inside buckets:
+    if sort_by == 'date':
+        # paused_bucket asc (0 then 1), inside bucket: secondary desc by default
+        jobs.sort(key=lambda j: (0 if float(j.get('started') or 0) == 0 else 1,
+                                 float(j.get('created') or 0) if float(j.get('started') or 0) == 0
+                                 else float(j.get('started') or 0)),
+                  reverse=False)
+        # reverse inside each bucket to get newest first
+        paused = [j for j in jobs if float(j.get('started') or 0) == 0]
+        running = [j for j in jobs if float(j.get('started') or 0) != 0]
+        paused.sort(key=lambda j: float(j.get('created') or 0), reverse=True if reverse else False)
+        running.sort(key=lambda j: float(j.get('started') or 0), reverse=True if reverse else False)
+        jobs_sorted = paused + running
+    else:
+        jobs_sorted = sorted(jobs, key=sort_key, reverse=reverse)
+
+    total = len(jobs_sorted)
+    total_pages = max(1, ceil(total / page_size))
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * page_size
+    items = jobs_sorted[start:start + page_size]
+
+    return jsonify({
+        'page': page,
+        'page_size': page_size,
+        'total': total,
+        'total_pages': total_pages,
+        'items': items
+    })
 
 @app.post('/add_job')
 def add_job():
