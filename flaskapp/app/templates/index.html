@@ -135,7 +135,12 @@
             <div class="text-xs text-gray-600 mt-1">Choose which audio stream to encode.</div>
           </div>
         </div>        
-
+        <div class="flex items-center gap-2">
+          <input id="job-serialize-pipeline" type="checkbox" class="h-4 w-4">
+          <label for="job-serialize-pipeline" class="text-sm">
+            Serialize pipeline for this job
+          </label>
+        </div>
         <div class="flex gap-2 pt-2">
           <button id="save-job-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 hidden">Save</button>
           <button id="start-job-btn" class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 hidden">Start Job</button>
@@ -168,6 +173,12 @@
           <input id="global-auto-start" type="checkbox" class="h-4 w-4">
           <label for="global-auto-start" class="text-sm">Automatically start encode jobs</label>
         </div>
+        <div class="flex items-center gap-2">
+          <input id="global-serialize-pipeline" type="checkbox" class="h-4 w-4">
+          <label for="global-serialize-pipeline" class="text-sm">
+            Serialize pipeline (split → encode → stitch)
+          </label>
+        </div>        
         <div class="flex gap-2 pt-2">
           <button id="save-global-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Save</button>
           <button type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300" onclick="closeModal('global-settings-modal')">Close</button>
@@ -424,17 +435,18 @@
       document.getElementById('global-segment-duration').value = data.segment_duration ?? 10;
       document.getElementById('global-number-parts').value = data.number_parts ?? 2;
       document.getElementById('global-auto-start').checked = !!data.auto_start;
+      document.getElementById('global-serialize-pipeline').checked = !!data.serialize_pipeline;      
       document.getElementById('global-settings-modal').classList.remove('hidden');
     }
     async function saveGlobalSettings() {
       const segment_duration = parseInt(document.getElementById('global-segment-duration').value, 10);
       const number_parts = parseInt(document.getElementById('global-number-parts').value, 10);
       const auto_start = document.getElementById('global-auto-start').checked;
-
+      const serialize_pipeline = document.getElementById('global-serialize-pipeline').checked;
       const res = await fetch('/global_settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ segment_duration, number_parts, auto_start })
+        body: JSON.stringify({ segment_duration, number_parts, auto_start, serialize_pipeline })
       });
       if (res.ok) {
         toast('Saved global settings', true);
@@ -469,6 +481,9 @@
       document.getElementById('settings-filename').value = data.filename || '';
       document.getElementById('settings-segment-duration').value = data.segment_duration || 10;
       document.getElementById('settings-number-parts').value = data.number_parts || 2;
+      document.getElementById('job-serialize-pipeline').checked =
+        String(data.serialize_pipeline) === '1' || data.serialize_pipeline === true;
+      document.getElementById('job-serialize-pipeline').disabled = !editable;
 
       // Streams
       const vSel = document.getElementById('settings-v-stream');
@@ -550,11 +565,16 @@
       const aSel = document.getElementById('settings-a-stream');
       const selected_v_stream = vSel.selectedIndex; // not vSel.value
       const selected_a_stream = aSel.selectedIndex; // not aSel.value      
+      const serialize_pipeline = document.getElementById('job-serialize-pipeline').checked;
 
       const res = await fetch(`/job_settings/${job_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ segment_duration, number_parts, selected_v_stream, selected_a_stream })
+        body: JSON.stringify({
+          segment_duration, number_parts,
+          selected_v_stream, selected_a_stream,
+          serialize_pipeline
+        })
       });
       if (res.ok) {
         closeModal('job-settings-modal');

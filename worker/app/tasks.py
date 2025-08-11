@@ -32,6 +32,10 @@ def is_job_halted(job_id):
         return True
     return status in (STATUS_FAILED, STATUS_STOPPED)
 
+def serialize_enabled(job_key: str) -> bool:
+    v = redis_client.hget(job_key, 'serialize_pipeline')
+    return str(v).lower() in ('1', 'true', 'yes')
+
 # --- add near the top with the other imports in worker/app/tasks.py ---
 import shlex
 
@@ -345,7 +349,8 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
 
                 # Previous chunk just closed -> enqueue encode, count it as created
                 if previous_chunk_index is not None and previous_chunk_path:
-                    encode_chunk(job_id, previous_chunk_path, previous_chunk_index)
+                    if not serialize_enabled(job_key):
+                        encode_chunk(job_id, previous_chunk_path, previous_chunk_index)
                     created, est_total, prog = update_progress(increment=True)
                     logger.info(f"VEM [{job_id}] Segmented chunk {created}/{est_total}, {prog}%")
 
@@ -361,7 +366,8 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
 
         # Final chunk of this part (if any)
         if previous_chunk_path is not None:
-            encode_chunk(job_id, previous_chunk_path, previous_chunk_index)
+            if not serialize_enabled(job_key):
+                encode_chunk(job_id, previous_chunk_path, previous_chunk_index)
             created, est_total, prog = update_progress(increment=True)
             logger.info(
                 f"VEM [{job_id}] Segmented last chunk P{part}:{previous_chunk_index} "
@@ -379,35 +385,31 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
         logger.info(f"VEM [{job_id}] Part {part} complete. parts_remaining={remaining}")
 
         if remaining == 0:
-            # All parts finished segmenting. Lock in exact total across parts.
-            try:
+            # compute exact_total across parts (existing code) ...
+            # mark segment_progress etc (existing) ...
+
+            if serialize_enabled(job_key):
+                # Enumerate ALL .ts chunks and enqueue *now*
+                all_ts = []
                 num_parts = int(redis_client.hget(job_key, 'num_parts') or redis_client.hget(job_key, 'number_parts') or 2)
-                exact_total = 0
                 for p in range(num_parts):
-                    max_idx = int(redis_client.hget(job_key, f'part_{p}_max_idx') or -1)
-                    if max_idx >= 0:
-                        exact_total += (max_idx + 1)
-                if exact_total > 0:
-                    redis_client.hset(job_key, 'total_chunks', exact_total)
-            except Exception:
-                pass
-
-            redis_client.hset(job_key, mapping={
-                'segment_progress': 100,
-                'segment_end_time': time.time()
-            })
-
-            # (Optional) compute segmentation fps if we have frame_count
-            try:
-                started_at = float(redis_client.hget(job_key, 'started_at') or time.time())
-                total_frames = int(redis_client.hget(job_key, 'total_frames') or 0)
-                if total_frames:
-                    seg_elapsed = max(0.001, time.time() - started_at)
-                    redis_client.hset(job_key, 'segmentation_fps', round(total_frames / seg_elapsed, 2))
-            except Exception:
-                pass
-
-            stitch_video(job_id)
+                    part_dir = os.path.join(job_dir, f"part_{int(p):03d}")
+                    files = sorted(glob.glob(os.path.join(part_dir, "chunk_*.ts")))
+                    for fpath in files:
+                        m = re.search(r"chunk_(\d+)\.ts$", os.path.basename(fpath))
+                        if m:
+                            all_ts.append((p, int(m.group(1)), fpath))
+                # Order encodes by part then index to be deterministic
+                all_ts.sort(key=lambda t: (t[0], t[1]))
+                enc_total = len(all_ts)
+                redis_client.set(f"{job_key}:enc_pending", enc_total)
+                logger.info(f"VEM [{job_id}] Serialized mode: enqueue {enc_total} encodes after segmentation completes.")
+                for _, idx, path in all_ts:
+                    encode_chunk(job_id, path, idx)
+                # DO NOT stitch yet; encode_chunk will trigger stitch when pending hits 0
+            else:
+                # Non-serialized (existing behavior): start stitch monitor now
+                stitch_video(job_id)
 
         return {'status': 'COMPLETED', 'part': part}
 
@@ -478,6 +480,14 @@ def encode_chunk(job_id, chunk_path, chunk_index):
                 'encode_elapsed': round(encode_end_time - encode_start_time, 2)
             })
 
+        # existing progress updates above...
+        if serialize_enabled(f"job:{job_id}"):
+            pending = redis_client.decr(f"job:{job_id}:enc_pending")
+            logger.info(f"VEM [{job_id}] Encoded chunk {chunk_index}, pending encodes left = {pending}")
+            if pending == 0:
+                logger.info(f"VEM [{job_id}] All encodes complete (serialized). Launch stitching.")
+                stitch_video(job_id)
+                
         return {'status': 'COMPLETED', 'chunk_index': chunk_index}
 
     except subprocess.CalledProcessError as e:

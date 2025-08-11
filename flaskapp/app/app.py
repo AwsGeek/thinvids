@@ -92,6 +92,7 @@ def post_global_settings():
         segment_duration = int(data.get('segment_duration', 10))
         number_parts = int(data.get('number_parts', 2))
         auto_start = bool(data.get('auto_start', True))
+        serialize_pipeline = bool(data.get('serialize_pipeline', False))
 
         if not (1 <= segment_duration <= 300):
             return "Segment length must be between 1 and 300 seconds.", 400
@@ -101,13 +102,14 @@ def post_global_settings():
         redis_client.hset('settings:global', mapping={
             'segment_duration': segment_duration,
             'number_parts': number_parts,
-            'auto_start': '1' if auto_start else '0'
+            'auto_start': '1' if auto_start else '0',
+            'serialize_pipeline': '1' if serialize_pipeline else '0',
         })
-        logger.info(f"[GLOBAL] Saved settings: segment_duration={segment_duration}, number_parts={number_parts}, auto_start={auto_start}")
         return jsonify({'status': 'ok'})
-    except Exception as e:
-        logger.exception(f"[GLOBAL] Failed to save settings: {e}")
+    except Exception:
+        logger.exception("Failed to save global settings")
         return "Failed to save global settings.", 500
+
 
 
 # ------------------------ Jobs API -------------------------
@@ -238,6 +240,7 @@ def add_job():
 
     auto_start_global = global_settings.get('auto_start', '1') == '1'
     auto_start_effective = (auto_start_global and not force_paused)
+    serialize_global  = global_settings.get('serialize_pipeline', '0') == '1'
 
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
@@ -254,6 +257,7 @@ def add_job():
         'stitched_chunks': 0,
         'segment_duration': segment_duration,
         'number_parts': number_parts,
+        'serialize_pipeline': '1' if serialize_global else '0',
         # placeholders (worker fills in)
         'source_codec': '',
         'source_resolution': '',
@@ -311,6 +315,7 @@ def copy_job():
         src.get('number_parts', globals_map.get('number_parts')),
         2
     )
+    serialize_src = src.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
 
     # New job skeleton (no stats/meta)
     new_job_id = str(uuid.uuid4())
@@ -326,6 +331,7 @@ def copy_job():
         'started_at': '0',
         'segment_duration': segment_duration,
         'number_parts': number_parts,
+        'serialize_pipeline': '1' if str(serialize_src) in ('1','true','True') else '0',
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -405,6 +411,8 @@ def restart_job(job_id):
         2
     )
 
+    serialize_existing = job.get('serialize_pipeline', (globals_map.get('serialize_pipeline', '0')))
+
     for key in redis_client.scan_iter(f"{job_key}*"):
         redis_client.delete(key)
 
@@ -421,6 +429,7 @@ def restart_job(job_id):
         'started_at': str(now),
         'segment_duration': segment_duration,
         'number_parts': number_parts,
+        'serialize_pipeline': '1' if str(serialize_existing) in ('1','true','True') else '0',
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -570,6 +579,7 @@ def job_settings(job_id):
             'status': job.get('status'),
             'segment_duration': int(job.get('segment_duration', '10')),
             'number_parts': int(job.get('number_parts', '2')),
+            'serialize_pipeline': job.get('serialize_pipeline', '0'),
             'streams': streams_json,
             'selected_v_stream': job.get('selected_v_stream', '0'),
             'selected_a_stream': job.get('selected_a_stream', '0'),
@@ -585,7 +595,8 @@ def job_settings(job_id):
     try:
         seg   = int(data.get('segment_duration', job.get('segment_duration', 10)))
         parts = int(data.get('number_parts', job.get('number_parts', 2)))
-
+        serialize_pipeline = bool(data.get('serialize_pipeline',
+                                   job.get('serialize_pipeline', '0') in ('1','true','True')))
         v_sel = data.get('selected_v_stream', job.get('selected_v_stream', 0))
         a_sel = data.get('selected_a_stream', job.get('selected_a_stream', 0))
 
@@ -596,7 +607,8 @@ def job_settings(job_id):
             'segment_duration': seg,
             'number_parts': parts,
             'selected_v_stream': v_sel,
-            'selected_a_stream': a_sel
+            'selected_a_stream': a_sel,
+            'serialize_pipeline': '1' if serialize_pipeline else '0',
         }
         redis_client.hset(job_key, mapping=mapping)
 
