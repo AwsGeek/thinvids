@@ -208,6 +208,9 @@ def copy_job():
     # New job skeleton (no stats/meta)
     new_job_id = str(uuid.uuid4())
     now = time.time()
+    selected_v_stream = src.get('selected_v_stream',0)
+    selected_a_stream = src.get('selected_a_stream',0)
+
     new_job = {
         'job_id': new_job_id,
         'filename': filename,
@@ -216,15 +219,22 @@ def copy_job():
         'started_at': '0',
         'segment_duration': segment_duration,
         'number_parts': number_parts,
+        'selected_v_stream': selected_v_stream,
+        'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
         'completed_chunks': 0,
-        'stitched_chunks': 0,
-        # leave out: job_dir, encode times, source_* fields, etc.
+        'stitched_chunks': 0
     }
-
     redis_client.hset(f"job:{new_job_id}", mapping=new_job)
     logger.info(f"[{new_job_id}] Copied from {source_job_id} with filename={filename}, "
                 f"segment_duration={segment_duration}, number_parts={number_parts} (PAUSED)")
+
+    try:
+        full_path = os.path.join("/watch", filename.lstrip('/'))
+        probe_source(new_job_id, full_path)   # async
+        logger.info(f"[{new_job_id}] Launched probe_source (source had no streams_json)")
+    except Exception as e:
+        logger.warning(f"[{new_job_id}] probe_source dispatch failed: {e}")
 
     return jsonify({'status': 'success', 'job_id': new_job_id}), 201
 
@@ -293,6 +303,9 @@ def restart_job(job_id):
 
     # New job skeleton (no stats/meta), but use the same job ID
     now = time.time()
+    selected_v_stream = job.get('selected_v_stream', 0)
+    selected_a_stream = job.get('selected_a_stream', 0)
+
     new_job = {
         'job_id': job_id,
         'filename': filename,
@@ -301,12 +314,12 @@ def restart_job(job_id):
         'started_at': str(now),
         'segment_duration': segment_duration,
         'number_parts': number_parts,
+        'selected_v_stream': selected_v_stream,
+        'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
         'completed_chunks': 0,
         'stitched_chunks': 0,
-        # leave out: job_dir, encode times, source_* fields, etc.
     }
-
     redis_client.hset(f"job:{job_id}", mapping=new_job)
 
     segment_video(job_id, f'/watch/{filename}', filename)
@@ -439,30 +452,66 @@ def job_settings(job_id):
 
     if request.method == 'GET':
         job = redis_client.hgetall(job_key)
-        return jsonify({
+        streams_json = job.get('streams_json') or '{"video":[],"audio":[]}'
+        try:
+            streams = json.loads(streams_json)
+        except Exception:
+            streams = {'video': [], 'audio': []}
+        return jsonify({ 
             'job_id': job_id,
             'filename': job.get('filename'),
             'status': job.get('status'),
-            'segment_duration': int(job.get('segment_duration', 10)),
-            'number_parts': int(job.get('number_parts', 2))
+            'segment_duration': int(job.get('segment_duration', '10')),
+            'number_parts': int(job.get('number_parts', '2')),
+            'streams': streams_json,
+            'selected_v_stream': job.get('selected_v_stream', '0'),
+            'selected_a_stream': job.get('selected_a_stream', '0'),
         })
 
     # POST
     job = redis_client.hgetall(job_key)
-    if job.get('status') != 'PAUSED':
-        return jsonify({'error': 'Job is not in PAUSED state'}), 400
+    # Allow changing when the job is not actively RUNNING
+    if job.get('status') in ['RUNNING']:
+        return jsonify({'error': 'Job is RUNNING; stop it or copy/restart to change settings.'}), 400
 
     data = request.get_json(silent=True) or {}
     try:
-        seg = int(data.get('segment_duration', job.get('segment_duration', 10)))
+        seg   = int(data.get('segment_duration', job.get('segment_duration', 10)))
         parts = int(data.get('number_parts', job.get('number_parts', 2)))
+
+        v_sel = data.get('selected_v_stream', job.get('selected_v_stream', 0))
+        a_sel = data.get('selected_a_stream', job.get('selected_a_stream', 0))
+
+        v_sel = int(v_sel)
+        a_sel = int(a_sel)
 
         if not (1 <= seg <= 300):
             return jsonify({'error': 'segment_duration must be between 1 and 300'}), 400
         if not (1 <= parts <= 8):
             return jsonify({'error': 'number_parts must be between 1 and 8'}), 400
 
-        redis_client.hset(job_key, mapping={'segment_duration': seg, 'number_parts': parts})
+        # (Optional) validate indices against probed streams
+        streams_json = job.get('streams_json') or '{"video":[],"audio":[]}'
+        try:
+            streams = json.loads(streams_json)
+        except Exception:
+            streams = {'video': [], 'audio': []}
+        video_indices = {int(s.get('index', -1)) for s in (streams.get('video') or [])}
+        audio_indices = {int(s.get('index', -1)) for s in (streams.get('audio') or [])}
+ 
+        if video_indices and v_sel not in video_indices:
+            return jsonify({'error': f'Invalid video stream index {v_sel}'}), 400
+        if a_sel >= 0 and audio_indices and a_sel not in audio_indices:
+            return jsonify({'error': f'Invalid audio stream index {a_sel}'}), 400
+
+        mapping = {
+            'segment_duration': seg,
+            'number_parts': parts,
+            'selected_v_stream': v_sel,
+            'selected_a_stream': a_sel
+        }
+        redis_client.hset(job_key, mapping=mapping)
+
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
         logger.exception(f"[{job_id}] Failed to update job settings: {e}")

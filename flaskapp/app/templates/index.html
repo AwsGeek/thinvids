@@ -87,6 +87,18 @@
             <input id="settings-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
           </div>
         </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-sm font-medium mb-1" for="settings-v-stream">Video Stream</label>
+            <select id="settings-v-stream" class="border p-2 rounded w-full"></select>
+            <div class="text-xs text-gray-600 mt-1">Choose which video stream to encode.</div>
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1" for="settings-a-stream">Audio Stream</label>
+            <select id="settings-a-stream" class="border p-2 rounded w-full"></select>
+            <div class="text-xs text-gray-600 mt-1">Choose which audio stream to encode.</div>
+          </div>
+        </div>        
 
         <div class="flex gap-2 pt-2">
           <button id="save-job-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 hidden">Save</button>
@@ -278,21 +290,78 @@
       const res = await fetch(`/job_settings/${job_id}`);
       if (!res.ok) return alert('Failed to load settings');
       const data = await res.json();
-      const paused = (data.status === 'PAUSED');
+      console.log(data)
+
+      const editable = ['READY','STOPPED','FAILED'].includes(String(data.status || '').toUpperCase());
 
       document.getElementById('settings-job-id').value = job_id;
       document.getElementById('settings-filename').value = data.filename || '';
       document.getElementById('settings-segment-duration').value = data.segment_duration || 10;
       document.getElementById('settings-number-parts').value = data.number_parts || 2;
 
-      document.getElementById('settings-segment-duration').disabled = !paused;
-      document.getElementById('settings-number-parts').disabled = !paused;
+      // Streams
+      const vSel = document.getElementById('settings-v-stream');
+      const aSel = document.getElementById('settings-a-stream');
+      vSel.innerHTML = '';
+      aSel.innerHTML = '';
 
-      document.getElementById('save-job-settings-btn').classList.toggle('hidden', !paused);
-      document.getElementById('start-job-btn').classList.toggle('hidden', !paused);
+      const streams = JSON.parse(data.streams || {}) ;
+      const vids = streams.video || [];
+      const auds = streams.audio || [];
+      console.log(vids)
+      console.log(auds)
 
-      document.getElementById('job-settings-help').innerHTML = paused
-        ? 'This job is <strong>PAUSED</strong>. You can change settings and then start the job.'
+      vids.forEach((v,idx) => {
+        const label = [
+          `#${idx}`, v.codec || '',
+          v.width && v.height ? `${v.width}x${v.height}` : '',
+          v.fps ? `${Number(v.fps).toFixed(2)}fps` : '',
+          v.title ? `“${v.title}”` : ''
+        ].filter(Boolean).join(' · ');
+        const opt = document.createElement('option');
+        opt.value = String(idx);
+        opt.textContent = label;
+        vSel.appendChild(opt);
+      });
+
+      auds.forEach((a,idx) => {
+        const label = [
+          `#${idx}`, a.codec || '',
+          a.channel_layout || (a.channels ? `${a.channels}ch` : ''),
+          a.language || '',
+          a.title ? `“${a.title}”` : '',
+          a.disposition_default ? '(default)' : ''
+        ].filter(Boolean).join(' · ');
+        const opt = document.createElement('option');
+        opt.value = String(idx);
+        opt.textContent = label;
+        aSel.appendChild(opt);
+      });
+
+      function setSelectIndexByValue(sel, val, fallback = 0) {
+        if (!sel || sel.options.length === 0) return;
+        let idx = parseInt(val, 10);
+        if (Number.isNaN(idx)) idx = fallback;
+        if (idx < 0 || idx >= sel.options.length) idx = fallback;
+        sel.selectedIndex = idx;
+      }
+
+      // Preselect current choices (fallback to first if missing/out of range)
+      setSelectIndexByValue(vSel, data.selected_v_stream, 0);
+      setSelectIndexByValue(aSel, data.selected_a_stream, 0);
+
+      // Enable/disable inputs
+      document.getElementById('settings-segment-duration').disabled = !editable;
+      document.getElementById('settings-number-parts').disabled = !editable;
+      vSel.disabled = !editable;
+      aSel.disabled = !editable;
+
+      // Show buttons
+      document.getElementById('save-job-settings-btn').classList.toggle('hidden', !editable);
+      document.getElementById('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase() === 'READY'));
+
+      document.getElementById('job-settings-help').innerHTML = editable
+        ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED).'
         : 'This job is active or finished. Settings are read-only.';
 
       document.getElementById('save-job-settings-btn').onclick = saveJobSettings;
@@ -306,10 +375,15 @@
       const segment_duration = parseInt(document.getElementById('settings-segment-duration').value, 10);
       const number_parts = parseInt(document.getElementById('settings-number-parts').value, 10);
 
+      const vSel = document.getElementById('settings-v-stream');
+      const aSel = document.getElementById('settings-a-stream');
+      const selected_v_stream = vSel.selectedIndex; // not vSel.value
+      const selected_a_stream = aSel.selectedIndex; // not aSel.value      
+
       const res = await fetch(`/job_settings/${job_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ segment_duration, number_parts })
+        body: JSON.stringify({ segment_duration, number_parts, selected_v_stream, selected_a_stream })
       });
       if (res.ok) {
         closeModal('job-settings-modal');
@@ -319,6 +393,7 @@
         alert(msg || 'Failed to save settings');
       }
     }
+
 
     // ---------- Jobs CRUD ----------
     async function copyJob(job_id) {
@@ -523,7 +598,7 @@
 
         const canStart   = job.status === 'READY';
         const canStop    = job.status === 'RUNNING';
-        const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED');
+        const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED'  || job.status === 'DONE');
 
         const totalChunks = Number(job.total_chunks || 0);
         const segCount    = Number(job.segmented_chunks || 0);

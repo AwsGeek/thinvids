@@ -38,110 +38,104 @@ import shlex
 # --- add alongside other @huey.task() defs ---
 @huey.task()
 def probe_source(job_id: str, file_path: str):
-    """
-    Lightweight async probe task. Extracts file size, duration, codec, resolution, fps
-    and stores them into job:{job_id} as:
-      - source_file_size (int bytes)
-      - source_duration (float seconds)
-      - source_codec (str)
-      - source_resolution (e.g., "1920x1080")
-      - source_fps (float)
-      - total_frames (int, if available / best-effort)
-    Safe to run before or without starting segmentation.
-    """
     job_key = f"job:{job_id}"
     try:
         if not os.path.exists(file_path):
-            # If path isn't accessible on this node, try a direct path from job (if any)
             job = redis_client.hgetall(job_key) or {}
             alt = job.get('filename')
             if alt and os.path.exists(alt):
                 file_path = alt
 
-        # Format & stream probes
-        fmt_cmd = [
+        # One shot: show streams + format as JSON
+        probe_cmd = [
             'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration,size',
-            '-of', 'json',
-            file_path
+            '-show_entries', 'format=duration,size:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
+            '-of', 'json', file_path
         ]
-        v_cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=codec_name,width,height,avg_frame_rate,nb_frames',
-            '-of', 'json',
-            file_path
-        ]
+        res = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise subprocess.CalledProcessError(res.returncode, probe_cmd, res.stdout, res.stderr)
 
-        def _run(cmd):
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
-            return json.loads(res.stdout or '{}')
+        info = json.loads(res.stdout or '{}')
+        fmt = info.get('format', {}) or {}
+        streams = info.get('streams', []) or []
 
-        fmt = {}
-        vid = {}
-        try:
-            fmt = _run(fmt_cmd).get('format', {}) or {}
-        except Exception as e:
-            logger.warning(f"VEM [{job_id}] ffprobe format failed: {e}")
-
-        try:
-            streams = _run(v_cmd).get('streams', []) or []
-            vid = streams[0] if streams else {}
-        except Exception as e:
-            logger.warning(f"VEM [{job_id}] ffprobe video stream failed: {e}")
-
-        # Parse values
-        size_b = int(fmt.get('size', 0)) if str(fmt.get('size', '')).isdigit() else 0
+        # Format
         try:
             duration_s = float(fmt.get('duration', 0) or 0)
         except Exception:
             duration_s = 0.0
+        size_b = int(fmt.get('size', 0) or 0)
 
-        codec = vid.get('codec_name') or ''
-        width = vid.get('width') or 0
-        height = vid.get('height') or 0
-        reso = f"{width}x{height}" if width and height else ''
+        # Split streams for UI
+        video_streams = []
+        audio_streams = []
+        for s in streams:
+            base = {
+                'index': int(s.get('index', 0)),
+                'codec': s.get('codec_name') or '',
+                'disposition_default': bool((s.get('disposition') or {}).get('default', 0)),
+                'title': ((s.get('tags') or {}).get('title') or ''),
+                'language': ((s.get('tags') or {}).get('language') or '')
+            }
+            if s.get('codec_type') == 'video':
+                afr = s.get('avg_frame_rate') or '0'
+                try:
+                    fps = (float(afr.split('/')[0]) / float(afr.split('/')[1])) if '/' in afr else float(afr)
+                except Exception:
+                    fps = 0.0
+                v = {
+                    **base,
+                    'width': s.get('width') or 0,
+                    'height': s.get('height') or 0,
+                    'fps': fps,
+                    'nb_frames': int(s.get('nb_frames', 0) or 0)
+                }
+                video_streams.append(v)
+            elif s.get('codec_type') == 'audio':
+                a = {
+                    **base,
+                    'channels': int(s.get('channels') or 0),
+                    'channel_layout': s.get('channel_layout') or ''
+                }
+                audio_streams.append(a)
 
-        # fps: avg_frame_rate can be "30000/1001"
-        afr = vid.get('avg_frame_rate') or '0'
-        try:
-            if '/' in afr:
-                num, den = afr.split('/', 2)
-                fps = float(num) / float(den) if float(den) != 0 else 0.0
-            else:
-                fps = float(afr)
-        except Exception:
-            fps = 0.0
+        # Choose sensible defaults if not set:
+        #  - video: first stream (or one with disposition default)
+        #  - audio: default-disposition if present else with most channels else first
+        job_now = redis_client.hgetall(job_key) or {}
+        redis_client.hset(job_key, 'selected_v_stream', 0)
+        redis_client.hset(job_key, 'selected_a_stream', 0)
 
-        # frames best-effort
-        nb_frames = vid.get('nb_frames')
-        try:
-            total_frames = int(nb_frames) if (nb_frames is not None and str(nb_frames).isdigit()) else 0
-        except Exception:
-            total_frames = 0
+        # Primary (first) video stream fields for top table
+        primary_v = video_streams[0] if video_streams else {}
+        codec = primary_v.get('codec', '')
+        reso = f"{primary_v.get('width',0)}x{primary_v.get('height',0)}" if primary_v else ''
+        fps = float(primary_v.get('fps', 0) or 0)
+
+        total_frames = int(primary_v.get('nb_frames') or 0)
         if total_frames == 0 and duration_s and fps:
             total_frames = int(duration_s * fps)
 
-        # Store to Redis
         mapping = {
             'source_file_size': size_b,
             'source_duration': f"{duration_s:.2f}" if duration_s else '0',
             'source_codec': codec,
             'source_resolution': reso,
             'source_fps': f"{fps:.2f}" if fps else '0',
+            'streams_json': json.dumps({'video': video_streams, 'audio': audio_streams})
         }
         if total_frames:
             mapping['total_frames'] = total_frames
 
         redis_client.hset(job_key, mapping=mapping)
-        logger.info(f"VEM [{job_id}] Metadata populated via ffprobe: {mapping}")
-        return {'status': 'OK', **mapping}
+        logger.info(f"VEM [{job_id}] Probed streams: {mapping['streams_json']}")
+        return {'status': 'OK'}
 
     except Exception as e:
-        logger.exception(f"VEM [{job_id}] ffprobe metadata error")
+        logger.exception(f"VEM [{job_id}] ffprobe error")
         return {'status': 'ERROR', 'error': str(e)}
+
 
 
 @huey.task()
@@ -290,12 +284,16 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
         # NEW: per-part, always start numbering at 0
         out_pattern = os.path.join(part_dir, "chunk_%03d.ts")
 
+        selected_v_stream = job_data.get('selected_v_stream', 0)
+        selected_a_stream = job_data.get('selected_a_stream', 0)
+
         cmd = [
             'ffmpeg',
             '-ss', str(max(0.0, start_time)),
             '-t', str(max(0.0, length)),
             '-i', file_path,
-            '-map', '0',
+            '-map', f"0:v:{selected_v_stream}",
+            '-map', f"0:a:{selected_a_stream}",
             '-c', 'copy',
             '-bsf:v', bsf,
             '-f', 'segment',
@@ -304,6 +302,7 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
             '-segment_start_number', '0',
             out_pattern
         ]
+
         logger.info(f"VEM [{job_id}] Part {part}: { ' '.join(cmd) }")
 
         segment_re = re.compile(r"Opening '.*?chunk_(\d+)\.ts' for writing")
@@ -394,7 +393,6 @@ def segment_part(job_id, file_path, part, start_time, length, start_index):
                 pass
 
             redis_client.hset(job_key, mapping={
-                'status': STATUS_DONE,
                 'segment_progress': 100,
                 'segment_end_time': time.time()
             })
@@ -431,6 +429,9 @@ def encode_chunk(job_id, chunk_path, chunk_index):
             logger.warning(f"VEM [{job_id}] Missing chunk file: {chunk_path}. Aborting encode.")
             return {'status': 'ABORTED'}
 
+        job_key = f"job:{job_id}"
+        job_data = redis_client.hgetall(job_key) or {}
+
         encoded_path = chunk_path.replace('chunk_', 'encoded_chunk_').replace('.ts', '.mp4')
 
         cmd = [
@@ -438,7 +439,7 @@ def encode_chunk(job_id, chunk_path, chunk_index):
             '-i', chunk_path,
             '-vf', 'scale=-1:720,format=nv12,hwupload',
             '-map', '0:v:0',
-            '-map', '0:a:0?',
+            '-map', '0:a:0',
             '-c:v', 'h264_vaapi',
             '-rc_mode', 'CQP',
             '-qp', '27',
