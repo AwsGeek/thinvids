@@ -426,6 +426,15 @@
         </div>
       `;
     }
+    function stackedSrcDst(src, dst, showDst) {
+      if (!showDst || !dst) return src;
+      return `
+        <div class="leading-tight">
+          <div>${src}</div>
+          <div>${dst}</div>
+        </div>
+      `;
+    }    
 
     // ---------- Global Settings ----------
     async function showGlobalSettings() {
@@ -788,12 +797,6 @@
         const displayName = prettyTitleFromPath(job.filename || '');
         const nameColor = statusColorClass(job.status || '');
 
-        const sizeDisp = formatBytes(job.source_file_size);
-        const dimDisp = job.source_resolution || '…';
-        const durDisp = formatDurationSeconds(job.source_duration);
-        const codecDisp = job.source_codec || '…';
-        const fpsDisp = formatFPS(job.source_fps);
-
         const canStart   = job.status === 'READY';
         const canStop    = job.status === 'RUNNING';
         const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED'  || job.status === 'DONE');
@@ -822,15 +825,44 @@
             </button>`
           : `<span class="font-bold ${nameColor}">${displayName}</span>`;
 
+          // Src displays (existing)
+          const sizeDisp = formatBytes(job.source_file_size);
+          const dimDisp  = job.source_resolution || '…';
+          const durDisp  = formatDurationSeconds(job.source_duration);
+          const codecDisp= job.source_codec || '…';
+          const fpsDisp  = formatFPS(job.source_fps);
+
+          // Dst displays (NEW)
+          const sizeDst  = formatBytes(job.dest_file_size);
+          const dimDst   = job.dest_resolution || '…';
+          const durDst   = formatDurationSeconds(job.dest_duration);
+          const codecDst = job.dest_codec || '…';
+          const fpsDst   = formatFPS(job.dest_fps);
+
+          // Show Dst only when DONE and we have *some* dst signal
+          const showDst  = isDone && (
+            job.dest_file_size || job.dest_resolution || job.dest_duration ||
+            job.dest_codec || job.dest_fps
+          );
+
         row.innerHTML = `
           <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
           <td class="px-2 py-1">${nameCellHTML}</td>
-          <td class="px-2 py-1 whitespace-nowrap">${sizeDisp}</td>
-          <td class="px-2 py-1 whitespace-nowrap">${dimDisp}</td>
-          <td class="px-2 py-1 whitespace-nowrap">${durDisp}</td>
-          <td class="px-2 py-1 whitespace-nowrap">${codecDisp}</td>
-          <td class="px-2 py-1 whitespace-nowrap">${fpsDisp}</td>
-
+          <td class="px-2 py-1">
+            ${stackedSrcDst(sizeDisp,  sizeDst,  showDst)}
+          </td>
+          <td class="px-2 py-1">
+            ${stackedSrcDst(dimDisp,   dimDst,   showDst)}
+          </td>
+          <td class="px-2 py-1">
+            ${stackedSrcDst(durDisp,   durDst,   showDst)}
+          </td>
+          <td class="px-2 py-1">
+            ${stackedSrcDst(codecDisp, codecDst, showDst)}
+          </td>
+          <td class="px-2 py-1">
+            ${stackedSrcDst(fpsDisp,   fpsDst,   showDst)}
+          </td>
           <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.segment_progress || 0)}
             <div class="text-gray-600 text-xs text-center mt-1">

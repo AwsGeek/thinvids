@@ -108,8 +108,47 @@ def probe_source(job_id: str, file_path: str):
         #  - video: first stream (or one with disposition default)
         #  - audio: default-disposition if present else with most channels else first
         job_now = redis_client.hgetall(job_key) or {}
+
+        # --- VIDEO selection (unchanged behavior, but keep prior if valid) ---
+        v_sel = 0
+        try:
+            prior_v = int(job_now.get('selected_v_stream', 0))
+            if 0 <= prior_v < len(video_streams):
+                v_sel = prior_v
+        except Exception:
+            pass
+            
+        # --- AUDIO selection with English preference ---
+        a_sel = None
+        # 1) keep prior if valid
+        try:
+            prior_a = int(job_now.get('selected_a_stream', -1))
+            if 0 <= prior_a < len(audio_streams):
+                a_sel = prior_a
+        except Exception:
+            a_sel = None
+
+        # 2) default-disposition
+        if a_sel is None:
+            for i, a in enumerate(audio_streams):
+                if a.get('disposition_default'):
+                    a_sel = i
+                    break
+
+        # 3) first English stream (eng, en, en-*)
+        if a_sel is None:
+            for i, a in enumerate(audio_streams):
+                lang = (a.get('language') or '').strip().lower()
+                if lang in ('eng', 'en', 'en-us', 'en_us', 'en-gb', 'en_gb') or lang.startswith('en'):
+                    a_sel = i
+                    break
+
+        # 4) fallback to 0 if nothing matched
+        if a_sel is None:
+            a_sel = 0 if audio_streams else 0
+
         redis_client.hset(job_key, 'selected_v_stream', 0)
-        redis_client.hset(job_key, 'selected_a_stream', 0)
+        redis_client.hset(job_key, 'selected_a_stream', a_sel)
 
         # Primary (first) video stream fields for top table
         primary_v = video_streams[0] if video_streams else {}
@@ -693,16 +732,59 @@ def stitch_video(job_id):
             redis_client.hset(job_key, 'status', STATUS_FAILED)
             return {'status': 'FAILED', 'error': str(e)}
 
-        if is_job_halted(job_id):
-            logger.info(f"VEM [{job_id}] Job aborted, preserving job directory {job_dir}")
-            return {'status': 'ABORTED'}
-
         # Cleanup
         try:
             shutil.rmtree(job_dir)
             logger.info(f"VEM [{job_id}] Removed job directory {job_dir}")
         except Exception as e:
             logger.warning(f"VEM [{job_id}] Failed to remove job dir {job_dir}: {e}")
+
+        # Probe the final output for Dst metadata
+        try:
+            # file size
+            dst_size_b = os.path.getsize(final_path)
+
+            # ffprobe
+            probe_cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,width,height,avg_frame_rate',
+                '-show_entries', 'format=duration',
+                '-of', 'json', final_path
+            ]
+            pr = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            info = json.loads(pr.stdout or '{}')
+            fmt = info.get('format', {}) or {}
+            streams = info.get('streams', []) or []
+            v0 = streams[0] if streams else {}
+
+            # duration
+            try:
+                dst_dur = float(fmt.get('duration', 0) or 0)
+            except Exception:
+                dst_dur = 0.0
+
+            # codec / resolution / fps
+            dst_codec = v0.get('codec_name') or ''
+            w = v0.get('width') or 0
+            h = v0.get('height') or 0
+            afr = v0.get('avg_frame_rate') or '0'
+            try:
+                dst_fps = (float(afr.split('/')[0]) / float(afr.split('/')[1])) if '/' in afr else float(afr)
+            except Exception:
+                dst_fps = 0.0
+
+            # persist Dst fields
+            redis_client.hset(job_key, mapping={
+                'dest_file_size': dst_size_b,
+                'dest_duration': f"{dst_dur:.2f}" if dst_dur else '0',
+                'dest_codec': dst_codec,
+                'dest_resolution': f"{w}x{h}" if (w and h) else '',
+                'dest_fps': f"{dst_fps:.2f}" if dst_fps else '0'
+            })
+        except Exception as e:
+            logger.warning(f"VEM [{job_id}] Failed to probe/stash dst metadata: {e}")
+
 
         redis_client.hset(job_key, mapping={
             'status': STATUS_DONE,
