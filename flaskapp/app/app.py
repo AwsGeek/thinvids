@@ -71,7 +71,6 @@ def metrics_snapshot():
     nodes.sort(key=lambda n: n["hostname"])
     return jsonify({"nodes": nodes})
 
-
 # ------------------- Global settings API -------------------
 @app.get('/global_settings')
 def get_global_settings():
@@ -79,10 +78,12 @@ def get_global_settings():
     segment_duration = int(g.get('segment_duration', 10))
     number_parts = int(g.get('number_parts', 2))
     auto_start = g.get('auto_start', '1') == '1'
+    serialize_pipeline = g.get('serialize_pipeline', '0') == '1'  # add this
     return jsonify({
         'segment_duration': segment_duration,
         'number_parts': number_parts,
-        'auto_start': auto_start
+        'auto_start': auto_start,
+        'serialize_pipeline': serialize_pipeline,                 # and return it
     })
 
 @app.post('/global_settings')

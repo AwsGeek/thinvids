@@ -25,31 +25,20 @@
       </div>
     </div>
 
-
     <div class="grid grid-cols-3 gap-6">
       <div class="bg-white rounded shadow p-4">
         <div class="flex items-baseline justify-between"><h3 class="font-semibold">GPU %</h3><span id="gpu-updated" class="text-xs text-gray-500"></span></div>
-        <div class="w-full h-20">
-          <canvas id="gpuChart" class="w-full h-full"></canvas>
-        </div>
+        <div class="w-full h-20"><canvas id="gpuChart" class="w-full h-full"></canvas></div>
       </div>
-
       <div class="bg-white rounded shadow p-4">
         <div class="flex items-baseline justify-between"><h3 class="font-semibold">CPU %</h3><span id="cpu-updated" class="text-xs text-gray-500"></span></div>
-        <div class="w-full h-20">
-          <canvas id="cpuChart" class="w-full h-full"></canvas>
-        </div>
+        <div class="w-full h-20"><canvas id="cpuChart" class="w-full h-full"></canvas></div>
       </div>
-
       <div class="bg-white rounded shadow p-4">
         <div class="flex items-baseline justify-between"><h3 class="font-semibold">Memory %</h3><span id="mem-updated" class="text-xs text-gray-500"></span></div>
-        <div class="w-full h-20">
-          <canvas id="memChart" class="w-full h-full"></canvas>
-        </div>
+        <div class="w-full h-20"><canvas id="memChart" class="w-full h-full"></canvas></div>
       </div>
-
-    </div>    
-
+    </div>
 
     <h2 class="text-xl font-semibold mb-2">Current Jobs</h2>
 
@@ -60,9 +49,8 @@
           <th class="px-2 py-1 text-left">Name</th>
           <th class="px-2 py-1 text-left">Size</th>
           <th class="px-2 py-1 text-left">Dim</th>
-          <th class="px-2 py-1 text-left">Dur</th>
           <th class="px-2 py-1 text-left">Codec</th>
-          <th class="px-2 py-1 text-left">FPS</th>
+          <th class="px-2 py-1 text-left">Bitrate (kbps)</th>
           <th class="px-2 py-1 text-center">Split</th>
           <th class="px-2 py-1 text-center">Encode</th>
           <th class="px-2 py-1 text-center">Stitch</th>
@@ -75,14 +63,13 @@
       <tbody id="job-list"></tbody>
     </table>
 
-    <!-- Pagination (server-side) -->
     <div id="pagination" class="flex items-center justify-end gap-2 mt-3">
       <button id="pg-first" class="px-2 py-1 border rounded text-sm">« First</button>
       <button id="pg-prev"  class="px-2 py-1 border rounded text-sm">‹ Prev</button>
       <span id="pg-status"  class="text-sm text-gray-700 mx-2">Page 1 / 1</span>
       <button id="pg-next"  class="px-2 py-1 border rounded text-sm">Next ›</button>
       <button id="pg-last"  class="px-2 py-1 border rounded text-sm">Last »</button>
-    </div>    
+    </div>
   </div>
 
   <!-- Toast container -->
@@ -151,42 +138,6 @@
     </div>
   </div>
 
-  <!-- Global Settings Modal -->
-  <div id="global-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
-    <div class="bg-white rounded shadow-lg w-full max-w-lg p-6 relative">
-      <button onclick="closeModal('global-settings-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
-        <span class="material-icons">close</span>
-      </button>
-      <h2 class="text-xl font-semibold mb-4">Global Settings</h2>
-      <form id="global-settings-form" class="space-y-4" onsubmit="return false;">
-        <div>
-          <label class="block text-sm font-medium mb-1" for="global-segment-duration">Segment Length (seconds)</label>
-          <input id="global-segment-duration" type="number" min="1" max="300" class="border p-2 rounded w-full">
-          <div class="text-xs text-gray-600 mt-1">Enter 1–300 seconds. Default is 10.</div>
-        </div>
-        <div>
-          <label class="block text-sm font-medium mb-1" for="global-number-parts">Number of Parts</label>
-          <input id="global-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
-          <div class="text-xs text-gray-600 mt-1">Split the video into 1–8 parts. Default is 2.</div>
-        </div>
-        <div class="flex items-center gap-2">
-          <input id="global-auto-start" type="checkbox" class="h-4 w-4">
-          <label for="global-auto-start" class="text-sm">Automatically start encode jobs</label>
-        </div>
-        <div class="flex items-center gap-2">
-          <input id="global-serialize-pipeline" type="checkbox" class="h-4 w-4">
-          <label for="global-serialize-pipeline" class="text-sm">
-            Serialize pipeline (split → encode → stitch)
-          </label>
-        </div>        
-        <div class="flex gap-2 pt-2">
-          <button id="save-global-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Save</button>
-          <button type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300" onclick="closeModal('global-settings-modal')">Close</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
   <!-- Video Preview Modal -->
   <div id="video-modal" class="fixed inset-0 bg-black bg-opacity-70 hidden z-50 items-center justify-center">
     <div class="bg-white rounded shadow-xl w-full max-w-5xl relative">
@@ -215,64 +166,60 @@
 
   <script>
     // --- helpers ---
-    const BLUE_FILL  = 'rgba(37, 99, 235, 0.85)'; // tailwind blue-600-ish
+    const BLUE_FILL  = 'rgba(37, 99, 235, 0.85)';
     const BLUE_STROKE= 'rgb(37, 99, 235)';
-  
+
     const el = id => document.getElementById(id);
+    const safeOn = (id, evt, handler) => {
+      const node = document.getElementById(id);
+      if (!node) { console.warn(`Element #${id} not found for ${evt}`); return; }
+      node.addEventListener(evt, handler);
+    };
+
     const shortHost = h => {
       if (!h) return '';
       const m = String(h).match(/(\d+)/);
-      return m ? m[1] : h; // show just the number
+      return m ? m[1] : h;
     };
     const tsStr = ts => new Date(ts * 1000).toLocaleTimeString();
-  
+
     const tinyBarOpts = (maxY = 100) => ({
       type: 'bar',
       data: { labels: [], datasets: [{ data: [], backgroundColor: BLUE_FILL, borderColor: BLUE_STROKE, borderWidth: 1 }] },
       options: {
         responsive: true,
-        maintainAspectRatio: false, // honor the 80px (h-20) height
+        maintainAspectRatio: false,
         animation: false,
         plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
         scales: {
-          x: {
-            grid: { display: false },
-            ticks: { autoSkip: false, maxRotation: 0, minRotation: 0, font: { size: 10 } }
-          },
-          y: {
-            beginAtZero: true,
-            suggestedMax: maxY,
-            grid: { display: false },
-            ticks: { stepSize: 50, font: { size: 10 } }
-          }
+          x: { grid: { display: false }, ticks: { autoSkip: false, maxRotation: 0, minRotation: 0, font: { size: 10 } } },
+          y: { beginAtZero: true, suggestedMax: maxY, grid: { display: false }, ticks: { stepSize: 50, font: { size: 10 } } }
         }
       }
     });
-  
+
     const gpuChart = new Chart(el('gpuChart').getContext('2d'), tinyBarOpts(100));
     const cpuChart = new Chart(el('cpuChart').getContext('2d'), tinyBarOpts(100));
     const memChart = new Chart(el('memChart').getContext('2d'), tinyBarOpts(100));
-  
+
     function updateBars(chart, labels, values, suggestedMax) {
       chart.data.labels = labels;
       chart.data.datasets[0].data = values;
       if (suggestedMax !== undefined) chart.options.scales.y.suggestedMax = suggestedMax;
       chart.update();
     }
-  
+
     async function fetchMetrics() {
       try {
         const res = await fetch('/metrics_snapshot');
         if (!res.ok) return;
         const { nodes } = await res.json();
-  
-        // Sort by node number so columns are stable left→right
         nodes.sort((a, b) => {
           const na = parseInt((a.hostname || '').match(/\d+/)?.[0] || 0, 10);
           const nb = parseInt((b.hostname || '').match(/\d+/)?.[0] || 0, 10);
           return na - nb;
         });
-  
+
         const labels = nodes.map(n => shortHost(n.hostname));
         const gpu = nodes.map(n => (n.gpu >= 0 ? Number(n.gpu.toFixed(1)) : 0));
         const cpu = nodes.map(n => Number((n.cpu || 0).toFixed(1)));
@@ -281,69 +228,63 @@
           const pct = total ? (used / total) * 100 : 0;
           return Number(pct.toFixed(1));
         });
-  
+
         updateBars(gpuChart, labels, gpu, 100);
         updateBars(cpuChart, labels, cpu, 100);
         updateBars(memChart, labels, mem, 100);
-  
+
         const latestTs = nodes.length ? Math.max(...nodes.map(n => n.ts || 0)) : 0;
         const stamp = latestTs ? tsStr(latestTs) : '';
         el('gpu-updated').textContent = stamp;
         el('cpu-updated').textContent = stamp;
         el('mem-updated').textContent = stamp;
-      } catch { /* ignore transient errors */ }
+      } catch {}
     }
-  
-    // 1 Hz updates
+
     fetchMetrics();
     setInterval(fetchMetrics, 1000);
   </script>
 
   <script>
-
     // ---- Server-side pagination + sorting ----
-    let CURRENT_PAGE = 1;            // 1-based
-    const PAGE_SIZE = 10;            // fixed as requested
-    let CURRENT_SORT = 'date';       // 'date'|'filename'|'status'|'encode'
-    let CURRENT_DIR  = 'desc';       // 'asc'|'desc'
+    let CURRENT_PAGE = 1;
+    const PAGE_SIZE = 10;
+    let CURRENT_SORT = 'date';
+    let CURRENT_DIR  = 'desc';
 
     function applyPagerState(meta) {
       const { page, total_pages } = meta;
       CURRENT_PAGE = page;
-
-      const status = document.getElementById('pg-status');
-      status.textContent = `Page ${page} / ${total_pages}`;
-
-      document.getElementById('pg-first').disabled = page <= 1;
-      document.getElementById('pg-prev').disabled  = page <= 1;
-      document.getElementById('pg-next').disabled  = page >= total_pages;
-      document.getElementById('pg-last').disabled  = page >= total_pages;
-
-      // store last meta for next/last buttons
+      const status = el('pg-status');
+      if (status) status.textContent = `Page ${page} / ${total_pages}`;
+      const f = el('pg-first'), p = el('pg-prev'), n = el('pg-next'), l = el('pg-last');
+      if (f) f.disabled = page <= 1;
+      if (p) p.disabled = page <= 1;
+      if (n) n.disabled = page >= total_pages;
+      if (l) l.disabled = page >= total_pages;
       window.__PAGER_META__ = meta;
     }
 
     window.addEventListener('DOMContentLoaded', () => {
-      document.getElementById('pg-first').addEventListener('click', () => { CURRENT_PAGE = 1; fetchJobs(false); });
-      document.getElementById('pg-prev').addEventListener('click',  () => { CURRENT_PAGE = Math.max(1, CURRENT_PAGE - 1); fetchJobs(false); });
-      document.getElementById('pg-next').addEventListener('click',  () => {
+      safeOn('pg-first','click',()=>{ CURRENT_PAGE = 1; fetchJobs(false); });
+      safeOn('pg-prev','click', ()=>{ CURRENT_PAGE = Math.max(1, CURRENT_PAGE - 1); fetchJobs(false); });
+      safeOn('pg-next','click', ()=>{
         const meta = window.__PAGER_META__ || { total_pages: CURRENT_PAGE };
         CURRENT_PAGE = Math.min(meta.total_pages, CURRENT_PAGE + 1);
         fetchJobs(false);
       });
-      document.getElementById('pg-last').addEventListener('click',  () => {
+      safeOn('pg-last','click', ()=>{
         const meta = window.__PAGER_META__ || { total_pages: CURRENT_PAGE };
         CURRENT_PAGE = meta.total_pages;
         fetchJobs(false);
       });
 
-      // If you already have a sort <select id="sort-by">, map to server fields:
-      const sortSel = document.getElementById('sort-by');
+      const sortSel = el('sort-by');
       if (sortSel) {
         sortSel.addEventListener('change', (e) => {
           const v = e.target.value || 'date';
-          CURRENT_SORT = v;    // our server expects same enum names you used
-          CURRENT_PAGE = 1;    // reset to first page on sort change
+          CURRENT_SORT = v;
+          CURRENT_PAGE = 1;
           fetchJobs(false);
         });
       }
@@ -362,28 +303,23 @@
       if (s === 'QUEUED' || s === 'PAUSED') return 'text-yellow-600';
       return 'text-black';
     }
-
     function prettyTitleFromPath(path = '') {
       const base = (path.split('/').pop() || '').replace(/\.[^.]+$/, '').trim();
       const tvMatch = base.match(/^(.+?)\s*-\s*([^-\n]+)\s*-\s*.*$/);
-      if (tvMatch) {
-        const show = tvMatch[1].trim();
-        const ep   = tvMatch[2].trim();
-        return `${show} - ${ep}`;
-      }
+      if (tvMatch) return `${tvMatch[1].trim()} - ${tvMatch[2].trim()}`;
       const movieMatch = base.match(/^(.+?)\s*\[\s*\d{4}.*\]$/);
       if (movieMatch) return movieMatch[1].trim();
       return base || path.split('/').pop() || 'N/A';
     }
     function toast(message, ok = true) {
-      const root = document.getElementById('toast-root');
-      const el = document.createElement('div');
-      el.className = `px-3 py-2 rounded text-white shadow ${ok ? 'bg-green-600' : 'bg-red-600'}`;
-      el.textContent = message;
-      root.appendChild(el);
-      setTimeout(() => el.remove(), 2200);
+      const root = el('toast-root');
+      const node = document.createElement('div');
+      node.className = `px-3 py-2 rounded text-white shadow ${ok ? 'bg-green-600' : 'bg-red-600'}`;
+      node.textContent = message;
+      root.appendChild(node);
+      setTimeout(() => node.remove(), 2200);
     }
-    function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+    function closeModal(id) { const n = el(id); if (n) n.classList.add('hidden'); }
     function formatElapsed(seconds) {
       if (seconds == null || isNaN(seconds)) return '';
       const m = Math.floor(seconds / 60);
@@ -403,19 +339,10 @@
       const v = b / Math.pow(1024, i);
       return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
     }
-    function formatDurationSeconds(secStr) {
-      const s = parseFloat(secStr);
-      if (!isFinite(s) || s <= 0) return '…';
-      const h = Math.floor(s / 3600);
-      const m = Math.floor((s % 3600) / 60);
-      const s2 = Math.floor(s % 60);
-      return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s2).padStart(2,'0')}`
-                   : `${m}:${String(s2).padStart(2,'0')}`;
-    }
-    function formatFPS(val) {
+    function formatKbps(val) {
       const n = parseFloat(val);
       if (!isFinite(n) || n <= 0) return '…';
-      return n.toFixed(n >= 100 ? 0 : 2);
+      return Math.round(n).toLocaleString();
     }
     function progressBar(percent) {
       percent = Number(percent || 0);
@@ -428,53 +355,43 @@
     }
     function stackedSrcDst(src, dst, showDst) {
       if (!showDst || !dst) return src;
-      return `
-        <div class="leading-tight">
-          <div>${src}</div>
-          <div>${dst}</div>
-        </div>
-      `;
-    }    
+      return `<div class="leading-tight"><div>${src}</div><div>${dst}</div></div>`;
+    }
 
     // ---------- Global Settings ----------
     async function showGlobalSettings() {
       const res = await fetch('/global_settings');
       if (!res.ok) return alert('Failed to load global settings');
       const data = await res.json();
-      document.getElementById('global-segment-duration').value = data.segment_duration ?? 10;
-      document.getElementById('global-number-parts').value = data.number_parts ?? 2;
-      document.getElementById('global-auto-start').checked = !!data.auto_start;
-      document.getElementById('global-serialize-pipeline').checked = !!data.serialize_pipeline;      
-      document.getElementById('global-settings-modal').classList.remove('hidden');
+      el('global-segment-duration').value = data.segment_duration ?? 10;
+      el('global-number-parts').value = data.number_parts ?? 2;
+      el('global-auto-start').checked = !!data.auto_start;
+      el('global-serialize-pipeline').checked = !!data.serialize_pipeline;
+      el('global-settings-modal').classList.remove('hidden');
     }
     async function saveGlobalSettings() {
-      const segment_duration = parseInt(document.getElementById('global-segment-duration').value, 10);
-      const number_parts = parseInt(document.getElementById('global-number-parts').value, 10);
-      const auto_start = document.getElementById('global-auto-start').checked;
-      const serialize_pipeline = document.getElementById('global-serialize-pipeline').checked;
+      const segment_duration = parseInt(el('global-segment-duration').value, 10);
+      const number_parts = parseInt(el('global-number-parts').value, 10);
+      const auto_start = el('global-auto-start').checked;
+      const serialize_pipeline = el('global-serialize-pipeline').checked;
       const res = await fetch('/global_settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ segment_duration, number_parts, auto_start, serialize_pipeline })
       });
-      if (res.ok) {
-        toast('Saved global settings', true);
-        closeModal('global-settings-modal');
-      } else {
-        const msg = await res.text();
-        toast(msg || 'Failed to save global settings', false);
-      }
+      if (res.ok) { toast('Saved global settings', true); closeModal('global-settings-modal'); }
+      else { toast(await res.text() || 'Failed to save global settings', false); }
     }
-    document.getElementById('open-global-settings').addEventListener('click', showGlobalSettings);
-    document.getElementById('save-global-settings-btn').addEventListener('click', saveGlobalSettings);
+    safeOn('open-global-settings','click', showGlobalSettings);
+    safeOn('save-global-settings-btn','click', saveGlobalSettings);
 
     // ---------- Job Info / Properties ----------
     async function showProperties(job_id) {
       const res = await fetch(`/job_properties/${job_id}`);
       if (!res.ok) return alert('Failed to load properties');
       const data = await res.json();
-      document.getElementById('properties-content').innerText = JSON.stringify(data, null, 2);
-      document.getElementById('properties-modal').classList.remove('hidden');
+      el('properties-content').innerText = JSON.stringify(data, null, 2);
+      const m = el('properties-modal'); if (m) m.classList.remove('hidden');
     }
 
     // ---------- Per-Job Settings ----------
@@ -482,29 +399,27 @@
       const res = await fetch(`/job_settings/${job_id}`);
       if (!res.ok) return alert('Failed to load settings');
       const data = await res.json();
-      console.log(data)
 
       const editable = ['READY','STOPPED','FAILED'].includes(String(data.status || '').toUpperCase());
-
-      document.getElementById('settings-job-id').value = job_id;
-      document.getElementById('settings-filename').value = data.filename || '';
-      document.getElementById('settings-segment-duration').value = data.segment_duration || 10;
-      document.getElementById('settings-number-parts').value = data.number_parts || 2;
-      document.getElementById('job-serialize-pipeline').checked =
+      el('settings-job-id').value = job_id;
+      el('settings-filename').value = data.filename || '';
+      el('settings-segment-duration').value = data.segment_duration || 10;
+      el('settings-number-parts').value = data.number_parts || 2;
+      el('job-serialize-pipeline').checked =
         String(data.serialize_pipeline) === '1' || data.serialize_pipeline === true;
-      document.getElementById('job-serialize-pipeline').disabled = !editable;
+      el('job-serialize-pipeline').disabled = !editable;
 
-      // Streams
-      const vSel = document.getElementById('settings-v-stream');
-      const aSel = document.getElementById('settings-a-stream');
+      const vSel = el('settings-v-stream');
+      const aSel = el('settings-a-stream');
       vSel.innerHTML = '';
       aSel.innerHTML = '';
 
-      const streams = JSON.parse(data.streams || {}) ;
+      const raw = data.streams;
+      const streams = typeof raw === 'string'
+        ? (JSON.parse(raw) || {video:[], audio:[]})
+        : (raw || {video:[], audio:[]});
       const vids = streams.video || [];
       const auds = streams.audio || [];
-      console.log(vids)
-      console.log(auds)
 
       vids.forEach((v,idx) => {
         const label = [
@@ -540,41 +455,37 @@
         if (idx < 0 || idx >= sel.options.length) idx = fallback;
         sel.selectedIndex = idx;
       }
-
-      // Preselect current choices (fallback to first if missing/out of range)
       setSelectIndexByValue(vSel, data.selected_v_stream, 0);
       setSelectIndexByValue(aSel, data.selected_a_stream, 0);
 
-      // Enable/disable inputs
-      document.getElementById('settings-segment-duration').disabled = !editable;
-      document.getElementById('settings-number-parts').disabled = !editable;
+      el('settings-segment-duration').disabled = !editable;
+      el('settings-number-parts').disabled = !editable;
       vSel.disabled = !editable;
       aSel.disabled = !editable;
 
-      // Show buttons
-      document.getElementById('save-job-settings-btn').classList.toggle('hidden', !editable);
-      document.getElementById('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase() === 'READY'));
+      el('save-job-settings-btn').classList.toggle('hidden', !editable);
+      el('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase() === 'READY'));
 
-      document.getElementById('job-settings-help').innerHTML = editable
+      el('job-settings-help').innerHTML = editable
         ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED).'
         : 'This job is active or finished. Settings are read-only.';
 
-      document.getElementById('save-job-settings-btn').onclick = saveJobSettings;
-      document.getElementById('start-job-btn').onclick = () => startJob(job_id);
+      el('save-job-settings-btn').onclick = saveJobSettings;
+      el('start-job-btn').onclick = () => startJob(job_id);
 
-      document.getElementById('job-settings-modal').classList.remove('hidden');
+      el('job-settings-modal').classList.remove('hidden');
     }
 
     async function saveJobSettings() {
-      const job_id = document.getElementById('settings-job-id').value;
-      const segment_duration = parseInt(document.getElementById('settings-segment-duration').value, 10);
-      const number_parts = parseInt(document.getElementById('settings-number-parts').value, 10);
+      const job_id = el('settings-job-id').value;
+      const segment_duration = parseInt(el('settings-segment-duration').value, 10);
+      const number_parts = parseInt(el('settings-number-parts').value, 10);
 
-      const vSel = document.getElementById('settings-v-stream');
-      const aSel = document.getElementById('settings-a-stream');
-      const selected_v_stream = vSel.selectedIndex; // not vSel.value
-      const selected_a_stream = aSel.selectedIndex; // not aSel.value      
-      const serialize_pipeline = document.getElementById('job-serialize-pipeline').checked;
+      const vSel = el('settings-v-stream');
+      const aSel = el('settings-a-stream');
+      const selected_v_stream = vSel.selectedIndex;
+      const selected_a_stream = aSel.selectedIndex;
+      const serialize_pipeline = el('job-serialize-pipeline').checked;
 
       const res = await fetch(`/job_settings/${job_id}`, {
         method: 'POST',
@@ -585,15 +496,9 @@
           serialize_pipeline
         })
       });
-      if (res.ok) {
-        closeModal('job-settings-modal');
-        fetchJobs();
-      } else {
-        const msg = await res.text();
-        alert(msg || 'Failed to save settings');
-      }
+      if (res.ok) { closeModal('job-settings-modal'); fetchJobs(); }
+      else { alert((await res.text()) || 'Failed to save settings'); }
     }
-
 
     // ---------- Jobs CRUD ----------
     async function copyJob(job_id) {
@@ -614,160 +519,72 @@
         toast(`Copy failed: ${err.message}`, false);
       }
     }
-
     async function deleteJob(job_id) {
       if (!confirm('Delete this job?')) return;
-      const response = await fetch(`/delete_job/${job_id}`, { method: 'DELETE' });
-      if (response.ok) fetchJobs(); else alert('Failed to delete job');
+      const r = await fetch(`/delete_job/${job_id}`, { method: 'DELETE' });
+      if (r.ok) fetchJobs(); else alert('Failed to delete job');
     }
-
     async function stopJob(job_id) {
       if (!confirm('Stop this job? This will abort all tasks but keep the project directory.')) return;
-      const response = await fetch(`/stop_job/${job_id}`, { method: 'POST' });
-      if (response.ok) fetchJobs(); else alert('Failed to stop job');
+      const r = await fetch(`/stop_job/${job_id}`, { method: 'POST' });
+      if (r.ok) fetchJobs(); else alert('Failed to stop job');
     }
-
     async function startJob(job_id) {
-      const response = await fetch(`/start_job/${job_id}`, { method: 'POST' });
-      if (response.ok) fetchJobs(); else alert('Failed to start job');
+      const r = await fetch(`/start_job/${job_id}`, { method: 'POST' });
+      if (r.ok) fetchJobs(); else alert('Failed to start job');
     }
-
     async function restartJob(job_id) {
-      const response = await fetch(`/restart_job/${job_id}`, { method: 'POST' });
-      if (response.ok) fetchJobs(); else alert('Failed to restart job');
+      const r = await fetch(`/restart_job/${job_id}`, { method: 'POST' });
+      if (r.ok) fetchJobs(); else alert('Failed to restart job');
     }
 
     // ---------- Video preview helpers ----------
     let __videoFPS__ = 30;
     function openVideoModal(title, jobId, fps) {
-      // FPS (fallback to 30 if invalid)
       __videoFPS__ = (Number(fps) > 0) ? Number(fps) : 30;
-
-      const modal  = document.getElementById('video-modal');
-      const player = document.getElementById('video-player');
-      const label  = document.getElementById('video-fps-label');
-      const titleEl = document.getElementById('video-title');
-
-      // Set UI text
+      const modal  = el('video-modal');
+      const player = el('video-player');
+      const label  = el('video-fps-label');
+      const titleEl = el('video-title');
       titleEl.textContent = String(title || '');
       label.textContent   = `FPS: ${__videoFPS__.toFixed(2)}`;
-
-      // Prepare player
       player.pause();
       player.removeAttribute('src');
       player.load();
-
-      // Safe, encoded preview URL
       const url = `/preview/${encodeURIComponent(jobId)}`;
       player.src = url;
-
-      // Reset time & load fresh
       player.currentTime = 0;
       player.load();
-
-      // Show modal
-      modal.classList.remove('hidden');
-      modal.classList.add('flex');
-
-      // Try autoplay (ignore if blocked)
-      player.play().catch(() => { /* autoplay might be blocked; that's fine */ });
-
-      // Focus for key controls
+      modal.classList.remove('hidden'); modal.classList.add('flex');
+      player.play().catch(()=>{});
       player.focus();
     }
     function closeVideoModal() {
-      const modal  = document.getElementById('video-modal');
-      const player = document.getElementById('video-player');
-      player.pause();
-      player.removeAttribute('src');
-      player.load();
-      modal.classList.add('hidden');
-      modal.classList.remove('flex');
+      const modal  = el('video-modal');
+      const player = el('video-player');
+      player.pause(); player.removeAttribute('src'); player.load();
+      modal.classList.add('hidden'); modal.classList.remove('flex');
     }
     function stepFrame(delta) {
-      const player = document.getElementById('video-player');
+      const player = el('video-player');
       if (!player) return;
       const step = 1 / (__videoFPS__ || 30);
       player.pause();
-      const target = Math.max(0, player.currentTime + delta * step);
-      player.currentTime = target;
+      player.currentTime = Math.max(0, player.currentTime + delta * step);
     }
     window.addEventListener('DOMContentLoaded', () => {
-      document.getElementById('btn-back-frame').addEventListener('click', () => stepFrame(-1));
-      document.getElementById('btn-fwd-frame').addEventListener('click', () => stepFrame(1));
+      safeOn('btn-back-frame', 'click', () => stepFrame(-1));
+      safeOn('btn-fwd-frame',  'click', () => stepFrame(1));
       document.addEventListener('keydown', (e) => {
-        const modal = document.getElementById('video-modal');
+        const modal = el('video-modal');
         if (modal.classList.contains('hidden')) return;
         if (e.key === 'ArrowLeft')  { e.preventDefault(); stepFrame(-1); }
         if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(1);  }
       });
     });
 
-    // ---------- Sorting ----------
-
-    function statusRank(s) {
-      const order = {
-        'READY': 0,
-        'RUNNING': 1,
-        'STOPPED': 2,
-        'FAILED': 3,
-        'DONE': 4
-      };
-      return order[s] ?? 99;
-    }
-
-    function compareJobs(a, b) {
-      switch (CURRENT_SORT) {
-        case 'filename': {
-          const af = (a.filename || '').toLowerCase();
-          const bf = (b.filename || '').toLowerCase();
-          if (af < bf) return -1;
-          if (af > bf) return 1;
-          return 0;
-        }
-        case 'status': {
-          const ar = statusRank(a.status || '');
-          const br = statusRank(b.status || '');
-          if (ar !== br) return ar - br;
-          const af = (a.filename || '').toLowerCase();
-          const bf = (b.filename || '').toLowerCase();
-          if (af < bf) return -1;
-          if (af > bf) return 1;
-          return 0;
-        }
-        case 'encode': {
-          const ae = Number(a.encode_progress || 0);
-          const be = Number(b.encode_progress || 0);
-          if (ae !== be) return be - ae;
-          if (a.started !== b.started) return b.started - a.started;
-          const af = (a.filename || '').toLowerCase();
-          const bf = (b.filename || '').toLowerCase();
-          if (af < bf) return -1;
-          if (af > bf) return 1;
-          return 0;
-        }
-        case 'date':
-        default: {
-          const aPaused = Number(a.started || 0) === 0;
-          const bPaused = Number(b.started || 0) === 0;
-          if (aPaused && bPaused) {
-            return Number(b.created || 0) - Number(a.created || 0);
-          }
-          if (aPaused && !bPaused) return -1;
-          if (!aPaused && bPaused) return 1;
-          return Number(b.started || 0) - Number(a.started || 0);
-        }
-      }
-    }
-
-    document.getElementById('sort-by').addEventListener('change', (e) => {
-      CURRENT_SORT = e.target.value || 'date';
-      fetchJobs(true); // re-render using cache
-    });
-
     // ---------- Table render ----------
-    async function fetchJobs(skipFetch = false) {
-      // skipFetch is ignored now; we always ask the server for the current page
+    async function fetchJobs() {
       const params = new URLSearchParams({
         page: String(CURRENT_PAGE),
         page_size: String(PAGE_SIZE),
@@ -778,16 +595,14 @@
       if (!response.ok) return;
       const payload = await response.json();
 
-      // Back-compat path (if server returned a raw array)
       const items = Array.isArray(payload) ? payload : (payload.items || []);
       const meta  = Array.isArray(payload)
         ? { page: 1, total_pages: 1, total: items.length, page_size: items.length }
         : { page: payload.page, total_pages: payload.total_pages, total: payload.total, page_size: payload.page_size };
 
-      // cache only current page if you want
       window.__JOBS_CACHE__ = items;
 
-      const jobList = document.getElementById('job-list');
+      const jobList = el('job-list');
       jobList.innerHTML = '';
 
       items.forEach(job => {
@@ -825,58 +640,47 @@
             </button>`
           : `<span class="font-bold ${nameColor}">${displayName}</span>`;
 
-          // Src displays (existing)
-          const sizeDisp = formatBytes(job.source_file_size);
-          const dimDisp  = job.source_resolution || '…';
-          const durDisp  = formatDurationSeconds(job.source_duration);
-          const codecDisp= job.source_codec || '…';
-          const fpsDisp  = formatFPS(job.source_fps);
+        const sizeDisp = formatBytes(job.source_file_size);
+        const dimDisp  = job.source_resolution || '…';
+        const codecDisp= job.source_codec || '…';
 
-          // Dst displays (NEW)
-          const sizeDst  = formatBytes(job.dest_file_size);
-          const dimDst   = job.dest_resolution || '…';
-          const durDst   = formatDurationSeconds(job.dest_duration);
-          const codecDst = job.dest_codec || '…';
-          const fpsDst   = formatFPS(job.dest_fps);
+        function kbpsFrom(sizeBytes, seconds, fallback) {
+          const kbpsStored = parseFloat(fallback);
+          if (isFinite(kbpsStored) && kbpsStored > 0) return kbpsStored;
+          const sz = Number(sizeBytes || 0), dur = parseFloat(seconds || 0);
+          if (sz > 0 && isFinite(dur) && dur > 0) return (sz * 8) / dur / 1000;
+          return NaN;
+        }
+        const srcKbps = kbpsFrom(job.source_file_size, job.source_duration, job.source_bitrate_kbps);
+        const srcKbpsDisp = formatKbps(srcKbps);
 
-          // Show Dst only when DONE and we have *some* dst signal
-          const showDst  = isDone && (
-            job.dest_file_size || job.dest_resolution || job.dest_duration ||
-            job.dest_codec || job.dest_fps
-          );
+        const sizeDst  = formatBytes(job.dest_file_size);
+        const dimDst   = job.dest_resolution || '…';
+        const codecDst = job.dest_codec || '…';
+        const dstKbps  = kbpsFrom(job.dest_file_size, job.dest_duration, job.dest_bitrate_kbps);
+        const dstKbpsDisp = formatKbps(dstKbps);
+
+        const showDst  = isDone && (job.dest_file_size || job.dest_resolution || job.dest_duration || job.dest_codec || job.dest_bitrate_kbps);
 
         row.innerHTML = `
           <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
           <td class="px-2 py-1">${nameCellHTML}</td>
-          <td class="px-2 py-1">
-            ${stackedSrcDst(sizeDisp,  sizeDst,  showDst)}
-          </td>
-          <td class="px-2 py-1">
-            ${stackedSrcDst(dimDisp,   dimDst,   showDst)}
-          </td>
-          <td class="px-2 py-1">
-            ${stackedSrcDst(durDisp,   durDst,   showDst)}
-          </td>
-          <td class="px-2 py-1">
-            ${stackedSrcDst(codecDisp, codecDst, showDst)}
-          </td>
-          <td class="px-2 py-1">
-            ${stackedSrcDst(fpsDisp,   fpsDst,   showDst)}
-          </td>
+          <td class="px-2 py-1">${stackedSrcDst(sizeDisp,  sizeDst,  showDst)}</td>
+          <td class="px-2 py-1">${stackedSrcDst(dimDisp,   dimDst,   showDst)}</td>
+          <td class="px-2 py-1">${stackedSrcDst(codecDisp, codecDst, showDst)}</td>
+          <td class="px-2 py-1">${stackedSrcDst(srcKbpsDisp, dstKbpsDisp, showDst)}</td>
           <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.segment_progress || 0)}
             <div class="text-gray-600 text-xs text-center mt-1">
               ${formatElapsed(job.segment_elapsed || 0)} ${segCount}/${totalChunks || '…'}
             </div>
           </td>
-
           <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.encode_progress || 0)}
             <div class="text-gray-600 text-xs text-center mt-1">
               ${formatElapsed(job.encode_elapsed || 0)} ${encCount}/${totalChunks || '…'}
             </div>
           </td>
-
           <td class="px-2 py-1 text-center w-28">
             ${progressBar(job.combine_progress || 0)}
             <div class="text-gray-600 text-xs text-center mt-1">
@@ -891,8 +695,7 @@
               job.status === 'RUNNING'? 'text-blue-600' :
               job.status === 'STOPPED'? 'text-orange-600' :
               job.status === 'FAILED' ? 'text-red-600'  :
-              job.status === 'DONE'   ? 'text-green-600':
-                                        'text-gray-700'
+              job.status === 'DONE'   ? 'text-green-600' : 'text-gray-700'
             }">${job.status || 'READY'}</span>
           </td>
           <td class="px-2 py-1">
@@ -900,15 +703,9 @@
               ${job.filename && job.filename !== 'undefined'
                 ? `<button class="copy-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>`
                 : ''}
-              <button class="delete-btn" title="Delete">
-                <span class="material-icons text-red-600 hover:text-red-800">delete</span>
-              </button>
-              <button class="properties-btn" title="Properties">
-                <span class="material-icons text-gray-700 hover:text-black">info</span>
-              </button>
-              <button class="settings-btn" title="Settings">
-                <span class="material-icons text-gray-700 hover:text-black">settings</span>
-              </button>
+              <button class="delete-btn" title="Delete"><span class="material-icons text-red-600 hover:text-red-800">delete</span></button>
+              <button class="properties-btn" title="Properties"><span class="material-icons text-gray-700 hover:text-black">info</span></button>
+              <button class="settings-btn" title="Settings"><span class="material-icons text-gray-700 hover:text-black">settings</span></button>
               ${vcrBtnHtml}
             </div>
           </td>
@@ -938,9 +735,8 @@
       applyPagerState(meta);
     }
 
-    // poll
-    setInterval(() => fetchJobs(false), 5000);
-    fetchJobs(false);
+    setInterval(() => fetchJobs(), 5000);
+    fetchJobs();
   </script>
 </body>
 </html>

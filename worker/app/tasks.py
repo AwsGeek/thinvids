@@ -36,6 +36,29 @@ def serialize_enabled(job_key: str) -> bool:
     v = redis_client.hget(job_key, 'serialize_pipeline')
     return str(v).lower() in ('1', 'true', 'yes')
 
+def _chunk_has_audio(chunk_path: str) -> bool:
+    """
+    Quick probe to see if the chunk has at least one usable audio stream
+    (channels > 0 and sample_rate > 0). If probe fails, assume False.
+    """
+    try:
+        pr = subprocess.run(
+            ['ffprobe', '-v', 'error',
+             '-show_entries', 'stream=index,codec_type,channels,sample_rate',
+             '-of', 'json', chunk_path],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(pr.stdout or '{}')
+        for s in (data.get('streams') or []):
+            if s.get('codec_type') == 'audio':
+                ch = int(s.get('channels') or 0)
+                sr = int(s.get('sample_rate') or 0)
+                if ch > 0 and sr > 0:
+                    return True
+        return False
+    except Exception:
+        return False
+
 # --- add near the top with the other imports in worker/app/tasks.py ---
 import shlex
 
@@ -50,10 +73,10 @@ def probe_source(job_id: str, file_path: str):
             if alt and os.path.exists(alt):
                 file_path = alt
 
-        # One shot: show streams + format as JSON
+        # One shot: show streams + format as JSON (include bit_rate)
         probe_cmd = [
             'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration,size:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
+            '-show_entries', 'format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
             '-of', 'json', file_path
         ]
         res = subprocess.run(probe_cmd, capture_output=True, text=True)
@@ -70,6 +93,15 @@ def probe_source(job_id: str, file_path: str):
         except Exception:
             duration_s = 0.0
         size_b = int(fmt.get('size', 0) or 0)
+        # bitrate (kbps): prefer format.bit_rate, else compute from size/duration
+        try:
+            fmt_bps = int(fmt.get('bit_rate', 0) or 0)
+        except Exception:
+            fmt_bps = 0
+        if fmt_bps > 0:
+            src_kbps = fmt_bps / 1000.0
+        else:
+            src_kbps = ((size_b * 8) / duration_s / 1000.0) if (size_b > 0 and duration_s > 0) else 0.0
 
         # Split streams for UI
         video_streams = []
@@ -105,11 +137,9 @@ def probe_source(job_id: str, file_path: str):
                 audio_streams.append(a)
 
         # Choose sensible defaults if not set:
-        #  - video: first stream (or one with disposition default)
-        #  - audio: default-disposition if present else with most channels else first
         job_now = redis_client.hgetall(job_key) or {}
 
-        # --- VIDEO selection (unchanged behavior, but keep prior if valid) ---
+        # --- VIDEO selection (keep prior if valid) ---
         v_sel = 0
         try:
             prior_v = int(job_now.get('selected_v_stream', 0))
@@ -166,7 +196,8 @@ def probe_source(job_id: str, file_path: str):
             'source_codec': codec,
             'source_resolution': reso,
             'source_fps': f"{fps:.2f}" if fps else '0',
-            'streams_json': json.dumps({'video': video_streams, 'audio': audio_streams})
+            'streams_json': json.dumps({'video': video_streams, 'audio': audio_streams}),
+            'source_bitrate_kbps': f"{src_kbps:.0f}" if src_kbps > 0 else '0'
         }
         if total_frames:
             mapping['total_frames'] = total_frames
@@ -214,13 +245,13 @@ def segment_video(job_id, file_path, filename):
             logger.warning(f"VEM [{job_id}] Duration probe failed: {e}")
             duration = 0.0
 
-        # Probe video stream
+        # Probe video stream (+ file size and bit_rate)
         try:
             probe = subprocess.check_output([
                 'ffprobe', '-v', 'error',
                 '-select_streams', 'v:0',
                 '-show_entries', 'stream=codec_name,width,height,avg_frame_rate',
-                '-show_entries', 'format=size',
+                '-show_entries', 'format=size,bit_rate',
                 '-of', 'json',
                 file_path
             ], text=True)
@@ -232,16 +263,24 @@ def segment_video(job_id, file_path, filename):
             height = video.get('height', '')
             fps = eval(video.get('avg_frame_rate', '0')) if video.get('avg_frame_rate') else 0.0
             file_size = int(fmt.get('size', 0))
+            try:
+                fmt_bps = int(fmt.get('bit_rate', 0) or 0)
+            except Exception:
+                fmt_bps = 0
         except Exception as e:
             logger.warning(f"VEM [{job_id}] ffprobe stream failed: {e}")
-            codec, width, height, fps, file_size = '', '', '', 0.0, 0
+            codec, width, height, fps, file_size, fmt_bps = '', '', '', 0.0, 0, 0
 
         # Estimated total chunks (based on duration / segment_duration)
         estimated_chunks = math.ceil(duration / segment_duration) if duration > 0 else 0
         frame_count = int(fps * duration) if fps and duration else 0
 
         # Persist job metadata (note: total_chunks is an *estimate* until finalize)
-        redis_client.hset(job_key, mapping={
+        kbps_calc = 0.0
+        if file_size and duration:
+            kbps_calc = (file_size * 8) / duration / 1000.0
+
+        mapping_seg = {
             'status': STATUS_RUNNING,
             'segment_progress': 0,
             'encode_progress': 0,
@@ -261,7 +300,10 @@ def segment_video(job_id, file_path, filename):
             'completed_chunks': 0,
             'filename': filename,                    # used by stitch_video
             'num_parts': num_parts
-        })
+        }
+        if (fmt_bps and fmt_bps > 0) or kbps_calc > 0:
+            mapping_seg['source_bitrate_kbps'] = f"{(fmt_bps/1000.0) if fmt_bps else kbps_calc:.0f}"
+        redis_client.hset(job_key, mapping=mapping_seg)
         if frame_count:
             redis_client.hset(job_key, 'total_frames', frame_count)
 
@@ -300,7 +342,7 @@ def segment_video(job_id, file_path, filename):
 
     except Exception as e:
         logger.exception(f"VEM [{job_id}] Segment planner failed: {e}")
-        redis_client.hset(f"job:{job_id}", mapping={'status': 'FAILED'})
+        redis_client.hset(f"job:{job_id}", mapping={'status': STATUS_FAILED})
         return {'status': 'FAILED'}
 
 @huey.task()
@@ -465,68 +507,87 @@ def encode_chunk(job_id, chunk_path, chunk_index):
             logger.warning(f"VEM [{job_id}] Job marked ABORTED before encoding chunk {chunk_index}. Exiting.")
             return
 
-        # Check if chunk file exists
         if not os.path.exists(chunk_path):
             logger.warning(f"VEM [{job_id}] Missing chunk file: {chunk_path}. Aborting encode.")
             return {'status': 'ABORTED'}
 
         job_key = f"job:{job_id}"
-        job_data = redis_client.hgetall(job_key) or {}
+        job_data = redis_client.hgetall(job_key)
 
         encoded_path = chunk_path.replace('chunk_', 'encoded_chunk_').replace('.ts', '.mp4')
 
+        # Detect whether this tiny TS has a usable audio stream
+        has_audio = _chunk_has_audio(chunk_path)
+
+        # Build ffmpeg command:
+        # - large analyzeduration/probesize for TS
+        # - genpts to synthesize timestamps when needed
+        # - optional audio mapping (skip when unusable)
         cmd = [
-            'ffmpeg', '-vaapi_device', '/dev/dri/renderD128',
+            'ffmpeg', '-hide_banner',
+            '-vaapi_device', '/dev/dri/renderD128',
+            '-analyzeduration', '200M',
+            '-probesize', '200M',
+            '-fflags', '+genpts',
             '-i', chunk_path,
-            '-vf', 'scale=-1:720,format=nv12,hwupload',
+
+            # Video path (decode->scale->upload->vaapi encode)
             '-map', '0:v:0',
-            '-map', '0:a:0',
+            '-vf', 'scale=-1:720,format=nv12,hwupload',
             '-c:v', 'h264_vaapi',
             '-rc_mode', 'CQP',
             '-qp', '27',
-            '-c:a', 'aac',
-            '-ac', '2',
-            '-b:a', '192k',
-            encoded_path
         ]
-        logger.info(f"VEM [{job_id}] Encoding chunk {chunk_index}")
 
-        encode_start_time = float(redis_client.hget(f"job:{job_id}", "encode_start_time"))
+        if has_audio:
+            # Map first audio if present; the '?' makes it tolerant
+            cmd += [
+                '-map', '0:a?',
+                '-c:a', 'aac',
+                '-ac', '2',
+                '-b:a', '192k',
+            ]
+        else:
+            # No valid audio in this chunk; disable audio to avoid filter graph errors
+            cmd += ['-an']
+
+        cmd += [encoded_path]
+
+        logger.info(f"VEM [{job_id}] Encoding chunk {chunk_index} (audio={'yes' if has_audio else 'no'})")
+
+        # Timers (robust to missing keys)
+        encode_start_time = float(job_data.get("encode_start_time", 0))
         if encode_start_time == 0:
             encode_start_time = time.time()
-            redis_client.hset(f"job:{job_id}", "encode_start_time", encode_start_time)
+            redis_client.hset(job_key, "encode_start_time", encode_start_time)
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.error(f"VEM [{job_id}] Encoding chunk {chunk_index} FAILED")
-            logger.error(f"VEM [{job_id}] Encode failed with return code {result.returncode}")
             logger.error(f"VEM [{job_id}] FFmpeg stderr:\n{result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
-        current_time = time.time()
-        encode_end_time = float(redis_client.hget(f"job:{job_id}", "encode_end_time"))
-        if current_time > encode_end_time:
-            encode_end_time = current_time
+        # Progress bookkeeping
+        now = time.time()
+        encode_end_time = max(now, float(job_data.get("encode_end_time", 0)))
+        redis_client.hincrby(job_key, 'completed_chunks', 1)
 
-        redis_client.hincrby(f"job:{job_id}", 'completed_chunks', 1)
+        total_chunks = max(1, int(job_data.get('total_chunks', 0)))
+        completed = int(job_data.get('completed_chunks',0))
+        redis_client.hset(job_key, mapping={
+            'encode_progress': int((completed / total_chunks) * 100),
+            'encode_end_time': encode_end_time,
+            'encode_elapsed': round(encode_end_time - encode_start_time, 2)
+        })
 
-        total_chunks = int(redis_client.hget(f"job:{job_id}", 'total_chunks'))
-        completed = int(redis_client.hget(f"job:{job_id}", 'completed_chunks'))
-        redis_client.hset(
-            f"job:{job_id}", mapping={
-                'encode_progress': int((completed / total_chunks) * 100),
-                'encode_end_time': current_time,
-                'encode_elapsed': round(encode_end_time - encode_start_time, 2)
-            })
-
-        # existing progress updates above...
-        if serialize_enabled(f"job:{job_id}"):
-            pending = redis_client.decr(f"job:{job_id}:enc_pending")
+        # Serialized mode: trigger stitch when last encode completes
+        if serialize_enabled(job_key):
+            pending = redis_client.decr(f"{job_key}:enc_pending")
             logger.info(f"VEM [{job_id}] Encoded chunk {chunk_index}, pending encodes left = {pending}")
             if pending == 0:
                 logger.info(f"VEM [{job_id}] All encodes complete (serialized). Launch stitching.")
                 stitch_video(job_id)
-                
+
         return {'status': 'COMPLETED', 'chunk_index': chunk_index}
 
     except subprocess.CalledProcessError as e:
@@ -536,13 +597,13 @@ def encode_chunk(job_id, chunk_path, chunk_index):
         try:
             raise RetryTask()
         except RetryTask:
-            redis_client.hset(f"job:{job_id}", mapping={'status': STATUS_FAILED})
+            redis_client.hset(job_key, mapping={'status': STATUS_FAILED})
             raise
     except Exception as e:
         logger.exception(f"VEM [{job_id}] Unexpected encode error")
-        logger.exception(f"VEM [{job_id}] {e}")
-        redis_client.hset(f"job:{job_id}", mapping={'status': STATUS_FAILED})
+        redis_client.hset(job_key, mapping={'status': STATUS_FAILED})
         raise
+
 
 import select
 
@@ -739,7 +800,7 @@ def stitch_video(job_id):
         except Exception as e:
             logger.warning(f"VEM [{job_id}] Failed to remove job dir {job_dir}: {e}")
 
-        # Probe the final output for Dst metadata
+        # Probe the final output for Dst metadata (include bit_rate)
         try:
             # file size
             dst_size_b = os.path.getsize(final_path)
@@ -749,7 +810,7 @@ def stitch_video(job_id):
                 'ffprobe', '-v', 'error',
                 '-select_streams', 'v:0',
                 '-show_entries', 'stream=codec_name,width,height,avg_frame_rate',
-                '-show_entries', 'format=duration',
+                '-show_entries', 'format=duration,bit_rate',
                 '-of', 'json', final_path
             ]
             pr = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
@@ -774,13 +835,23 @@ def stitch_video(job_id):
             except Exception:
                 dst_fps = 0.0
 
+            # bitrate
+            try:
+                dst_bps = int(fmt.get('bit_rate', 0) or 0)
+            except Exception:
+                dst_bps = 0
+
             # persist Dst fields
+            dst_kbps = (dst_bps / 1000.0) if dst_bps > 0 else (
+                (dst_size_b * 8) / dst_dur / 1000.0 if (dst_size_b and dst_dur) else 0.0
+            )
             redis_client.hset(job_key, mapping={
                 'dest_file_size': dst_size_b,
                 'dest_duration': f"{dst_dur:.2f}" if dst_dur else '0',
                 'dest_codec': dst_codec,
                 'dest_resolution': f"{w}x{h}" if (w and h) else '',
-                'dest_fps': f"{dst_fps:.2f}" if dst_fps else '0'
+                'dest_fps': f"{dst_fps:.2f}" if dst_fps else '0',
+                'dest_bitrate_kbps': f"{dst_kbps:.0f}" if dst_kbps > 0 else '0'
             })
         except Exception as e:
             logger.warning(f"VEM [{job_id}] Failed to probe/stash dst metadata: {e}")
