@@ -18,9 +18,13 @@
           <option value="status">Status</option>
           <option value="encode">Encode %</option>
         </select>
+        <button id="open-nodes" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+          <span class="material-icons">dns</span>
+          Nodes
+        </button>
         <button id="open-global-settings" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
           <span class="material-icons">settings</span>
-          Global Settings
+          Settings
         </button>
       </div>
     </div>
@@ -223,11 +227,7 @@
         const labels = nodes.map(n => shortHost(n.hostname));
         const gpu = nodes.map(n => (n.gpu >= 0 ? Number(n.gpu.toFixed(1)) : 0));
         const cpu = nodes.map(n => Number((n.cpu || 0).toFixed(1)));
-        const mem = nodes.map(n => {
-          const used = Number(n.mem_used || 0), total = Number(n.mem_total || 0);
-          const pct = total ? (used / total) * 100 : 0;
-          return Number(pct.toFixed(1));
-        });
+        const mem = nodes.map(n => Number((n.mem || 0).toFixed(1)));
 
         updateBars(gpuChart, labels, gpu, 100);
         updateBars(cpuChart, labels, cpu, 100);
@@ -288,6 +288,9 @@
           fetchJobs(false);
         });
       }
+
+      // Open Nodes page
+      safeOn('open-nodes','click', () => { window.location.href = '/nodes'; });
     });
 
     // ---------- Utils ----------

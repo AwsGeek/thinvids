@@ -6,14 +6,15 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     restart: always
-    command: huey_consumer tasks.huey -w 2
-    environment:
-      CELERY_BROKER: redis://192.168.0.120:6379/0
-      CELERY_BACKEND: redis://192.168.0.120:6379/1
+    command: huey_consumer tasks.huey -w 4 -k process
+    shm_size: "2g"                 # raise from 64MB default
+    tmpfs:
+      - /dev/shm:size=8g,exec,nosuid,nodev
     volumes:
       - vol_archives:/watch
       - vol_library:/library
       - vol_chunks:/chunks
+      - ./:/projects
       - /dev/dri:/dev/dri
     devices:
       - /dev/dri/renderD128

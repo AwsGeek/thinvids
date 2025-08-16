@@ -62,9 +62,10 @@ UNIT
     ssh "${ssh_user}@${node}" "
       set -e
       echo HOSTNAME=${node} > .env
+      sudo systemctl start docker
       sudo docker compose pull
       sudo docker compose down
-      sudo docker compose up -d worker
+      sudo docker compose up --remove-orphans -d worker
     "
 
     echo "Finished $node"
