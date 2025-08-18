@@ -6,7 +6,7 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     restart: always
-    command: huey_consumer tasks.huey -w 4 -k process
+    command: huey_consumer tasks.huey -w 1
     shm_size: "2g"                 # raise from 64MB default
     tmpfs:
       - /dev/shm:size=8g,exec,nosuid,nodev

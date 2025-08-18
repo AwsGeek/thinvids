@@ -323,12 +323,6 @@
       setTimeout(() => node.remove(), 2200);
     }
     function closeModal(id) { const n = el(id); if (n) n.classList.add('hidden'); }
-    function formatElapsed(seconds) {
-      if (seconds == null || isNaN(seconds)) return '';
-      const m = Math.floor(seconds / 60);
-      const s = Math.floor(seconds % 60);
-      return `${m}:${String(s).padStart(2, '0')}`;
-    }
     function formatDateTime(timestamp) {
       if (!timestamp || isNaN(timestamp)) return '';
       const dt = new Date(timestamp * 1000);
@@ -347,18 +341,24 @@
       if (!isFinite(n) || n <= 0) return '…';
       return Math.round(n).toLocaleString();
     }
-    function progressBar(percent) {
+    function formatElapsed(seconds) {
+      if (seconds == null || isNaN(seconds)) return '';
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return `${m}:${String(s).padStart(2, '0')}`;
+    }
+    function progressBar(percent, elapsed) {
       percent = Number(percent || 0);
       return `
         <div class="relative w-full h-4 bg-gray-200 rounded">
           <div class="absolute top-0 left-0 h-4 rounded bg-blue-500" style="width: ${percent}%"></div>
-          <div class="absolute inset-0 text-center text-xs leading-4 font-medium text-black">${percent}%</div>
+          <div class="absolute right-1 inset-0 text-right text-xs leading-4 font-medium text-black">${percent}%</div>
+          <div class="absolute left-1 inset-0 text-left text-xs leading-4 font-medium text-black">${formatElapsed(elapsed)}</div>
         </div>
       `;
     }
     function stackedSrcDst(src, dst, showDst) {
-      if (!showDst || !dst) return src;
-      return `<div class="leading-tight"><div>${src}</div><div>${dst}</div></div>`;
+      return src;
     }
 
     // ---------- Global Settings ----------
@@ -673,22 +673,13 @@
           <td class="px-2 py-1">${stackedSrcDst(codecDisp, codecDst, showDst)}</td>
           <td class="px-2 py-1">${stackedSrcDst(srcKbpsDisp, dstKbpsDisp, showDst)}</td>
           <td class="px-2 py-1 text-center w-28">
-            ${progressBar(job.segment_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">
-              ${formatElapsed(job.segment_elapsed || 0)} ${segCount}/${totalChunks || '…'}
-            </div>
+            ${progressBar(job.segment_progress || 0, job.segment_elapsed || 0)}
           </td>
           <td class="px-2 py-1 text-center w-28">
-            ${progressBar(job.encode_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">
-              ${formatElapsed(job.encode_elapsed || 0)} ${encCount}/${totalChunks || '…'}
-            </div>
+            ${progressBar(job.encode_progress || 0, job.encode_elapsed || 0)}
           </td>
           <td class="px-2 py-1 text-center w-28">
-            ${progressBar(job.combine_progress || 0)}
-            <div class="text-gray-600 text-xs text-center mt-1">
-              ${formatElapsed(job.combine_elapsed || 0)} ${stitchedApprox}/${totalChunks || '…'}
-            </div>
+            ${progressBar(job.combine_progress || 0, job.combine_elapsed || 0)}
           </td>
           <td class="px-2 py-1 whitespace-normal break-words">${formatDateTime(job.started)}</td>
           <td class="px-2 py-1">${formatElapsed(job.elapsed)}</td>

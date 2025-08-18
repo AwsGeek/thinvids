@@ -1,5 +1,4 @@
 from flask import Flask, render_template, render_template_string, request, jsonify, abort, send_file
-import redis
 from huey import RedisHuey
 import uuid
 import time
@@ -12,6 +11,10 @@ from math import ceil
 import socket
 import re
 
+import redis
+from redis.retry import Retry
+from redis.backoff import ExponentialBackoff
+
 # import backend task planner
 from tasks import segment_video, probe_source
 
@@ -19,8 +22,36 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 
 # NOTE: container/service hostnames; adjust if needed
-huey = RedisHuey('tasks', host='redis', port=6379, db=0)
-redis_client = redis.Redis(host='redis', port=6379, db=1, decode_responses=True)
+#huey = RedisHuey('tasks', host='redis', port=6379, db=0)
+huey = RedisHuey(
+    'tasks',
+    host='redis',
+    port=6379,
+    db=0,
+    # Huey/redis-py connection hardening:
+    blocking=True,
+    read_timeout=15,                 # block-pop read
+    socket_timeout=5,                # per-op timeout
+    socket_connect_timeout=5,        # connect timeout
+    socket_keepalive=True,           # keep sockets alive through NAT/overlay resets
+    health_check_interval=30,        # auto PING on idle sockets
+    retry_on_timeout=True,           # retry timeouts
+    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),  # 1s,2s,4s... capped
+)
+# redis_client = redis.Redis(host='redis', port=6379, db=1, decode_responses=True)
+redis_client = redis.Redis(
+    host='redis',
+    port=6379,
+    db=1,
+    decode_responses=True,
+    socket_keepalive=True,
+    socket_timeout=5,
+    socket_connect_timeout=5,
+    health_check_interval=30,
+    retry_on_timeout=True,
+    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
+)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -296,7 +327,7 @@ def list_jobs():
             stitched = int(job_data.get('stitched_chunks', '0') or 0)
 
             segment_progress = int(job_data.get('segment_progress', '0') or 0)
-            encode_progress = int((done / total) * 100) if total > 0 else 0
+            encode_progress  = int(job_data.get('encode_progress',  '0') or 0)
             combine_progress = int(job_data.get('combine_progress', '0') or 0)
 
             jobs.append({
@@ -542,8 +573,8 @@ def restart_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if job.get('status') not in [STATUS_STOPPED, STATUS_FAILED]:
-        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED state.'}), 400
+    if job.get('status') not in [STATUS_STOPPED, STATUS_FAILED, STATUS_DONE]:
+        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/DONE state.'}), 400
 
     filename = job.get('filename')
     if not filename:

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os, time, json, socket, subprocess, signal, re
-import redis
 import psutil
 
-import logging
+import redis
+from redis.retry import Retry
+from redis.backoff import ExponentialBackoff
 
+import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -13,18 +15,18 @@ logging.basicConfig(
 log = logging.getLogger("agent")
 
 # ---------------- Env / Config ----------------
-REDIS_HOST = os.getenv("REDIS_HOST", "swarm1")  # central Redis host
+REDIS_HOST = os.getenv("REDIS_HOST", "swarm3")  # central Redis host
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB   = int(os.getenv("REDIS_DB", "1"))
 TTL_SEC    = int(os.getenv("TTL_SEC", "15"))
 
 # Sleep policy — suspend if NO RUNNING jobs cluster-wide for 1 minute
-SLEEP_AFTER_IDLE_SEC        = int(os.getenv("SLEEP_AFTER_IDLE_SEC", "60"))   # 1 minute
+SLEEP_AFTER_IDLE_SEC        = int(os.getenv("SLEEP_AFTER_IDLE_SEC", "300"))   # 5 minute
 IDLE_CHECK_EVERY_SEC        = int(os.getenv("IDLE_CHECK_EVERY_SEC", "10"))
 SUSPEND_CMD                 = os.getenv("SUSPEND_CMD", "systemctl suspend")
 SLEEP_INHIBIT_FILE          = os.getenv("SLEEP_INHIBIT_FILE", "/run/no-suspend")
 ALWAYS_ON_HOST              = os.getenv("ALWAYS_ON_HOST", "").strip()  # e.g. "thinman09"
-MIN_UPTIME_BEFORE_SLEEP_SEC = int(os.getenv("MIN_UPTIME_BEFORE_SLEEP_SEC", "120"))
+MIN_UPTIME_BEFORE_SLEEP_SEC = int(os.getenv("MIN_UPTIME_BEFORE_SLEEP_SEC", "300")) # 5 minute
 
 # MAC detection overrides
 AGENT_IFACE = os.getenv("AGENT_IFACE", "").strip()  # e.g. "eth0" to force interface
@@ -34,7 +36,12 @@ HOSTNAME   = os.getenv("HOSTNAME", socket.gethostname())  # e.g. thinman07
 KEY        = f"metrics:node:{HOSTNAME}"
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
-
+#r = redis.Redis(
+#    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
+#    socket_keepalive=True, socket_timeout=5, socket_connect_timeout=5,
+#    health_check_interval=30, retry_on_timeout=True,
+#    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
+#)
 # ---------------- GPU sampling helpers (kept) ----------------
 def _extract_video_busy(sample: dict):
     if not isinstance(sample, dict): return None
@@ -209,14 +216,22 @@ def _cluster_has_running():
     Return True if ANY job:* hash has status == RUNNING (cluster-wide).
     Fail-safe: on Redis error, assume running to avoid unintended suspend.
     """
-    #try:
-    for key in r.scan_iter("job:*"):
-        s = r.hget(key, "status") or ""
-        if s.upper() == "RUNNING":
-            return True
-    return False
-    #except Exception:
-    #    return True  # be conservative on errors
+    try:
+        for key in r.scan_iter("job:*"):
+            try:
+                # Skip anything that isn't a hash (e.g., sets like job_done_parts:* if misnamed)
+                if r.type(key) != 'hash':
+                    continue
+                s = (r.hget(key, "status") or "").upper()
+                if s == "RUNNING":
+                    return True
+            except redis.exceptions.ResponseError:
+                # Wrong type or other hash-op error — skip
+                continue
+        return False
+    except Exception:
+        # Be conservative on broader Redis issues
+        return True
 
 def _host_uptime_sec():
     try:

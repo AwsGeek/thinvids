@@ -18,7 +18,9 @@ fi
 for node in "${nodes[@]}"; do
   (
     echo "Processing $node..."
-    docker node update --label-add encoder=vaacp "$node"
+    docker node update --label-add encoder=vaacp "$node"    
+
+    ssh "${ssh_user}@${node}" "sudo rm -rf *"
 
     # Copy compose file
     scp docker-compose-worker.yml "${ssh_user}@${node}:docker-compose.yml"
@@ -44,7 +46,7 @@ RestartSec=2
 # Run as root so it can read host metrics and intel_gpu_top
 User=root
 # Tune these as needed; agent can also default from hostname/env
-Environment=REDIS_HOST=swarm1
+Environment=REDIS_HOST=swarm3
 Environment=REDIS_DB=1
 Environment=TTL_SEC=15
 Environment=NODE_NAME=${node}

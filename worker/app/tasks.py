@@ -23,6 +23,8 @@ import re
 from typing import List, Tuple, Optional
 
 import redis
+from redis.retry import Retry
+from redis.backoff import ExponentialBackoff
 
 # ----------------- Configuration -----------------
 
@@ -33,9 +35,35 @@ REDIS_PORT = int(ENV("REDIS_PORT", "6379"))
 REDIS_DB_TASKS = int(ENV("REDIS_DB_TASKS", "0"))  # Huey broker
 REDIS_DB_DATA  = int(ENV("REDIS_DB_DATA",  "1"))  # App/job state
 
-# Huey broker + Redis client
-huey = RedisHuey('tasks', host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB_TASKS)
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB_DATA, decode_responses=True)
+# Huey broker + Redis client (hardened timeouts/retries)
+huey = RedisHuey( 'tasks', host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB_TASKS)
+# huey = RedisHuey(
+#     'tasks',
+#     host=REDIS_HOST,
+#     port=REDIS_PORT,
+#     db=REDIS_DB_TASKS,
+#     blocking=True,
+#     read_timeout=15,
+#     socket_timeout=5,
+#     socket_connect_timeout=5,
+#     socket_keepalive=True,
+#     health_check_interval=30,
+#     retry_on_timeout=True,
+#     retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
+# )
+redis_client = redis.Redis( host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB_DATA, decode_responses=True)
+# redis_client = redis.Redis(
+#     host=REDIS_HOST,
+#     port=REDIS_PORT,
+#     db=REDIS_DB_DATA,
+#     decode_responses=True,
+#     socket_keepalive=True,
+#     socket_timeout=5,
+#     socket_connect_timeout=5,
+#     health_check_interval=30,
+#     retry_on_timeout=True,
+#     retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
+# )
 
 # Filesystem layout (ensure /tmpfs is mounted with enough RAM)
 PROJECT_ROOT = ENV("PROJECT_ROOT", "/projects")
@@ -296,16 +324,6 @@ def _start_master_http_once():
                         return
 
                     os.replace(tmp_path, enc_path)   # atomic move
-                    # Mark progress (best-effort)
-                    try:
-                        job_key = _job_key(job_id)
-                        done = int(redis_client.hincrby(job_key, 'parts_done', 1))
-                        total = int(redis_client.hget(job_key, 'parts_total') or 0)
-                        if total:
-                            redis_client.hset(job_key, 'encode_progress', int((done/total)*100))
-                    except Exception:
-                        pass
-
                     self.send_response(200)
                     self.end_headers()
                 except Exception as e:
@@ -433,48 +451,47 @@ def probe_source(job_id: str, file_path: str):
 @huey.task()
 def transcode_video(job_id: str, file_path: str):
     """
-    Master node orchestration (runs where this task is executed):
-    1) Probe source + set metadata
-    2) Determine N active nodes; P = max(1, N-1)
-    3) Split source into P TS parts in /tmpfs/<job_id>/parts
-    4) Start local HTTP server (GET parts, PUT results) on port 8000
-    5) Dispatch encode_part tasks pointing to this master
-    6) Wait for all encoded parts to be PUT back to /tmpfs/<job_id>/encoded
-    7) Stitch (concat copy) and move final to /library
+    Orchestrate transcode with keyframe-aligned segmentation (no overlaps).
+
+    Uses ffmpeg segment muxer with -force_key_frames to align boundaries.
+    As each segment rolls over, we rename it to the part path and dispatch
+    encode_part immediately.
+
+    While waiting for encodes, we verify completed parts by scanning the
+    /encoded directory on disk (with a short "settled" check) rather than
+    relying solely on Redis 'parts_done'. We also expose 'awaiting_parts'
+    and re-dispatch missing parts once on stall.
     """
     job_key = _job_key(job_id)
 
     try:
-        # Make sure HTTP server is up on this node
-        _start_master_http_once()
+        _start_master_http_once()  # HTTP server for parts/results
 
         # Resolve input path
         src_path = file_path
         if not os.path.exists(src_path):
-            # allow filename from job record
             job = redis_client.hgetall(job_key) or {}
             filename = job.get('filename') or ''
             alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
             if os.path.exists(alt):
                 src_path = alt
-
         if not os.path.exists(src_path):
             redis_client.hset(job_key, 'status', STATUS_FAILED)
-            return {'status':'FAILED','reason':f'input not found: {src_path}'}
+            return {'status': 'FAILED', 'reason': f'input not found: {src_path}'}
 
-        # Mark as running
+        # Mark as RUNNING
         now = _now()
         redis_client.hset(job_key, mapping={'status': STATUS_RUNNING, 'started_at': now})
 
-        # Probe essentials (also fills metadata fields)
-        meta = _ffprobe_stream0(src_path)
+        # Probe essentials
+        meta     = _ffprobe_stream0(src_path)
         duration = _ffprobe_duration(src_path)
-        codec = meta.get("codec") or ""
-        width = meta.get("width") or 0
-        height = meta.get("height") or 0
-        fps = meta.get("fps") or 0.0
-        size_b = meta.get("size") or 0
-        fmt_bps = meta.get("bit_rate") or 0
+        codec    = meta.get("codec") or ""
+        width    = meta.get("width") or 0
+        height   = meta.get("height") or 0
+        fps      = meta.get("fps") or 0.0
+        size_b   = meta.get("size") or 0
+        fmt_bps  = meta.get("bit_rate") or 0
         kbps_calc = (fmt_bps/1000.0) if fmt_bps > 0 else (
             ((size_b*8)/duration/1000.0) if (size_b and duration) else 0.0
         )
@@ -487,129 +504,298 @@ def transcode_video(job_id: str, file_path: str):
             'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0'
         })
 
-        # Decide parts
+        # Decide target number of parts (P) — never 0
         nodes = _active_nodes()
-        # Compute master URL other nodes can reach (host network)
         master_host_name = ENV("HOSTNAME") or socket.gethostname()
         master_url = f"http://{master_host_name}:{HTTP_PORT}"
 
-        P1 = int(size_b / 107374182)
-        P2 = 4 * max(1, len(nodes))  # reserve one slot for this master
-        P = max(P1, P2)              # sanity cap
-        seg_t0 = _now()
+        P = max(1, len(nodes) - 1) # prefer N-1 workers if many nodes
+        logger.info(f"TTV [{job_id}] Splitting into {P} parts")
 
+        seg_t0 = _now()
         redis_client.hset(job_key, mapping={'parts_total': P, 'parts_done': 0, 'master_host': master_url})
 
+        # Which streams to carry
         v_sel, a_sel = _pick_stream_indices(job_key)
         redis_client.hset(job_key, mapping={'selected_v_stream': v_sel, 'selected_a_stream': a_sel})
 
-        # Plan time slices and split into TS parts in tmpfs
-        parts = _plan_parts(duration, P)
+        # Prepare parts dir + naming
+        parts_dir = os.path.join(PROJECT_ROOT, job_id, "parts")
+        _ensure_dirs(parts_dir)
+        temp_pattern = os.path.join(parts_dir, "chunk_%03d.ts")
+
+        # Segment duration target from P
+        segment_duration = max(1.0, float(duration) / float(P)) if duration else 10.0
         bsf = _bsf_for_codec(codec)
 
-        for idx, (start, length) in enumerate(parts, start=1):
+        # Build ffmpeg segment command (video+audio only; subs/data dropped)
+        cmd = [
+            'ffmpeg', '-hide_banner',
+            '-i', src_path,
+            '-map', f'0:v:{v_sel}',
+            '-map', f'0:a:{a_sel}?',
+            '-sn', '-dn',
+            '-map_metadata', '-1',
+            '-map_chapters', '-1',
+            '-c', 'copy',
+            '-bsf:v', bsf,
+            '-f', 'segment',
+            '-segment_time', f"{segment_duration:.6f}",
+            '-force_key_frames', f"expr:gte(t,n_forced*{segment_duration:.6f})",
+            '-reset_timestamps', '1',
+            temp_pattern
+        ]
+        logger.info(f"[{job_id}] Segment command: {' '.join(cmd)}")
 
+        # Run and parse stderr to detect new segments; queue previous one
+        segment_re = re.compile(r"Opening '(.+?/chunk_(\d+)\.ts)' for writing")
+        process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+        previous_chunk_path = None
+        previous_chunk_index = None
+        estimated_chunks = P
+        queued_count = 0
+
+        while True:
             if _is_job_halted(job_id):
-                logger.warning(f"[{job_id}] Halted during encoding wait")
-                return {'status':'ABORTED'}
+                logger.warning(f"[{job_id}] Halted. Terminating segmentation.")
+                process.terminate()
+                process.wait()
+                return {'status': 'ABORTED'}
 
-            part_path, _ = _part_paths(job_id, idx)
-            _ensure_dirs(os.path.dirname(part_path))
-            cmd = [
-                'ffmpeg', '-hide_banner',
-                '-ss', f"{start:.6f}",
-                '-t', f"{length:.6f}",
-                '-i', src_path,
-                '-map', f"0:v:{v_sel}",
-                '-map', f"0:a:{a_sel}?",
-                '-c', 'copy',
-                '-bsf:v', bsf,
-                '-f', 'mpegts',
-                part_path
-            ]
-            logger.info(f"[{job_id}] Split part {idx}/{P}: {' '.join(cmd)}")
-            pr = subprocess.run(cmd, capture_output=True, text=True)
-            if pr.returncode != 0:
-                logger.error(f"[{job_id}] Split part {idx} failed: {pr.stderr[-600:]}")
+            line = process.stderr.readline()
+            if not line:
+                break
+
+            m = segment_re.search(line)
+            if m:
+                chunk_path = m.group(1)
+                chunk_index = int(m.group(2))  # 0-based
+                logger.info(f"TTV [{job_id}] Splitting part {chunk_index}")
+
+                # update progress on opening next chunk
+                redis_client.hset(job_key, mapping={
+                    'segment_progress': int(((min(chunk_index + 1, estimated_chunks)) / max(1, estimated_chunks)) * 100)
+                })
+
+                # previous chunk has finished writing
+                if previous_chunk_index is not None and previous_chunk_path:
+                    part_idx = previous_chunk_index + 1  # 1-based
+                    dest_path, _ = _part_paths(job_id, part_idx)
+                    _ensure_dirs(os.path.dirname(dest_path))
+                    try:
+                        os.replace(previous_chunk_path, dest_path)
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Move part {part_idx} failed: {e}")
+                        process.terminate(); process.wait()
+                        redis_client.hset(job_key, 'status', STATUS_FAILED)
+                        return {'status': 'FAILED', 'reason': f'move part {part_idx} failed'}
+
+                    queued_count = part_idx
+                    prog = int((queued_count / max(1, estimated_chunks)) * 100)
+                    if queued_count < estimated_chunks:
+                        prog = min(prog, 99)
+                    redis_client.hset(job_key, mapping={
+                        'segmented_chunks': queued_count,
+                        'segment_progress': prog,
+                        'segment_elapsed': round(_now() - seg_t0, 2),
+                    })
+
+                    logger.info(f"TTV [{job_id}] Queueing part {part_idx} for encoding")
+                    encode_part(job_id, part_idx, master_url, v_sel, a_sel)
+
+                previous_chunk_path = chunk_path
+                previous_chunk_index = chunk_index
+
+        process.wait()
+        if process.returncode != 0:
+            logger.error(f"[{job_id}] ffmpeg segmentation failed (rc={process.returncode})")
+            redis_client.hset(job_key, 'status', STATUS_FAILED)
+            return {'status': 'FAILED'}
+
+        # Queue the final chunk
+        total_chunks = 0
+        if previous_chunk_index is not None and previous_chunk_path:
+            part_idx = previous_chunk_index + 1
+            dest_path, _ = _part_paths(job_id, part_idx)
+            _ensure_dirs(os.path.dirname(dest_path))
+            try:
+                os.replace(previous_chunk_path, dest_path)
+            except Exception as e:
+                logger.error(f"[{job_id}] Move final part {part_idx} failed: {e}")
                 redis_client.hset(job_key, 'status', STATUS_FAILED)
-                return {'status':'FAILED','reason':f'split part {idx} failed'}
+                return {'status': 'FAILED', 'reason': f'move part {part_idx} failed'}
 
-           # --- Update split/segment progress after each successful part ---
-            created = idx
-            # Clamp to 99% until the last part is done for a nicer UX
-            prog = int((created / P) * 100)
-            if created < P:
-                prog = min(prog, 99)
-            redis_client.hset(job_key, mapping={
-                'segmented_chunks': created,
-                'segment_progress': prog,
-                'segment_elapsed': round(_now() - seg_t0, 2),
-            })
-            encode_part(job_id, idx, master_url, v_sel, a_sel)
+            logger.info(f"TTV [{job_id}] Queueing part {part_idx} for encoding")
+            encode_part(job_id, part_idx, master_url, v_sel, a_sel)
+            total_chunks = part_idx
 
-        # Finalize split progress
+        if total_chunks <= 0:
+            redis_client.hset(job_key, 'status', STATUS_FAILED)
+            return {'status': 'FAILED', 'reason': 'no segments produced'}
+
+        # Finalize parts_total with actual count
         redis_client.hset(job_key, mapping={
+            'parts_total': total_chunks,
+            'segmented_chunks': total_chunks,
             'segment_progress': 100,
             'segment_elapsed': round(_now() - seg_t0, 2),
         })
 
-        # Dispatch encode tasks
-        #for idx in range(1, P+1):
-        #    encode_part(job_id, idx, master_url, v_sel, a_sel)
-
-        # Wait for encoded parts to arrive via PUT
+        # ===== Wait for encoded parts (check filesystem, not just Redis) =====
+        P = total_chunks
         enc_dir = os.path.join(PROJECT_ROOT, job_id, "encoded")
         _ensure_dirs(enc_dir)
 
-        deadline = _now() + max(300.0, duration * 3)  # generous timeout
+        expected = set(range(1, P + 1))
+        requeued = set()
+        no_progress_since = _now()
+        last_ready = 0
+
+        def _ready_set():
+            """Indices present & settled on disk."""
+            now_ts = _now()
+            ready = set()
+            for f in glob.glob(os.path.join(enc_dir, "enc_*.mp4")):
+                base = os.path.basename(f)
+                m = re.match(r"enc_(\d+)\.mp4$", base)
+                if not m:
+                    continue
+                try:
+                    st = os.stat(f)
+                except Exception:
+                    continue
+                if st.st_size > 0 and (now_ts - st.st_mtime) > 0.8:
+                    i = int(m.group(1))
+                    if 1 <= i <= P:
+                        ready.add(i)
+            return ready
+
+        deadline = _now() + max(300.0, (duration or 0) * 3)
+
         while _now() < deadline:
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] Halted during encoding wait")
-                return {'status':'ABORTED'}
+                return {'status': 'ABORTED'}
 
-            present = []
-            for f in sorted(glob.glob(os.path.join(enc_dir, "enc_*.mp4"))):
-                m = re.search(r"enc_(\d+)\.mp4$", os.path.basename(f))
-                if m:
-                    present.append(int(m.group(1)))
+            ready = _ready_set()
+            done_fs = len(ready)
 
-            done = len(set(present))
-            redis_client.hset(job_key, 'parts_done', done)
-            if P:
-                redis_client.hset(job_key, 'encode_progress', int((done / P) * 100))
-            if done >= P:
+            # progress + counters (never decrease)
+            try:
+                prog_fs = int((done_fs / P) * 100) if P else 0
+                cur = int(redis_client.hget(job_key, 'encode_progress') or 0)
+                if prog_fs > cur:
+                    redis_client.hset(job_key, 'encode_progress', prog_fs)
+                cur_done = int(redis_client.hget(job_key, 'parts_done') or 0)
+                if done_fs > cur_done:
+                    redis_client.hset(job_key, 'parts_done', done_fs)
+            except Exception:
+                pass
+
+            # publish which parts are still missing (for UI/debug)
+            missing = sorted(expected - ready)
+            try:
+                redis_client.hset(job_key, 'awaiting_parts', json.dumps(missing))
+            except Exception:
+                pass
+
+            if done_fs >= P:
                 break
+
+            # stall detection: if no progress for 20s, requeue missing ones once
+            if done_fs > last_ready:
+                last_ready = done_fs
+                no_progress_since = _now()
+            elif (_now() - no_progress_since) > 20 and missing:
+                for mi in missing:
+                    if mi not in requeued:
+                        logger.warning(f"[{job_id}] Re-dispatch stalled part {mi}")
+                        encode_part(job_id, mi, master_url, v_sel, a_sel)
+                        requeued.add(mi)
+                no_progress_since = _now()
+
             time.sleep(1.0)
 
-        if int(redis_client.hget(job_key, 'parts_done') or 0) < P:
+        # Final reconciliation before giving up
+        final_ready = _ready_set()
+        if len(final_ready) < P:
+            missing_final = sorted(expected - final_ready)
+            logger.error(f"[{job_id}] Missing parts after timeout: {missing_final}")
             redis_client.hset(job_key, 'status', STATUS_FAILED)
-            return {'status':'FAILED','reason':'timeout waiting for encoded parts'}
+            return {'status': 'FAILED', 'reason': 'timeout waiting for encoded parts (files missing)'}
 
-        # Stitch in tmpfs (concat copy)
+        # Ensure progress hits 100
+        try:
+            redis_client.hset(job_key, mapping={'encode_progress': 100, 'parts_done': P, 'awaiting_parts': '[]'})
+        except Exception:
+            pass
+
+        # ===== Stitch (concat copy) with progress =====
         base_dir = os.path.join(PROJECT_ROOT, job_id)
         concat_path = os.path.join(base_dir, "concat.txt")
-        enc_paths = [os.path.join(enc_dir, f"enc_{i:03d}.mp4") for i in range(1, P+1)]
+        enc_paths = [os.path.join(enc_dir, f"enc_{i:03d}.mp4") for i in range(1, P + 1)]
         with open(concat_path, 'w') as f:
             for pth in enc_paths:
                 f.write(f"file '{pth}'\n")
 
         local_out = os.path.join(base_dir, f"job_{job_id}_output.mp4")
+        combine_t0 = _now()
+        redis_client.hset(job_key, mapping={'combine_progress': 0, 'combine_elapsed': 0})
+
+        total_us = int(float(duration) * 1_000_000) if duration else 0
         stitch_cmd = [
             'ffmpeg', '-hide_banner',
             '-f', 'concat', '-safe', '0',
             '-i', concat_path,
             '-c', 'copy',
             '-movflags', '+faststart',
+            '-nostats', '-loglevel', 'error',
+            '-progress', 'pipe:1',
             local_out
         ]
         logger.info(f"[{job_id}] Stitch: {' '.join(stitch_cmd)}")
-        pr = subprocess.run(stitch_cmd, capture_output=True, text=True)
-        if pr.returncode != 0 or not os.path.exists(local_out):
-            logger.error(f"[{job_id}] Stitch failed: {pr.stderr[-1000:]}")
-            redis_client.hset(job_key, 'status', STATUS_FAILED)
-            return {'status':'FAILED','reason':'stitch failed'}
 
-        # Move final to NFS library and set metadata
+        proc = subprocess.Popen(stitch_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            while True:
+                line = proc.stdout.readline() if proc.stdout else ''
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+                line = line.strip()
+                if line.startswith('out_time_ms='):
+                    try:
+                        out_ms = int(line.split('=', 1)[1] or '0')
+                    except Exception:
+                        out_ms = 0
+                    if total_us > 0:
+                        pct = int(min(100, max(0, (out_ms / total_us) * 100)))
+                        pct = min(pct, 99)
+                        redis_client.hset(job_key, mapping={
+                            'combine_progress': pct,
+                            'combine_elapsed': round(_now() - combine_t0, 2),
+                        })
+                    else:
+                        redis_client.hset(job_key, 'combine_elapsed', round(_now() - combine_t0, 2))
+                elif line.startswith('progress=') and line.split('=',1)[1].strip() == 'end':
+                    break
+        finally:
+            rc = proc.wait()
+
+        if rc != 0 or not os.path.exists(local_out):
+            err_tail = ''
+            try:
+                err_tail = (proc.stderr.read() or '')[-1000:]
+            except Exception:
+                pass
+            logger.error(f"[{job_id}] Stitch failed (rc={rc}): {err_tail}")
+            redis_client.hset(job_key, 'status', STATUS_FAILED)
+            return {'status': 'FAILED', 'reason': 'stitch failed'}
+
+        # Move final to library + set metadata
         job = redis_client.hgetall(job_key) or {}
         src_filename = job.get('filename') or os.path.basename(src_path)
         final_path = _final_output_path(src_filename)
@@ -669,18 +855,21 @@ def transcode_video(job_id: str, file_path: str):
         except Exception:
             pass
 
+        # Final combine progress update
         redis_client.hset(job_key, mapping={
             'status': STATUS_DONE,
             'output_path': final_path,
             'ended_at': _now(),
-            'combine_progress': 100
+            'combine_progress': 100,
+            'combine_elapsed': round(_now() - combine_t0, 2),
         })
-        return {'status':'COMPLETED','output': final_path}
+        return {'status': 'COMPLETED', 'output': final_path}
 
     except Exception as e:
         logger.exception(f"[{job_id}] transcode_video failed")
         redis_client.hset(job_key, 'status', STATUS_FAILED)
-        return {'status':'FAILED','error': str(e)}
+        return {'status': 'FAILED', 'error': str(e)}
+
 
 @huey.task(retries=1, retry_delay=5)
 def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int = 0):
@@ -689,11 +878,14 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
       - GET /job/<job_id>/part/<idx> from master
       - ffmpeg VAAPI transcode
       - PUT /job/<job_id>/result/<idx> back to master
+      - Update encode_progress/parts_done/completed_chunks atomically on completion
     """
     try:
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode_part {idx}: halted before start")
-            return {'status':'ABORTED'}
+            return {'status': 'ABORTED'}
+
+        encode_started_now = _now()
 
         import requests
 
@@ -703,16 +895,18 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
         in_path  = os.path.join(wtmp, f"in_{idx:03d}.ts")
         out_path = os.path.join(wtmp, f"out_{idx:03d}.mp4")
 
-        # Download part (stream)
+        # Download part
+        logger.info(f"TTV [{job_id}] Getting part {idx} for encode")
+
         get_url = f"{master_host.rstrip('/')}/job/{job_id}/part/{idx}"
         with requests.get(get_url, stream=True, timeout=30) as r:
             r.raise_for_status()
             with open(in_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
 
-        # Encode (identical settings across all workers)
+        # Encode
         cmd = [
             'ffmpeg','-hide_banner',
             '-vaapi_device', VAAPI_DEVICE,
@@ -726,6 +920,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             out_path
         ]
         logger.info(f"[{job_id}] encode_part {idx}: {' '.join(cmd)}")
+        logger.info(f"TTV [{job_id}] Encoding part {idx}")
         pr = subprocess.run(cmd, capture_output=True, text=True)
         if pr.returncode != 0 or not os.path.exists(out_path):
             logger.error(f"[{job_id}] encode_part {idx} failed: {pr.stderr[-1000:]}")
@@ -739,19 +934,53 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             if r.status_code // 100 != 2:
                 raise RuntimeError(f"PUT failed {r.status_code}: {r.text[:300]}")
 
+        logger.info(f"TTV [{job_id}] Completed part {idx}")
+
         # Cleanup local tmpfs
         for p in (in_path, out_path):
             try: os.remove(p)
             except Exception: pass
 
-        # Best-effort UI bump
+        # ------- Progress & timing (idempotent) -------
         try:
-            job_key = _job_key(job_id)
-            completed = int(redis_client.hincrby(job_key, 'completed_chunks', 1))
+            job_key  = _job_key(job_id)
+            done_set = f"job_done_parts:{job_id}"
+
+            # Only count once per idx across retries/duplicates
+            first_time = bool(redis_client.sadd(done_set, idx))
+
+            if first_time:
+                completed = int(redis_client.hincrby(job_key, 'completed_chunks', 1))
+                parts_done = int(redis_client.hincrby(job_key, 'parts_done', 1))
+            else:
+                completed  = int(redis_client.hget(job_key, 'completed_chunks') or 0)
+                parts_done = int(redis_client.hget(job_key, 'parts_done') or 0)
+
             total = int(redis_client.hget(job_key, 'parts_total') or 0)
+
+            # Start the encode elapsed timer on the first part to complete
+            encode_started = redis_client.hget(job_key, 'encode_started')
+            if not encode_started:
+                encode_started = encode_started_now
+                redis_client.hset(job_key, 'encode_started', encode_started)
+
+            # Update elapsed and progress (never decrease)
+            try:
+                elapsed = round(_now() - float(encode_started), 2)
+            except Exception:
+                elapsed = round(_now() - encode_started_now, 2)
+            redis_client.hset(job_key, 'encode_elapsed', elapsed)
+
             if total:
-                redis_client.hset(job_key, 'encode_progress', int((completed/total)*100))
-        except Exception:
+                cur  = int(redis_client.hget(job_key, 'encode_progress') or 0)
+                prog = int((max(completed, parts_done) / total) * 100)
+                if max(completed, parts_done) >= total:
+                    prog = 100
+                if prog > cur:
+                    redis_client.hset(job_key, 'encode_progress', prog)
+
+        except Exception as e:
+            logger.error(f"[{job_id}] encode_part {idx} progress update error: {e}")
             pass
 
         return {'status':'COMPLETED','idx': idx}
@@ -759,9 +988,10 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
     except subprocess.CalledProcessError as e:
         logger.error(f"[{job_id}] encode_part {idx} failed: {e.stderr}")
         raise
-    except Exception as e:
+    except Exception:
         logger.exception(f"[{job_id}] encode_part {idx} unexpected error")
         raise
+
 
 # --------------- Legacy shim ----------------
 

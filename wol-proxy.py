@@ -4,7 +4,7 @@ import redis
 
 # sudo install -m0755 wol-proxy.py /usr/local/bin/wol-proxy.py
 
-REDIS_HOST = os.getenv("REDIS_HOST", "swarm1")   # or "127.0.0.1" if Redis is on this host
+REDIS_HOST = os.getenv("REDIS_HOST", "swarm3")   # or "127.0.0.1" if Redis is on this host
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB   = int(os.getenv("REDIS_DB", "1"))
 CHANNEL    = os.getenv("WOL_CHANNEL", "wol:wake")

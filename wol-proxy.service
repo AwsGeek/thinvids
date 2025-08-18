@@ -14,7 +14,7 @@ Wants=network-online.target
 ExecStart=/usr/bin/env python3 /usr/local/bin/wol-proxy.py
 Restart=always
 RestartSec=1
-Environment=REDIS_HOST=swarm1
+Environment=REDIS_HOST=swarm3
 Environment=REDIS_PORT=6379
 Environment=REDIS_DB=1
 Environment=WOL_CHANNEL=wol:wake
