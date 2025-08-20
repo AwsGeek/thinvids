@@ -863,6 +863,13 @@ def transcode_video(job_id: str, file_path: str):
             'combine_progress': 100,
             'combine_elapsed': round(_now() - combine_t0, 2),
         })
+
+        try:
+            redis_client.delete(f"job_done_parts:{job_id}")
+            redis_client.hdel(f"job:{job_id}", "awaiting_parts")
+        except Exception:
+            pass
+
         return {'status': 'COMPLETED', 'output': final_path}
 
     except Exception as e:
@@ -992,13 +999,3 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
         logger.exception(f"[{job_id}] encode_part {idx} unexpected error")
         raise
 
-
-# --------------- Legacy shim ----------------
-
-@huey.task()
-def segment_video(job_id: str, file_path: str, filename: Optional[str] = None):
-    """
-    Legacy entry kept for compatibility with existing Flask app calls.
-    Delegates to transcode_video().
-    """
-    return transcode_video(job_id, file_path)

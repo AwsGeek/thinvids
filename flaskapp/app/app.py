@@ -16,7 +16,7 @@ from redis.retry import Retry
 from redis.backoff import ExponentialBackoff
 
 # import backend task planner
-from tasks import segment_video, probe_source
+from tasks import transcode_video, probe_source
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -71,6 +71,11 @@ WOL_DEFAULT_BCAST = os.getenv("WOL_BROADCAST", "255.255.255.255")
 WOL_WAKE_ALL = os.getenv("WOL_WAKE_ALL", "0") in ("1", "true", "True")
 WOL_USE_PROXY = os.getenv("WOL_USE_PROXY", "0") in ("1","true","True")
 WOL_CHANNEL   = os.getenv("WOL_CHANNEL", "wol:wake")
+
+# NEW: waiting behavior when waking nodes
+WOL_WAIT_TIMEOUT_SEC = int(os.getenv("WOL_WAIT_TIMEOUT_SEC", "90"))   # total time to wait
+WOL_WAIT_POLL_SEC    = float(os.getenv("WOL_WAIT_POLL_SEC", "1.0"))   # poll interval
+WOL_WAIT_MIN_PERCENT = float(os.getenv("WOL_WAIT_MIN_PERCENT", "0.5"))# 1.0 = 100% nodes must be online
 
 def _active_nodes():
     """Return a set of hostnames with fresh metrics heartbeat."""
@@ -133,10 +138,47 @@ def _load_wol_nodes():
         logger.warning(f"WOL: failed to read nodes:mac: {e}")
     return nodes
 
-def wake_all_nodes():
+def _await_nodes(expected: set[str],
+                 timeout_sec: int = WOL_WAIT_TIMEOUT_SEC,
+                 poll_sec: float = WOL_WAIT_POLL_SEC,
+                 min_percent: float = WOL_WAIT_MIN_PERCENT) -> tuple[int, set[str]]:
+    """
+    Wait until at least min_percent of expected nodes are active, or until timeout.
+    Returns (active_count, active_set) at exit.
+    """
+    expected = set(h for h in expected if h)  # sanitize
+    if not expected:
+        return (0, set())
+
+    deadline = time.time() + max(1, timeout_sec)
+    best_seen: set[str] = set()
+
+    need = max(1, int(len(expected) * min(1.0, max(0.0, min_percent))))
+
+    while True:
+        active = _active_nodes()
+        have = len(expected & active)
+        if have >= need:
+            return (have, active)
+        if time.time() >= deadline:
+            # keep the best snapshot for logs/return
+            if len(expected & active) > len(expected & best_seen):
+                best_seen = active
+            logger.warning(
+                f"WOL wait timeout: {have}/{len(expected)} nodes active "
+                f"(need {need}). Missing: {sorted(expected - active)}"
+            )
+            return (len(expected & best_seen), best_seen)
+        best_seen = active if len(expected & active) > len(expected & best_seen) else best_seen
+        time.sleep(max(0.1, poll_sec))
+
+def wake_all_nodes(wait: bool = False,
+                   timeout_sec: int = WOL_WAIT_TIMEOUT_SEC,
+                   min_percent: float = WOL_WAIT_MIN_PERCENT):
     """
     Wake ALL nodes discovered in nodes:mac (persistent), regardless of recent activity.
-    Returns number of packets sent (unique hosts).
+    If wait=True, block until at least `min_percent` of nodes are active (or timeout).
+    Returns number of WOL packets sent (unique hosts).
     """
     targets = _load_wol_nodes()
     if not targets:
@@ -149,7 +191,6 @@ def wake_all_nodes():
         bcast = cfg.get("bcast") or WOL_DEFAULT_BCAST
         if not mac:
             continue
-
         try:
             _send_magic(mac, bcast)
             sent += 1
@@ -158,7 +199,14 @@ def wake_all_nodes():
             logger.warning(f"WOL: failed for {host} ({mac}): {e}")
 
     logger.info(f"WOL: packets sent for {sent} host(s)")
+
+    if wait:
+        expected_hosts = set(targets.keys())
+        have, active = _await_nodes(expected_hosts, timeout_sec=timeout_sec, min_percent=min_percent)
+        logger.info(f"WOL: wait complete: {have}/{len(expected_hosts)} active "
+                    f"(min {int(len(expected_hosts)*min_percent)}).")
     return sent
+
 
 # NEW: wake a single node by hostname
 @app.post('/nodes/wake/<hostname>')
@@ -177,15 +225,17 @@ def nodes_wake_one(hostname):
         logger.warning(f"WOL: failed for {hostname} ({mac}): {e}")
         return jsonify({'error': str(e)}), 500
 
-# NEW: wake all nodes
 @app.post('/nodes/wake_all')
 def nodes_wake_all():
     try:
-        sent = wake_all_nodes()
-        return jsonify({'status': 'ok', 'sent': sent})
+        sent = wake_all_nodes(wait=False)   # UI should return quickly
+        # Optional: show how many are currently active right now (best-effort)
+        active_now = len(_active_nodes())
+        return jsonify({'status': 'ok', 'sent': sent, 'active_now': active_now})
     except Exception as e:
         logger.exception("Wake All failed")
         return jsonify({'error': str(e)}), 500
+
 
 # -------------------------- Views --------------------------
 @app.route('/')
@@ -461,10 +511,10 @@ def add_job():
     # Optionally auto-start segmentation
     if auto_start_effective:
         try:
-            wake_all_nodes()  # wake thinman nodes
+            wake_all_nodes(wait=True)
         except Exception as e:
             logger.warning(f"WOL during add_job failed: {e}")
-        segment_video(job_id, f'/watch/{filename}', filename)
+        transcode_video(job_id, f'/watch/{filename}')
 
     return jsonify({'status': 'success', 'job_id': job_id}), 201
 
@@ -558,11 +608,11 @@ def start_job(job_id):
     redis_client.hset(job_key, mapping={'status': STATUS_RUNNING, 'started_at': now})
 
     try:
-        wake_all_nodes()  # wake thinman nodes
+        wake_all_nodes(wait=True)
     except Exception as e:
         logger.warning(f"WOL during start_job failed: {e}")
 
-    segment_video(job_id, f'/watch/{filename}', filename)
+    transcode_video(job_id, f'/watch/{filename}')
 
     return jsonify({'status': 'started'}), 200
 
@@ -632,11 +682,11 @@ def restart_job(job_id):
     redis_client.hset(f"job:{job_id}", mapping=new_job)
 
     try:
-        wake_all_nodes()  # wake thinman nodes
+        wake_all_nodes(wait=True)
     except Exception as e:
         logger.warning(f"WOL during restart_job failed: {e}")
 
-    segment_video(job_id, f'/watch/{filename}', filename)
+    transcode_video(job_id, f'/watch/{filename}')
     return jsonify({'status': 'started'}), 200
 
 @app.get('/dashboard')
