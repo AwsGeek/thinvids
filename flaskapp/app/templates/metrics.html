@@ -1,14 +1,15 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Network Traffic – Thinvids</title>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+{% extends "base.html" %}
+{% block title %}Network Traffic – Thinvids{% endblock %}
+{% block head_extra %}
   <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
-</head>
-<body class="bg-gray-100">
-  <div class="container mx-auto p-4 space-y-4">
+  <style>
+    th.sortable { cursor: pointer; user-select: none; }
+    .sort-indicator { display:inline-block; width:0.8rem; }
+  </style>
+{% endblock %}
+
+{% block content %}
+  <div class="space-y-4">
     <div class="flex items-center justify-between">
       <h1 class="text-2xl font-bold">Network Traffic</h1>
       <div class="flex items-center gap-2">
@@ -25,8 +26,6 @@
         <select id="host-select" class="border rounded px-2 py-1 text-sm min-w-[12rem]">
           <option value="__ALL__" selected>All hosts</option>
         </select>
-
-        <a href="/" class="bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded text-sm ml-2">Back</a>
       </div>
     </div>
 
@@ -51,13 +50,14 @@
         <table class="min-w-full border-collapse">
           <thead>
             <tr class="bg-gray-100 text-left text-sm">
-              <th class="px-2 py-1">Host</th>
-              <th class="px-2 py-1">RX (Mbps)</th>
-              <th class="px-2 py-1">TX (Mbps)</th>
-              <th class="px-2 py-1">CPU%</th>
-              <th class="px-2 py-1">GPU%</th>
-              <th class="px-2 py-1">Mem%</th>
-              <th class="px-2 py-1">Last Seen</th>
+              <th class="px-2 py-1 sortable" data-key="hostname">Host <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="rx">RX (Mbps) <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="tx">TX (Mbps) <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="cpu">CPU% <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="gpu">GPU% <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="mem">Mem% <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="disk">Disk% <span class="sort-indicator"></span></th>
+              <th class="px-2 py-1 sortable" data-key="ts">Last Seen <span class="sort-indicator"></span></th>
             </tr>
           </thead>
           <tbody id="talkers"></tbody>
@@ -65,250 +65,295 @@
       </div>
     </div>
   </div>
+{% endblock %}
 
-  <script>
-    // --------- helpers ---------
-    const updatedEl   = document.getElementById('last-updated');
-    const windowSel   = document.getElementById('window-min');
-    const hostSel     = document.getElementById('host-select');
-    const talkersBody = document.getElementById('talkers');
+{% block scripts %}
+<script>
+  // --------- helpers ---------
+  const updatedEl   = document.getElementById('last-updated');
+  const windowSel   = document.getElementById('window-min');
+  const hostSel     = document.getElementById('host-select');
+  const talkersBody = document.getElementById('talkers');
 
-    const nowSec = () => Math.floor(Date.now() / 1000);
-    const winSec = () => (parseInt(windowSel.value, 10) || 5) * 60;
-    const mbps   = bps => (Number(bps || 0) * 8 / 1e6);
-    const tsStr  = ts => new Date(ts * 1000).toLocaleTimeString();
+  const nowSec = () => Math.floor(Date.now() / 1000);
+  const mbps   = bps => (Number(bps || 0) * 8 / 1e6);
 
-    // --------- localStorage cache (last 10min) ---------
-    const METRICS_CACHE_KEY = 'metrics_page_cache_v1';
-    const CACHE_LIMIT = 600; // seconds ≈ 10min
+  // --------- chart setup ---------
+  const PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#17becf', '#7f7f7f', '#bcbd22',
+    '#000000', '#ff1493', '#00ced1', '#ffa500', '#4169e1',
+    '#2e8b57', '#ff4500', '#6a5acd', '#008080', '#c71585'
+  ];
+  const lighten = (hex, amt = 0.38) => {
+    const m = hex.match(/^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i); if (!m) return hex;
+    let [r,g,b] = [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)];
+    r = Math.round(r + (255-r)*amt); g = Math.round(g + (255-g)*amt); b = Math.round(b + (255-b)*amt);
+    return '#' + [r,g,b].map(v=>v.toString(16).padStart(2,'0')).join('');
+  };
 
-    function loadCache() {
-      try {
-        const raw = localStorage.getItem(METRICS_CACHE_KEY);
-        const d = raw ? JSON.parse(raw) : null;
-        if (!d || !Array.isArray(d.labels) || typeof d.hosts !== 'object') return { labels: [], hosts: {} };
-        return d;
-      } catch { return { labels: [], hosts: {} }; }
-    }
-    function saveCache(cache) {
-      try { localStorage.setItem(METRICS_CACHE_KEY, JSON.stringify(cache)); } catch {}
-    }
-
-    function pushSample(cache, ts, sampleByHost) {
-      // enforce monotonic seconds
-      const lastTs = cache.labels[cache.labels.length - 1] || 0;
-      if (ts <= lastTs) return;
-
-      cache.labels.push(ts);
-
-      // trim to limit
-      const over = Math.max(0, cache.labels.length - CACHE_LIMIT);
-      if (over) {
-        cache.labels = cache.labels.slice(over);
-        for (const h of Object.keys(cache.hosts)) {
-          cache.hosts[h].rx = cache.hosts[h].rx.slice(over);
-          cache.hosts[h].tx = cache.hosts[h].tx.slice(over);
-        }
-      }
-
-      // union host set; backfill nulls for new hosts
-      const union = new Set([...Object.keys(cache.hosts), ...Object.keys(sampleByHost)]);
-      for (const h of union) {
-        if (!cache.hosts[h]) {
-          cache.hosts[h] = {
-            rx: Array(cache.labels.length - 1).fill(null),
-            tx: Array(cache.labels.length - 1).fill(null),
-          };
-        }
-        const s = sampleByHost[h];
-        cache.hosts[h].rx.push(s ? s.rx : null);
-        cache.hosts[h].tx.push(s ? s.tx : null);
-      }
-
-      saveCache(cache);
-    }
-
-    // --------- chart setup ---------
-    const PALETTE = [
-      '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-      '#8c564b', '#e377c2', '#17becf', '#7f7f7f', '#bcbd22',
-      '#000000', '#ff1493', '#00ced1', '#ffa500', '#4169e1',
-      '#2e8b57', '#ff4500', '#6a5acd', '#008080', '#c71585'
-    ];
-    const lighten = (hex, amt = 0.38) => {
-      const m = hex.match(/^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i); if (!m) return hex;
-      let [r,g,b] = [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)];
-      r = Math.round(r + (255-r)*amt); g = Math.round(g + (255-g)*amt); b = Math.round(b + (255-b)*amt);
-      return '#' + [r,g,b].map(v=>v.toString(16).padStart(2,'0')).join('');
-    };
-
-    const ctx = document.getElementById('hostChart').getContext('2d');
-    const hostChart = new Chart(ctx, {
-      type: 'line',
-      data: { labels: [], datasets: [] },
-      options: {
-        responsive: true, maintainAspectRatio: false, animation: false,
-        plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
-        interaction: { mode: 'index', intersect: false },
-        elements: { point: { radius: 0 } },
-        scales: {
-          x: { grid: { display: false } },
-          y: {
-            beginAtZero: true,
-            title: { display: true, text: 'Mbps' },
-            ticks: { callback: v => v.toLocaleString() }
+  let frameSeconds = []; // used to show minute ticks only
+  const ctx = document.getElementById('hostChart').getContext('2d');
+  const hostChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
+      interaction: { mode: 'index', intersect: false },
+      elements: { point: { radius: 0 } },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: {
+            autoSkip: false,
+            callback: (idx) => {
+              const ts = frameSeconds[idx] || 0;
+              if ((ts % 60) !== 0) return '';
+              const d = new Date(ts * 1000);
+              return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
           }
+        },
+        y: {
+          beginAtZero: true,
+          min: 0,
+          max: 1000,
+          ticks: { stepSize: 500, callback: v => v.toLocaleString() },
+          title: { display: true, text: 'Mbps' }
         }
       }
+    }
+  });
+
+  // stable host order → stable colors
+  const hostOrder = [];
+  function sortHosts(hosts) {
+    return [...hosts].sort((a,b) => {
+      const na = parseInt((a||'').match(/\d+/)?.[0] || 0, 10);
+      const nb = parseInt((b||'').match(/\d+/)?.[0] || 0, 10);
+      return na - nb || a.localeCompare(b);
+    });
+  }
+
+  function ensureHostSelectOptions(hosts) {
+    const current = hostSel.value || '__ALL__';
+    const opts = ['__ALL__', ...hosts];
+    hostSel.innerHTML = '';
+    for (const v of opts) {
+      const op = document.createElement('option');
+      op.value = v;
+      op.textContent = v === '__ALL__' ? 'All hosts' : v;
+      hostSel.appendChild(op);
+    }
+    hostSel.value = opts.includes(current) ? current : '__ALL__';
+  }
+
+  // Build fixed window frame (N seconds ending "now") and map cache values onto it.
+  function buildFrameFromCache(cache, N) {
+    const endTs = nowSec();
+    const frame = Array.from({length: N}, (_, i) => endTs - (N - 1 - i));
+    const tsIdx = new Map(cache.labels.map((t, i) => [t, i]));
+    const hosts = Object.keys(cache.hosts || {});
+    const seriesByHost = {};
+    hosts.forEach(h => {
+      const rx = new Array(N).fill(null);
+      const tx = new Array(N).fill(null);
+      for (let k = 0; k < N; k++) {
+        const idx = tsIdx.get(frame[k]);
+        if (idx != null) {
+          rx[k] = cache.hosts[h].rx[idx];
+          tx[k] = cache.hosts[h].tx[idx];
+        }
+      }
+      seriesByHost[h] = { rx, tx };
+    });
+    return { frame, seriesByHost };
+  }
+
+  function renderChart(cache) {
+    const N = (parseInt(windowSel.value, 10) || 5) * 60;
+    const { frame, seriesByHost } = buildFrameFromCache(cache, N);
+    frameSeconds = frame;
+    hostChart.data.labels = frame;
+
+    const allHosts = sortHosts(Object.keys(seriesByHost));
+    ensureHostSelectOptions(allHosts);
+
+    const selected = hostSel.value || '__ALL__';
+    const showHosts = selected === '__ALL__' ? allHosts : [selected];
+
+    const datasets = [];
+    showHosts.forEach((h) => {
+      if (!hostOrder.includes(h)) hostOrder.push(h);
+      const baseColor = PALETTE[hostOrder.indexOf(h) % PALETTE.length];
+      datasets.push({
+        label: `${h} RX`,
+        data: seriesByHost[h]?.rx || new Array(N).fill(null),
+        borderColor: baseColor, fill: false, tension: 0.12, borderWidth: 2, spanGaps: true
+      });
+      datasets.push({
+        label: `${h} TX`,
+        data: seriesByHost[h]?.tx || new Array(N).fill(null),
+        borderColor: lighten(baseColor, 0.38), borderDash: [6,4], fill: false, tension: 0.12, borderWidth: 2, spanGaps: true
+      });
     });
 
-    // stable host order → stable colors
-    const hostOrder = [];
-    function sortHosts(hosts) {
-      return [...hosts].sort((a,b) => {
-        const na = parseInt((a||'').match(/\d+/)?.[0] || 0, 10);
-        const nb = parseInt((b||'').match(/\d+/)?.[0] || 0, 10);
-        return na - nb || a.localeCompare(b);
-      });
-    }
+    hostChart.data.datasets = datasets;
+    hostChart.update('none');
+  }
 
-    function ensureHostSelectOptions(hosts) {
-      const current = hostSel.value || '__ALL__';
-      const opts = ['__ALL__', ...hosts];
-      hostSel.innerHTML = '';
-      for (const v of opts) {
-        const op = document.createElement('option');
-        op.value = v;
-        op.textContent = v === '__ALL__' ? 'All hosts' : v;
-        hostSel.appendChild(op);
+  // ---------- Top Talkers sortable table ----------
+  const SORT_LS_KEY = 'metrics_talkers_sort_v1';
+  let sortState = loadSortState();
+  let currentNodes = [];
+
+  function loadSortState() {
+    try {
+      const d = JSON.parse(localStorage.getItem(SORT_LS_KEY) || '{}');
+      if (d && d.key && d.dir) return d;
+    } catch {}
+    return { key: 'throughput', dir: 'desc' };
+  }
+  function saveSortState() {
+    try { localStorage.setItem(SORT_LS_KEY, JSON.stringify(sortState)); } catch {}
+  }
+  function naturalHostCompare(a, b) {
+    const num = s => {
+      const m = String(s||'').match(/(\d+)/);
+      return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+    };
+    const na = num(a), nb = num(b);
+    if (na !== nb) return na - nb;
+    const sa = String(a||'').toLowerCase();
+    const sb = String(b||'').toLowerCase();
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  }
+  function sortValue(n, key) {
+    switch (key) {
+      case 'hostname': return n.hostname || '';
+      case 'rx': return Number(n.rx_bps || 0);
+      case 'tx': return Number(n.tx_bps || 0);
+      case 'cpu': return Number(n.cpu || 0);
+      case 'gpu': return Number(n.gpu || 0);
+      case 'mem': return Number(n.mem || 0);
+      case 'disk': return Number(n.disk || 0);
+      case 'ts': return Number(n.ts || 0);
+      case 'throughput': return Math.max(Number(n.rx_bps || 0), Number(n.tx_bps || 0));
+      default: return 0;
+    }
+  }
+  function renderTalkers(nodes) {
+    currentNodes = Array.isArray(nodes) ? nodes.slice() : [];
+
+    const key = sortState.key;
+    const dirMul = sortState.dir === 'asc' ? 1 : -1;
+
+    const rows = currentNodes.sort((a,b) => {
+      if (key === 'hostname') {
+        return naturalHostCompare(a.hostname, b.hostname) * dirMul;
       }
-      hostSel.value = opts.includes(current) ? current : '__ALL__';
-    }
-
-    // Build fixed window frame (N seconds ending "now") and map cache values onto it.
-    function buildFrameFromCache(cache, N) {
-      const endTs = nowSec();
-      const frame = Array.from({length: N}, (_, i) => endTs - (N - 1 - i));
-      const tsIdx = new Map(cache.labels.map((t, i) => [t, i]));
-      const hosts = Object.keys(cache.hosts || {});
-      const seriesByHost = {};
-      hosts.forEach(h => {
-        const rx = new Array(N).fill(null);
-        const tx = new Array(N).fill(null);
-        for (let k = 0; k < N; k++) {
-          const idx = tsIdx.get(frame[k]);
-          if (idx != null) {
-            rx[k] = cache.hosts[h].rx[idx];
-            tx[k] = cache.hosts[h].tx[idx];
-          }
-        }
-        seriesByHost[h] = { rx, tx };
-      });
-      return { frame, seriesByHost };
-    }
-
-    function renderChart(cache) {
-      const N = winSec();
-      const { frame, seriesByHost } = buildFrameFromCache(cache, N);
-      const allHosts = sortHosts(Object.keys(seriesByHost));
-      ensureHostSelectOptions(allHosts);
-
-      const selected = hostSel.value || '__ALL__';
-      const showHosts = selected === '__ALL__' ? allHosts : [selected];
-
-      // datasets: (re)build each time for clarity
-      const datasets = [];
-      showHosts.forEach((h) => {
-        if (!hostOrder.includes(h)) hostOrder.push(h);
-        const baseColor = PALETTE[hostOrder.indexOf(h) % PALETTE.length];
-        datasets.push({
-          label: `${h} RX`,
-          data: seriesByHost[h]?.rx || new Array(N).fill(null),
-          borderColor: baseColor, fill: false, tension: 0.12, borderWidth: 2, spanGaps: true
-        });
-        datasets.push({
-          label: `${h} TX`,
-          data: seriesByHost[h]?.tx || new Array(N).fill(null),
-          borderColor: lighten(baseColor, 0.38), borderDash: [6,4], fill: false, tension: 0.12, borderWidth: 2, spanGaps: true
-        });
-      });
-
-      hostChart.data.labels = frame.map(ts => new Date(ts * 1000).toLocaleTimeString());
-      hostChart.data.datasets = datasets;
-      hostChart.update('none');
-    }
-
-    function renderTalkers(nodes) {
-      const rows = [...nodes].sort((a,b) => {
-        const aa = Math.max(a.rx_bps||0, a.tx_bps||0);
-        const bb = Math.max(b.rx_bps||0, b.tx_bps||0);
-        return bb - aa;
-      }).slice(0, 20);
-
-      talkersBody.innerHTML = '';
-      for (const n of rows) {
-        const tr = document.createElement('tr');
-        tr.className = 'border-b';
-        tr.innerHTML = `
-          <td class="px-2 py-1 font-mono">${n.hostname || ''}</td>
-          <td class="px-2 py-1">${mbps(n.rx_bps).toFixed(2)}</td>
-          <td class="px-2 py-1">${mbps(n.tx_bps).toFixed(2)}</td>
-          <td class="px-2 py-1">${Number(n.cpu||0).toFixed(1)}</td>
-          <td class="px-2 py-1">${Number(n.gpu||0).toFixed(1)}</td>
-          <td class="px-2 py-1">${Number(n.mem||0).toFixed(1)}</td>
-          <td class="px-2 py-1">${n.ts ? new Date(n.ts*1000).toLocaleTimeString() : ''}</td>
-        `;
-        talkersBody.appendChild(tr);
+      const va = sortValue(a, key), vb = sortValue(b, key);
+      const na = Number(va), nb = Number(vb);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+        return (na - nb) * dirMul;
       }
+      const sa = String(va).toLowerCase(), sb = String(vb).toLowerCase();
+      return (sa < sb ? -1 : sa > sb ? 1 : 0) * dirMul;
+    }).slice(0, 20);
+
+    talkersBody.innerHTML = '';
+    for (const n of rows) {
+      const tr = document.createElement('tr');
+      tr.className = 'border-b';
+      tr.innerHTML = `
+        <td class="px-2 py-1 font-mono">${n.hostname || ''}</td>
+        <td class="px-2 py-1">${mbps(n.rx_bps).toFixed(2)}</td>
+        <td class="px-2 py-1">${mbps(n.tx_bps).toFixed(2)}</td>
+        <td class="px-2 py-1">${Number(n.cpu||0).toFixed(1)}</td>
+        <td class="px-2 py-1">${Number(n.gpu||0).toFixed(1)}</td>
+        <td class="px-2 py-1">${Number(n.mem||0).toFixed(1)}</td>
+        <td class="px-2 py-1">${Number(n.disk||0).toFixed(1)}</td>
+        <td class="px-2 py-1">${n.ts ? new Date(n.ts*1000).toLocaleTimeString() : ''}</td>
+      `;
+      talkersBody.appendChild(tr);
     }
+    updateHeaderSortIndicators();
+  }
 
-    async function fetchSnapshot() {
-      const r = await fetch('/metrics_snapshot');
-      if (!r.ok) return null;
-      return r.json();
-    }
+  function updateHeaderSortIndicators() {
+    document.querySelectorAll('thead th.sortable').forEach(th => {
+      const span = th.querySelector('.sort-indicator');
+      if (!span) return;
+      const k = th.dataset.key;
+      if (k === sortState.key) {
+        span.textContent = sortState.dir === 'asc' ? '▲' : '▼';
+        th.classList.add('text-blue-700');
+      } else {
+        span.textContent = '';
+        th.classList.remove('text-blue-700');
+      }
+    });
+  }
 
-    async function tick() {
-      try {
-        const payload = await fetchSnapshot();
-        const ts = nowSec();
-
-        // update cache
-        if (payload && Array.isArray(payload.nodes)) {
-          const sample = {};
-          payload.nodes.forEach(n => {
-            if (!n.hostname) return;
-            sample[n.hostname] = { rx: mbps(n.rx_bps || 0), tx: mbps(n.tx_bps || 0) };
-          });
-          const cache = loadCache();
-          pushSample(cache, ts, sample);
-          renderChart(cache);
-
-          updatedEl.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
-          const nodes = (payload.nodes || []).map(n => ({
-            hostname: n.hostname, ts: n.ts, cpu: n.cpu, gpu: n.gpu, mem: n.mem,
-            rx_bps: Number(n.rx_bps || 0), tx_bps: Number(n.tx_bps || 0)
-          }));
-          renderTalkers(nodes);
+  function bindSortHandlers() {
+    document.querySelectorAll('thead th.sortable').forEach(th => {
+      th.addEventListener('click', () => {
+        const k = th.dataset.key;
+        if (!k) return;
+        if (sortState.key === k) {
+          sortState.dir = (sortState.dir === 'asc') ? 'desc' : 'asc';
         } else {
-          // even if fetch fails, keep the chart alive with cached data
-          renderChart(loadCache());
+          sortState.key = k;
+          sortState.dir = (k === 'hostname') ? 'asc' : 'desc';
         }
-      } catch {
-        // use cache on transient errors
-        renderChart(loadCache());
+        saveSortState();
+        renderTalkers(currentNodes);
+      });
+    });
+  }
+
+  async function fetchSnapshot() {
+    const r = await fetch('/metrics_snapshot');
+    if (!r.ok) return null;
+    return r.json();
+  }
+
+  async function tick() {
+    try {
+      const payload = await fetchSnapshot();
+
+      if (payload && Array.isArray(payload.nodes)) {
+        const sample = {};
+        payload.nodes.forEach(n => {
+          if (!n.hostname) return;
+          sample[n.hostname] = { rx: mbps(n.rx_bps || 0), tx: mbps(n.tx_bps || 0) };
+        });
+        const cache = window.NETCACHE.push(nowSec(), sample);
+        renderChart(cache);
+
+        updatedEl.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+        const nodes = (payload.nodes || []).map(n => ({
+          hostname: n.hostname, ts: n.ts, cpu: n.cpu, gpu: n.gpu, mem: n.mem, disk: n.disk,
+          rx_bps: Number(n.rx_bps || 0), tx_bps: Number(n.tx_bps || 0)
+        }));
+        renderTalkers(nodes);
+      } else {
+        renderChart(window.NETCACHE.load());
       }
+    } catch {
+      renderChart(window.NETCACHE.load());
     }
+  }
 
-    // events
-    document.getElementById('refresh-now').addEventListener('click', tick);
-    windowSel.addEventListener('change', () => renderChart(loadCache()));
-    hostSel.addEventListener('change',  () => renderChart(loadCache()));
+  document.getElementById('refresh-now').addEventListener('click', tick);
+  windowSel.addEventListener('change', () => renderChart(window.NETCACHE.load()));
+  hostSel.addEventListener('change',  () => renderChart(window.NETCACHE.load()));
 
-    // initial render from cache then start ticking
-    renderChart(loadCache());
-    tick();
-    setInterval(tick, 1000);
-  </script>
-</body>
-</html>
+  bindSortHandlers();
+  updateHeaderSortIndicators();
+  renderChart(window.NETCACHE.load());
+  tick();
+  setInterval(tick, 1000);
+</script>
+{% endblock %}

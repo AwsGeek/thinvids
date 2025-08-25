@@ -273,6 +273,7 @@ def metrics_snapshot():
                 "mem_total": int(float(data.get("mem_total", 0) or 0)),
                 "rx_bps": int(float(data.get("rx_bps", 0) or 0)),
                 "tx_bps": int(float(data.get("tx_bps", 0) or 0)),
+                "disk": int(float(data.get("disk", 0) or 0)),
             })
         except Exception:
             continue

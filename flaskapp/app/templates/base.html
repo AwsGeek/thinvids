@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{% block title %}Trans the Vids!{% endblock %}</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  {% block head_extra %}{% endblock %}
+</head>
+<body class="bg-gray-100">
+  <div class="container mx-auto p-4">
+    <!-- Shared header -->
+    <div class="flex items-center justify-between mb-4">
+      <a href="/" class="flex items-center gap-2 group" title="Home">
+        <span class="text-2xl font-bold">Trans the Vids!</span>
+      </a>
+      <div class="flex items-center gap-2">
+        <button id="open-home" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">home</span>
+            Home
+          </button>
+          <button id="open-nodes" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+          <span class="material-icons">dns</span>
+          Nodes
+        </button>
+        <button id="open-metrics" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+          <span class="material-icons">show_chart</span>
+          Metrics
+        </button>
+        <button id="open-global-settings" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+          <span class="material-icons">settings</span>
+          Settings
+        </button>
+      </div>
+    </div>
+
+    {% block content %}{% endblock %}
+  </div>
+
+  <!-- Global nav handlers -->
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const hook = (id, href) => { const b=document.getElementById(id); if (b) b.onclick=()=>location.href=href; };
+      hook('open-home','/');
+      hook('open-nodes','/nodes');
+      hook('open-metrics','/metrics');
+      hook('open-global-settings','/settings');
+    });
+  </script>
+
+  <!-- Shared per-second network cache (ALL pages use the same storage) -->
+  <script>
+    window.NETCACHE = (function(){
+      const KEY   = 'thinvids_netcache_v1';
+      const LIMIT = 1800; // keep up to 30 minutes of per-second samples
+      function load(){
+        try{
+          const raw = localStorage.getItem(KEY);
+          const d = raw ? JSON.parse(raw) : null;
+          if (!d || !Array.isArray(d.labels) || typeof d.hosts !== 'object') return { labels: [], hosts: {} };
+          return d;
+        }catch{ return { labels: [], hosts: {} }; }
+      }
+      function save(c){ try{ localStorage.setItem(KEY, JSON.stringify(c)); }catch{} }
+      function push(ts, sampleByHost){
+        const c = load();
+        const last = c.labels[c.labels.length-1] || 0;
+        if (ts <= last) return c;
+        c.labels.push(ts);
+
+        const over = Math.max(0, c.labels.length - LIMIT);
+        if (over){
+          c.labels = c.labels.slice(over);
+          for (const h of Object.keys(c.hosts)){
+            c.hosts[h].rx = c.hosts[h].rx.slice(over);
+            c.hosts[h].tx = c.hosts[h].tx.slice(over);
+          }
+        }
+
+        const union = new Set([...Object.keys(c.hosts), ...Object.keys(sampleByHost||{})]);
+        for (const h of union){
+          if (!c.hosts[h]){
+            c.hosts[h] = { rx: Array(c.labels.length-1).fill(null), tx: Array(c.labels.length-1).fill(null) };
+          }
+          const s = sampleByHost[h];
+          c.hosts[h].rx.push(s ? s.rx : null);
+          c.hosts[h].tx.push(s ? s.tx : null);
+        }
+        save(c);
+        return c;
+      }
+      return { load, save, push, KEY, LIMIT };
+    })();
+  </script>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

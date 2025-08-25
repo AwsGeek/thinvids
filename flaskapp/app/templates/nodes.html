@@ -1,197 +1,184 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Thinman Nodes</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-</head>
-<body class="bg-gray-100">
-  <div class="container mx-auto p-4">
-    <div class="flex items-center justify-between mb-4">
-      <h1 class="text-2xl font-bold">Thinman Nodes</h1>
-      <div class="flex items-center gap-2">
-        <button id="wake-all" class="flex items-center gap-1 bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded">
-          <span class="material-icons">power_settings_new</span>
-          Wake All
-        </button>
-        <button id="refresh" class="flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded">
-          <span class="material-icons">refresh</span>
-          Refresh
-        </button>
-        <a href="/" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
-          <span class="material-icons">arrow_back</span>
-          Back
-        </a>
-      </div>
-    </div>
+{% extends "base.html" %}
+{% block title %}Thinman Nodes{% endblock %}
 
-    <div class="bg-white rounded shadow p-4">
-      <table class="w-full border-collapse">
-        <thead>
-          <tr class="bg-gray-200 text-left">
-            <th class="px-2 py-1">Hostname</th>
-            <th class="px-2 py-1">IP</th>
-            <th class="px-2 py-1">MAC</th>
-            <th class="px-2 py-1">Last Seen</th>
-            <th class="px-2 py-1">Status</th>
-            <th class="px-2 py-1">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="nodes-body"></tbody>
-      </table>
-      <div id="empty" class="text-sm text-gray-600 py-2 hidden">
-        No nodes found. Ensure agents have published <code>nodes:mac</code> in Redis.
-      </div>
+{% block content %}
+  <div class="flex items-center justify-between mb-4">
+    <h1 class="text-2xl font-bold">Thinman Nodes</h1>
+    <div class="flex items-center gap-2">
+      <button id="wake-all" class="flex items-center gap-1 bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded">
+        <span class="material-icons">power_settings_new</span>
+        Wake All
+      </button>
+      <button id="refresh" class="flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded">
+        <span class="material-icons">refresh</span>
+        Refresh
+      </button>
+    </div>
+  </div>
+
+  <div class="bg-white rounded shadow p-4">
+    <table class="w-full border-collapse">
+      <thead>
+        <tr class="bg-gray-200 text-left">
+          <th class="px-2 py-1">Hostname</th>
+          <th class="px-2 py-1">IP</th>
+          <th class="px-2 py-1">MAC</th>
+          <th class="px-2 py-1">Last Seen</th>
+          <th class="px-2 py-1">Status</th>
+          <th class="px-2 py-1">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="nodes-body"></tbody>
+    </table>
+    <div id="empty" class="text-sm text-gray-600 py-2 hidden">
+      No nodes found. Ensure agents have published <code>nodes:mac</code> in Redis.
     </div>
   </div>
 
   <!-- Toasts -->
   <div id="toast-root" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
+{% endblock %}
 
-  <script>
-    const body = document.getElementById('nodes-body');
-    const empty = document.getElementById('empty');
-    const toastRoot = document.getElementById('toast-root');
+{% block scripts %}
+<script>
+  const body = document.getElementById('nodes-body');
+  const empty = document.getElementById('empty');
+  const toastRoot = document.getElementById('toast-root');
 
-    function toast(msg, ok=true) {
-      const n = document.createElement('div');
-      n.className = `px-3 py-2 rounded text-white shadow ${ok?'bg-green-600':'bg-red-600'}`;
-      n.textContent = msg;
-      toastRoot.appendChild(n);
-      setTimeout(()=>n.remove(), 2200);
-    }
+  function toast(msg, ok=true) {
+    const n = document.createElement('div');
+    n.className = `px-3 py-2 rounded text-white shadow ${ok?'bg-green-600':'bg-red-600'}`;
+    n.textContent = msg;
+    toastRoot.appendChild(n);
+    setTimeout(()=>n.remove(), 2200);
+  }
 
-    function tsToStr(ts) {
-      if (!ts) return '';
-      return new Date(ts*1000).toLocaleString();
-    }
+  function tsToStr(ts) {
+    if (!ts) return '';
+    return new Date(ts*1000).toLocaleString();
+  }
 
-    function ensureRow(hostname) {
-      let tr = body.querySelector(`tr[data-host="${hostname}"]`);
-      if (tr) return tr;
+  function ensureRow(hostname) {
+    let tr = body.querySelector(`tr[data-host="${hostname}"]`);
+    if (tr) return tr;
 
-      tr = document.createElement('tr');
-      tr.dataset.host = hostname;
-      tr.innerHTML = `
-        <td class="px-2 py-1 cell-host"></td>
-        <td class="px-2 py-1 font-mono cell-ip"></td>
-        <td class="px-2 py-1 font-mono cell-mac"></td>
-        <td class="px-2 py-1 cell-last"></td>
-        <td class="px-2 py-1 cell-status">
-          <span class="badge px-2 py-0.5 rounded text-xs"></span>
-        </td>
-        <td class="px-2 py-1 cell-actions"></td>
-      `;
-      body.appendChild(tr);
-      return tr;
-    }
+    tr = document.createElement('tr');
+    tr.dataset.host = hostname;
+    tr.innerHTML = `
+      <td class="px-2 py-1 cell-host"></td>
+      <td class="px-2 py-1 font-mono cell-ip"></td>
+      <td class="px-2 py-1 font-mono cell-mac"></td>
+      <td class="px-2 py-1 cell-last"></td>
+      <td class="px-2 py-1 cell-status">
+        <span class="badge px-2 py-0.5 rounded text-xs"></span>
+      </td>
+      <td class="px-2 py-1 cell-actions"></td>
+    `;
+    body.appendChild(tr);
+    return tr;
+  }
 
-    function setBadge(el, active) {
-      el.textContent = active ? 'online' : 'offline';
-      el.className = `badge px-2 py-0.5 rounded text-xs ${
-        active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
-      }`;
-    }
+  function setBadge(el, active) {
+    el.textContent = active ? 'online' : 'offline';
+    el.className = `badge px-2 py-0.5 rounded text-xs ${
+      active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+    }`;
+  }
 
-    function setActions(td, hostname, active) {
-        td.innerHTML = '';
+  function setActions(td, hostname, active) {
+      td.innerHTML = '';
 
-        // Wake (only when offline, as before)
-        if (!active) {
-          const btn = document.createElement('button');
-          btn.className = 'wake-btn bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
-          btn.textContent = 'Wake';
-          btn.addEventListener('click', async () => {
-            try {
-              const r = await fetch(`/nodes/wake/${encodeURIComponent(hostname)}`, { method: 'POST' });
-              const j = await r.json().catch(()=>({}));
-              if (r.ok) toast(`Sent WOL to ${hostname}`); else toast(j.error || `Failed to wake ${hostname}`, false);
-            } catch { toast(`Failed to wake ${hostname}`, false); }
-          });
-          td.appendChild(btn);
-        }
-
-        // Delete (always available)
-        const delBtn = document.createElement('button');
-        delBtn.className = 'ml-2 bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-sm';
-        delBtn.textContent = 'Delete';
-        delBtn.title = 'Remove this node from Redis and the list';
-        delBtn.addEventListener('click', async () => {
-          if (!confirm(`Delete node "${hostname}"?\nThis removes its MAC mapping and metrics from Redis.`)) return;
+      // Wake (only when offline)
+      if (!active) {
+        const btn = document.createElement('button');
+        btn.className = 'wake-btn bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
+        btn.textContent = 'Wake';
+        btn.addEventListener('click', async () => {
           try {
-            const r = await fetch(`/nodes/delete/${encodeURIComponent(hostname)}`, { method: 'DELETE' });
+            const r = await fetch(`/nodes/wake/${encodeURIComponent(hostname)}`, { method: 'POST' });
             const j = await r.json().catch(()=>({}));
-            if (r.ok) {
-              toast(`Removed ${hostname}`);
-              const row = document.querySelector(`tr[data-host="${hostname}"]`);
-              if (row) row.remove();
-              // Show empty state if nothing remains
-              if (!document.querySelector('#nodes-body tr')) {
-                empty.classList.remove('hidden');
-              }
-            } else {
-              toast(j.error || `Failed to remove ${hostname}`, false);
+            if (r.ok) toast(`Sent WOL to ${hostname}`); else toast(j.error || `Failed to wake ${hostname}`, false);
+          } catch { toast(`Failed to wake ${hostname}`, false); }
+        });
+        td.appendChild(btn);
+      }
+
+      // Delete (always available)
+      const delBtn = document.createElement('button');
+      delBtn.className = 'ml-2 bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-sm';
+      delBtn.textContent = 'Delete';
+      delBtn.title = 'Remove this node from Redis and the list';
+      delBtn.addEventListener('click', async () => {
+        if (!confirm(`Delete node "${hostname}"?\nThis removes its MAC mapping and metrics from Redis.`)) return;
+        try {
+          const r = await fetch(`/nodes/delete/${encodeURIComponent(hostname)}`, { method: 'DELETE' });
+          const j = await r.json().catch(()=>({}));
+          if (r.ok) {
+            toast(`Removed ${hostname}`);
+            const row = document.querySelector(`tr[data-host="${hostname}"]`);
+            if (row) row.remove();
+            if (!document.querySelector('#nodes-body tr')) {
+              empty.classList.remove('hidden');
             }
-          } catch {
-            toast(`Failed to remove ${hostname}`, false);
+          } else {
+            toast(j.error || `Failed to remove ${hostname}`, false);
           }
-        });
-        td.appendChild(delBtn);
-      }
-
-    async function loadNodes() {
-      try {
-        const res = await fetch('/nodes_data');
-        if (!res.ok) { toast('Failed to load nodes', false); return; }
-        const data = await res.json();
-        const items = data.nodes || [];
-        empty.classList.toggle('hidden', items.length > 0);
-
-        // Build a set of hosts we saw this refresh
-        const seen = new Set();
-
-        // Update or insert rows
-        for (const n of items) {
-          const host = n.hostname || '';
-          if (!host) continue;
-          seen.add(host);
-
-          const tr = ensureRow(host);
-          tr.querySelector('.cell-host').textContent = host;
-          tr.querySelector('.cell-ip').textContent   = n.ip || '';
-          tr.querySelector('.cell-mac').textContent  = n.mac || '';
-          tr.querySelector('.cell-last').textContent = tsToStr(n.last_seen_ts);
-
-          const badge = tr.querySelector('.cell-status .badge');
-          setBadge(badge, !!n.active);
-
-          const actions = tr.querySelector('.cell-actions');
-          setActions(actions, host, !!n.active);
+        } catch {
+          toast(`Failed to remove ${hostname}`, false);
         }
-
-        // Remove rows for hosts not present anymore
-        body.querySelectorAll('tr[data-host]').forEach(tr => {
-          const h = tr.dataset.host;
-          if (!seen.has(h)) tr.remove();
-        });
-
-      } catch {
-        toast('Failed to load nodes', false);
-      }
+      });
+      td.appendChild(delBtn);
     }
 
-    document.getElementById('refresh').addEventListener('click', loadNodes);
-    document.getElementById('wake-all').addEventListener('click', async () => {
-      try {
-        const r = await fetch('/nodes/wake_all', { method: 'POST' });
-        const j = await r.json().catch(()=>({}));
-        if (r.ok) toast(`Sent WOL to ${j.sent ?? 0} nodes`);
-        else toast(j.error || 'Wake All failed', false);
-      } catch { toast('Wake All failed', false); }
-    });
+  async function loadNodes() {
+    try {
+      const res = await fetch('/nodes_data');
+      if (!res.ok) { toast('Failed to load nodes', false); return; }
+      const data = await res.json();
+      const items = data.nodes || [];
+      empty.classList.toggle('hidden', items.length > 0);
 
-    loadNodes();
-    setInterval(loadNodes, 5000);
-  </script>
-</body>
-</html>
+      const seen = new Set();
+
+      for (const n of items) {
+        const host = n.hostname || '';
+        if (!host) continue;
+        seen.add(host);
+
+        const tr = ensureRow(host);
+        tr.querySelector('.cell-host').textContent = host;
+        tr.querySelector('.cell-ip').textContent   = n.ip || '';
+        tr.querySelector('.cell-mac').textContent  = n.mac || '';
+        tr.querySelector('.cell-last').textContent = tsToStr(n.last_seen_ts);
+
+        const badge = tr.querySelector('.cell-status .badge');
+        setBadge(badge, !!n.active);
+
+        const actions = tr.querySelector('.cell-actions');
+        setActions(actions, host, !!n.active);
+      }
+
+      body.querySelectorAll('tr[data-host]').forEach(tr => {
+        const h = tr.dataset.host;
+        if (!seen.has(h)) tr.remove();
+      });
+
+    } catch {
+      toast('Failed to load nodes', false);
+    }
+  }
+
+  document.getElementById('refresh').addEventListener('click', loadNodes);
+  document.getElementById('wake-all').addEventListener('click', async () => {
+    try {
+      const r = await fetch('/nodes/wake_all', { method: 'POST' });
+      const j = await r.json().catch(()=>({}));
+      if (r.ok) toast(`Sent WOL to ${j.sent ?? 0} nodes`);
+      else toast(j.error || 'Wake All failed', false);
+    } catch { toast('Wake All failed', false); }
+  });
+
+  loadNodes();
+  setInterval(loadNodes, 5000);
+</script>
+{% endblock %}
