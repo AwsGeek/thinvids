@@ -1,0 +1,299 @@
+- name: Thinvids manager
+  hosts: thinman_managers
+  become: yes
+
+  vars:
+    # Path on your control machine to repo root
+    code_src: "/home/jerry/thinvids"
+
+    # Runtime user/paths (match workers layout)
+    thinman_user: jerry
+    thinman_group: jerry
+    app_root: /opt/jerry
+    projects_dir: /projects
+    watch_dir: /watch
+    library_dir: /library
+
+    # Redis (manager uses same Redis as workers)
+    redis_host: swarm3
+    redis_port: 6379
+    redis_db_tasks: 0
+    redis_db_data: 1
+    master_http_port: 8000
+
+    # Manager HTTP port
+    manager_http_port: 5005
+
+    # OS packages (mirrors worker set; manager doesn't *need* ffmpeg/vaapi, harmless to keep consistent)
+    base_packages:
+      - python3
+      - python3-venv
+      - python3-pip
+      - python3-psutil
+      - python3-redis
+      - rsync
+      - nfs-common
+
+    # Python packages (in venv)
+    pip_packages: [flask, huey, redis, psutil, humanize, gunicorn, requests, watchdog]
+
+    # NFS settings (mirror compose)
+    nfs_server: 192.168.0.5
+    nfs_fstype: nfs
+    nfs_opts: "nolock,soft,_netdev"
+    nfs_watch_export:   /volume1/shared/projects/media/archive
+    nfs_library_export: /volume1/shared/projects/media/library
+
+    # Optional centralized journald upload
+    enable_journal_upload: false
+    journal_aggregator_url: "http://swarm1:19532"
+
+  tasks:
+    # --- Packages & user (match workers) ---
+    - name: Ensure packages
+      ansible.builtin.package:
+        name: "{{ base_packages }}"
+        state: present
+
+    - name: Ensure thinman group
+      ansible.builtin.group:
+        name: "{{ thinman_group }}"
+        state: present
+
+    # Keep parity with workers (render group exists there)
+    - name: Ensure render group
+      ansible.builtin.group:
+        name: render
+        state: present
+
+    - name: Ensure thinman user (in video+render groups)
+      ansible.builtin.user:
+        name: "{{ thinman_user }}"
+        groups: "{{ thinman_group }},video,render"
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+
+    # --- Directories (mountpoints + app dir) ---
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}/current"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0755"
+
+    - name: Ensure NFS mountpoints exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ watch_dir }}"
+        - "{{ library_dir }}"
+
+    # --- NFS mounts (idempotent) ---
+    - name: Mount /watch (NFS)
+      ansible.builtin.mount:
+        path: "{{ watch_dir }}"
+        src: "{{ nfs_server }}:{{ nfs_watch_export }}"
+        fstype: "{{ nfs_fstype }}"
+        opts: "{{ nfs_opts }}"
+        state: mounted
+
+    - name: Mount /library (NFS)
+      ansible.builtin.mount:
+        path: "{{ library_dir }}"
+        src: "{{ nfs_server }}:{{ nfs_library_export }}"
+        fstype: "{{ nfs_fstype }}"
+        opts: "{{ nfs_opts }}"
+        state: mounted
+
+    # --- venv for manager ---
+    - name: Create venv
+      ansible.builtin.command: "python3 -m venv {{ app_root }}/venv"
+      args: { creates: "{{ app_root }}/venv/bin/python" }
+
+    - name: Upgrade pip
+      ansible.builtin.command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
+      changed_when: false
+
+    - name: Install Python deps in venv
+      ansible.builtin.pip:
+        name: "{{ pip_packages }}"
+        virtualenv: "{{ app_root }}/venv"
+
+    # --- Deploy only what workers need: worker/ + agent.py ---
+    - name: Sync manager code
+      ansible.posix.synchronize:
+        src: "{{ code_src }}/flaskapp/app/"
+        dest: "{{ app_root }}/current/"
+        delete: yes
+        rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
+      notify: restart thinvids_manager
+      tags: build_app # Add a tag here
+
+    - name: Install tasks.py from worker tree
+      ansible.builtin.copy:
+        src: "{{ code_src }}/worker/app/tasks.py"
+        dest: "{{ app_root }}/current/tasks.py"
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0644"
+      notify: restart thinvids_manager
+      tags: build_app # Add a tag here
+
+    - name: Purge old bytecode (avoid stale imports)
+      ansible.builtin.command: "find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +"
+      changed_when: false
+      tags: build_app # Add a tag here
+
+    # --- Make "redis" resolvable (app.py uses host='redis') ---
+    - name: Resolve redis_host IP
+      ansible.builtin.command: "getent hosts {{ redis_host }}"
+      register: redis_getent
+      changed_when: false
+      failed_when: redis_getent.rc != 0
+
+    - name: Set redis_ip fact
+      ansible.builtin.set_fact:
+        redis_ip: "{{ (redis_getent.stdout.split() | first) | default('') }}"
+
+    - name: Add /etc/hosts alias for 'redis'
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        create: yes
+        line: "{{ redis_ip }} redis"
+        state: present
+        insertafter: EOF
+      when: redis_ip != ""
+
+    # --- Service (requires NFS mounts before starting) ---
+    - name: thinvids_manager.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thinvids_manager.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Thinvids Manager (Flask via Gunicorn)
+          After=network-online.target remote-fs.target
+          Wants=network-online.target remote-fs.target
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }}
+
+          [Service]
+          Type=simple
+          User={{ thinman_user }}
+          Group={{ thinman_group }}
+          WorkingDirectory={{ app_root }}/current
+          Environment=PYTHONPATH={{ app_root }}/current
+          Environment=REDIS_HOST={{ redis_host }}
+          Environment=REDIS_PORT={{ redis_port }}
+          Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
+          Environment=REDIS_DB_DATA={{ redis_db_data }}
+          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=MASTER_HTTP_PORT={{ master_http_port }}
+          ExecStart={{ app_root }}/venv/bin/gunicorn -w 2 -t 120 -b 0.0.0.0:{{ manager_http_port }} app:app
+          Restart=always
+          RestartSec=2
+          SyslogIdentifier=thinvids_manager
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - systemd daemon-reload
+        - restart thinvids_manager
+
+    - name: Reload systemd (ensure unit visible before first start)
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable & start thinvids_manager
+      ansible.builtin.systemd:
+        name: thinvids_manager
+        enabled: true
+        state: started
+
+    # --- Centralized journald upload (optional, same as workers) ---
+    - name: Install systemd-journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.package:
+        name: systemd-journal-upload
+        state: present
+
+    - name: Configure journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.copy:
+        dest: /etc/systemd/journal-upload.conf
+        mode: "0644"
+        content: |
+          [Upload]
+          URL={{ journal_aggregator_url }}
+          ServerKeyFile=
+          ServerCertificateFile=
+          TrustedCertificateFile=
+
+    - name: Enable & start journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.systemd:
+        name: systemd-journal-upload
+        enabled: true
+        state: started
+
+    # --- Watcher systemd unit ---
+    - name: thinvids_watcher.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thinvids_watcher.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Thinvids Watcher (submit new files to manager)
+          After=network-online.target remote-fs.target thinvids_manager.service
+          Wants=network-online.target remote-fs.target thinvids_manager.service
+          RequiresMountsFor={{ watch_dir }}
+
+          [Service]
+          Type=simple
+          User={{ thinman_user }}
+          Group={{ thinman_group }}
+          WorkingDirectory={{ app_root }}/current
+          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=MANAGER_HTTP_PORT={{ manager_http_port }}
+          # Optional tunables:
+          # Environment=STABILIZE_CHECKS=5
+          # Environment=STABILIZE_DELAY=10
+          ExecStart={{ app_root }}/venv/bin/python watcher.py
+          Restart=always
+          RestartSec=3
+          SyslogIdentifier=thinvids_watcher
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - systemd daemon-reload
+        - restart thinvids_watcher
+
+    - name: Reload systemd (ensure units visible)
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable & start thinvids_watcher
+      ansible.builtin.systemd:
+        name: thinvids_watcher
+        enabled: true
+        state: started
+
+  handlers:
+    - name: systemd daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: restart thinvids_manager
+      ansible.builtin.systemd:
+        name: thinvids_manager
+        state: restarted
+
+    - name: restart thinvids_watcher
+      ansible.builtin.systemd:
+        name: thinvids_watcher
+        state: restarted

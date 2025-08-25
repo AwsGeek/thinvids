@@ -1,0 +1,334 @@
+- name: Thinman workers
+  hosts: thinman_workers
+  become: yes
+
+  vars:
+    # Path on your control machine to repo root
+    code_src: "/home/jerry/thinvids"
+
+    # Runtime user/paths on workers
+    thinman_user: jerry
+    thinman_group: jerry
+    app_root: /opt/jerry
+    projects_dir: /projects
+    watch_dir: /watch
+    library_dir: /library
+
+    # Redis / pipeline
+    redis_host: swarm3
+    redis_port: 6379
+    redis_db_tasks: 0
+    redis_db_data: 1
+    ttl_sec: 15
+    master_http_port: 8000
+    vaapi_device: /dev/dri/renderD128
+    huey_workers: 1
+
+    # OS packages
+    base_packages:
+      - python3
+      - python3-venv
+      - python3-pip
+      - python3-psutil
+      - python3-redis
+      - rsync
+      - ffmpeg
+      - vainfo
+      - intel-media-va-driver
+      - intel-gpu-tools
+      - nfs-common
+      - ethtool
+
+    # Python packages (in venv)
+    pip_packages: [huey, redis, requests]
+
+    # NFS settings (mirror your compose config)
+    nfs_server: 192.168.0.5
+    nfs_fstype: nfs
+    nfs_opts: "nolock,soft,_netdev"
+    nfs_watch_export:   /volume1/shared/projects/media/archive
+    nfs_library_export: /volume1/shared/projects/media/library
+
+    # Optional centralized journald upload
+    enable_journal_upload: false
+    journal_aggregator_url: "http://swarm1:19532"
+
+  tasks:
+    # --- Packages & user ---
+    - name: Ensure packages
+      ansible.builtin.package:
+        name: "{{ base_packages }}"
+        state: present
+
+    - name: Ensure thinman group
+      ansible.builtin.group:
+        name: "{{ thinman_group }}"
+        state: present
+
+    # ensure groups exist
+    - name: Ensure render group
+      ansible.builtin.group:
+        name: render
+        state: present
+
+    - name: Ensure thinman user (in video+render groups)
+      ansible.builtin.user:
+        name: "{{ thinman_user }}"
+        groups: "{{ thinman_group }},video,render"
+        append: yes
+        shell: /bin/bash
+        create_home: yes
+
+    # --- Directories (mountpoints + app dir) ---
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}/current"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0755"
+
+    - name: Ensure NFS mountpoints exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ watch_dir }}"
+        - "{{ library_dir }}"
+
+    # --- NFS mounts (idempotent, adds to fstab & mounts now) ---
+    - name: Mount /watch (NFS)
+      ansible.builtin.mount:
+        path: "{{ watch_dir }}"
+        src: "{{ nfs_server }}:{{ nfs_watch_export }}"
+        fstype: "{{ nfs_fstype }}"
+        opts: "{{ nfs_opts }}"
+        state: mounted
+
+    - name: Mount /library (NFS)
+      ansible.builtin.mount:
+        path: "{{ library_dir }}"
+        src: "{{ nfs_server }}:{{ nfs_library_export }}"
+        fstype: "{{ nfs_fstype }}"
+        opts: "{{ nfs_opts }}"
+        state: mounted
+
+    # --- venv for worker ---
+    - name: Create venv
+      ansible.builtin.command: "python3 -m venv {{ app_root }}/venv"
+      args: { creates: "{{ app_root }}/venv/bin/python" }
+
+    - name: Upgrade pip
+      ansible.builtin.command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
+      changed_when: false
+
+    - name: Install Python deps in venv
+      ansible.builtin.pip:
+        name: "{{ pip_packages }}"
+        virtualenv: "{{ app_root }}/venv"
+
+    # --- Deploy only what workers need: worker/ + agent.py ---
+    - name: Sync worker code
+      ansible.posix.synchronize:
+        src: "{{ code_src }}/worker/"
+        dest: "{{ app_root }}/current/worker/"
+        delete: yes
+        rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
+      notify: restart thinman-worker
+      tags: build_app # Add a tag here
+
+    - name: Purge old bytecode (avoid stale imports)
+      ansible.builtin.command: "find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +"
+      changed_when: false
+      tags: build_app # Add a tag here
+
+    - name: Install agent.py
+      ansible.builtin.copy:
+        src: "{{ code_src }}/agent.py"
+        dest: /usr/local/bin/agent.py
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart thinman-agent
+      tags: build_app # Add a tag here
+
+    # --- Services (Require NFS mounts before starting) ---
+    - name: thinman-agent.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thinman-agent.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Thinman Metrics Agent
+          After=network-online.target remote-fs.target
+          Wants=network-online.target remote-fs.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /usr/local/bin/agent.py
+          Restart=always
+          RestartSec=2
+          User=root
+          SyslogIdentifier=thinman-agent
+          Environment=REDIS_HOST={{ redis_host }}
+          Environment=REDIS_PORT={{ redis_port }}
+          Environment=REDIS_DB={{ redis_db_data }}
+          Environment=TTL_SEC={{ ttl_sec }}
+          Environment=NODE_NAME=%H
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - systemd daemon-reload
+        - restart thinman-agent
+
+    - name: thinman-worker.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thinman-worker.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Thinman Worker (Huey)
+          After=network-online.target remote-fs.target
+          Wants=network-online.target remote-fs.target
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }}
+
+          [Service]
+          Type=simple
+          User={{ thinman_user }}
+          Group={{ thinman_group }}
+          SupplementaryGroups=video render
+          WorkingDirectory={{ app_root }}/current/worker/app
+          Environment=PYTHONPATH={{ app_root }}/current:{{ app_root }}/current/worker/app
+          Environment=REDIS_HOST={{ redis_host }}
+          Environment=REDIS_PORT={{ redis_port }}
+          Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
+          Environment=REDIS_DB_DATA={{ redis_db_data }}
+          Environment=PROJECT_ROOT={{ app_root }}/current
+          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=MASTER_HTTP_PORT={{ master_http_port }}
+          Environment=VAAPI_DEVICE={{ vaapi_device }}
+          ExecStart={{ app_root }}/venv/bin/huey_consumer tasks.huey -k thread -w {{ huey_workers }} --flush-locks
+          Restart=always
+          RestartSec=2
+          SyslogIdentifier=thinman-worker
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - systemd daemon-reload
+        - restart thinman-worker
+
+    - name: Reload systemd (ensure units visible before first start)
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable & start agent
+      ansible.builtin.systemd:
+        name: thinman-agent
+        enabled: true
+        state: started
+
+    - name: Enable & start worker
+      ansible.builtin.systemd:
+        name: thinman-worker
+        enabled: true
+        state: started
+
+    # --- Centralized journald upload (optional) ---
+    - name: Install systemd-journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.package:
+        name: systemd-journal-upload
+        state: present
+
+    - name: Configure journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.copy:
+        dest: /etc/systemd/journal-upload.conf
+        mode: "0644"
+        content: |
+          [Upload]
+          URL={{ journal_aggregator_url }}
+          ServerKeyFile=
+          ServerCertificateFile=
+          TrustedCertificateFile=
+
+    - name: Enable & start journal-upload
+      when: enable_journal_upload | bool
+      ansible.builtin.systemd:
+        name: systemd-journal-upload
+        enabled: true
+        state: started
+
+    - name: Install /etc/network/interfaces
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          source /etc/network/interfaces.d/*
+
+          # The loopback network interface
+          auto lo
+          iface lo inet loopback
+
+          # The primary network interface
+          allow-hotplug enp1s0
+          iface enp1s0 inet dhcp
+          ethernet-wol g
+      notify: restart networking
+
+    # Remove any legacy copy in /etc to avoid double execution
+    - name: Remove legacy resume hook from /etc
+      ansible.builtin.file:
+        path: /etc/systemd/system-sleep/thinman-resume
+        state: absent
+
+    # Install the hook in /lib (primary location many distros scan)
+    - name: Install thinman resume hook (primary in /lib)
+      ansible.builtin.copy:
+        dest: /lib/systemd/system-sleep/thinman-resume
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/sh
+          # Called as: {pre|post} {suspend|hibernate|hybrid-sleep|suspend-then-hibernate}
+          LOGGER=/usr/bin/logger
+          SYSTEMCTL=/usr/bin/systemctl
+          SLEEP=/bin/sleep
+          TAG="thinman-resume"
+          case "$1" in
+            post)
+              "$LOGGER" -t "$TAG" "Resume detected (mode=$2): reloading systemd and restarting thinman services"
+              "$SLEEP" 3
+              "$SYSTEMCTL" daemon-reload
+              "$SYSTEMCTL" restart thinman-agent.service  || true
+              "$SYSTEMCTL" restart thinman-worker.service || true
+              "$LOGGER" -t "$TAG" "Resume recovery complete"
+              ;;
+          esac
+
+  handlers:
+    - name: systemd daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: restart thinman-agent
+      ansible.builtin.systemd:
+        name: thinman-agent
+        state: restarted
+
+    - name: restart thinman-worker
+      ansible.builtin.systemd:
+        name: thinman-worker
+        state: restarted
+
+    - name: restart networking
+      ansible.builtin.service:
+        name: networking
+        state: restarted

@@ -20,7 +20,7 @@ class VideoFileHandler(PatternMatchingEventHandler):
         if self.wait_until_stable(path):
             logger.info(f"[INFO] File is stable: {filename}, submitting job.")
             try:
-                response = requests.post("http://flaskapp:5000/add_task", json={"filename": path.replace("/watch/", "")})
+                response = requests.post("http://flaskapp:5000/add_job", json={"filename": path.replace("/watch/", "")})
                 logger.info(f"Job submitted: {response.status_code}")
             except Exception as e:
                 logger.error(f"Failed to submit job: {e}")

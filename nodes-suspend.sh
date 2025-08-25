@@ -14,8 +14,7 @@ fi
 
 for h in "${HOSTS[@]}"; do
   [[ $h =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Skipping invalid hostname: $h" >&2; continue; }
-  echo "$h: rm -rf /opt/jerry/current"
-  ssh jerry@${h} "find /opt/jerry/current -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$' -exec rm -rf {} +"
-  ssh jerry@${h} "df"
+  echo "$h"
+  ssh jerry@${h} "sudo systemctl suspend"
 done
 

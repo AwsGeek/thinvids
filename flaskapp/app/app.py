@@ -10,6 +10,7 @@ import shutil
 from math import ceil
 import socket
 import re
+import struct
 
 import redis
 from redis.retry import Retry
@@ -22,7 +23,6 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 
 # NOTE: container/service hostnames; adjust if needed
-#huey = RedisHuey('tasks', host='redis', port=6379, db=0)
 huey = RedisHuey(
     'tasks',
     host='redis',
@@ -38,7 +38,7 @@ huey = RedisHuey(
     retry_on_timeout=True,           # retry timeouts
     retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),  # 1s,2s,4s... capped
 )
-# redis_client = redis.Redis(host='redis', port=6379, db=1, decode_responses=True)
+
 redis_client = redis.Redis(
     host='redis',
     port=6379,
@@ -52,195 +52,207 @@ redis_client = redis.Redis(
     retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
 )
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 STATUS_READY = 'READY'
+STATUS_STARTING = 'STARTING'
 STATUS_RUNNING = 'RUNNING'
 STATUS_STOPPED = 'STOPPED'
 STATUS_FAILED = 'FAILED'
 STATUS_DONE    = 'DONE'
 
-# ------------------------ Wake-on-LAN helpers ------------------------
+# ------------------------ Node discovery (no WOL publish) ------------------------
 
-# TTL used to decide if a node is "active" (matches agent expiry window)
-WOL_TTL_SEC = int(os.getenv("TTL_SEC", "15"))
-WOL_TTL_GRACE_SEC = int(os.getenv("TTL_GRACE_SEC", "5"))
-WOL_DEFAULT_BCAST = os.getenv("WOL_BROADCAST", "255.255.255.255")
-WOL_WAKE_ALL = os.getenv("WOL_WAKE_ALL", "0") in ("1", "true", "True")
-WOL_USE_PROXY = os.getenv("WOL_USE_PROXY", "0") in ("1","true","True")
-WOL_CHANNEL   = os.getenv("WOL_CHANNEL", "wol:wake")
+# Nodes are considered "active" if their last signal (metrics/heartbeat) is within this window
+ACTIVE_WINDOW_SEC = int(os.getenv("ACTIVE_WINDOW_SEC", "5"))
 
-# NEW: waiting behavior when waking nodes
-WOL_WAIT_TIMEOUT_SEC = int(os.getenv("WOL_WAIT_TIMEOUT_SEC", "90"))   # total time to wait
-WOL_WAIT_POLL_SEC    = float(os.getenv("WOL_WAIT_POLL_SEC", "1.0"))   # poll interval
-WOL_WAIT_MIN_PERCENT = float(os.getenv("WOL_WAIT_MIN_PERCENT", "0.5"))# 1.0 = 100% nodes must be online
-
-def _active_nodes():
-    """Return a set of hostnames with fresh metrics heartbeat."""
-    now_cutoff = int(time.time()) - (WOL_TTL_SEC + WOL_TTL_GRACE_SEC)
-    active = set()
-    for key in redis_client.scan_iter("metrics:node:*"):
-        try:
-            d = redis_client.hgetall(key) or {}
-            ts = int(float(d.get("ts", 0)))
-            host = d.get("hostname") or key.split(":")[-1]
-            if ts >= now_cutoff:
-                active.add(host)
-        except Exception:
-            continue
-    return active
-
-def _normalize_mac(mac: str) -> str:
-    """Return MAC as 12 hex chars or raise ValueError."""
-    s = re.sub(r'[^0-9A-Fa-f]', '', mac or '')
-    if len(s) != 12:
-        raise ValueError(f"Invalid MAC: {mac!r}")
-    return s.lower()
-
-def _send_magic(mac: str, bcast: str, port: int = 9, repeats: int = 3):
-    """Send magic packet; if WOL_USE_PROXY=1 publish to host-side wol-proxy."""
-    try:
-        payload = {"mac": mac, "bcast": bcast, "port": int(port), "repeats": int(repeats)}
-        redis_client.publish(WOL_CHANNEL, json.dumps(payload))
-        logger.info(f"WOL(proxy): queued {mac} via {bcast}")
-        return
-    except Exception as e:
-        logger.warning(f"WOL(proxy) publish failed; falling back to UDP: {e}")
-
-    # direct UDP (works if app is on host network; otherwise proxy recommended)
-    # mac_hex = _normalize_mac(mac)
-    # packet = b'\xff' * 6 + bytes.fromhex(mac_hex) * 16
-    # with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-    #     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    #     for _ in range(max(1, repeats)):
-    #         s.sendto(packet, (bcast, port))
-
-def _load_wol_nodes():
+def get_all_nodes():
     """
-    Load WOL targets from persistent Redis hash published by agent.py.
-
-    Reads:  HGETALL nodes:mac  -> {hostname: "aa:bb:cc:dd:ee:ff", ...}
-
-    Returns:
-        {hostname: {"mac": "<mac>", "bcast": None}}
+    Return ALL known nodes from the persistent mapping published by agents.
+    Format: [{'hostname': 'thinman01', 'mac': 'aa:bb:cc:dd:ee:ff'}, ...]
+    Source: HGETALL nodes:mac
     """
-    nodes = {}
+    out = []
     try:
         mapping = redis_client.hgetall("nodes:mac") or {}
         for host, mac in mapping.items():
             host = (host or "").strip()
             mac  = (mac or "").strip()
             if host and mac:
-                nodes[host] = {"mac": mac, "bcast": None}
+                out.append({"hostname": host, "mac": mac})
     except Exception as e:
-        logger.warning(f"WOL: failed to read nodes:mac: {e}")
-    return nodes
+        logger.warning(f"get_all_nodes: failed to read nodes:mac: {e}")
+    return out
 
-def _await_nodes(expected: set[str],
-                 timeout_sec: int = WOL_WAIT_TIMEOUT_SEC,
-                 poll_sec: float = WOL_WAIT_POLL_SEC,
-                 min_percent: float = WOL_WAIT_MIN_PERCENT) -> tuple[int, set[str]]:
+def _active_from_metrics(cutoff_ts: int) -> set[str]:
     """
-    Wait until at least min_percent of expected nodes are active, or until timeout.
-    Returns (active_count, active_set) at exit.
+    Hosts active due to recent metrics:node:<host> 'ts' field.
     """
-    expected = set(h for h in expected if h)  # sanitize
-    if not expected:
-        return (0, set())
+    active = set()
+    try:
+        for key in redis_client.scan_iter("metrics:node:*"):
+            try:
+                data = redis_client.hgetall(key) or {}
+                ts = int(float(data.get("ts", 0)))
+                host = data.get("hostname") or key.split(":")[-1]
+                if host and ts >= cutoff_ts:
+                    active.add(host)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"_active_from_metrics: error scanning metrics: {e}")
+    return active
 
-    deadline = time.time() + max(1, timeout_sec)
-    best_seen: set[str] = set()
-
-    need = max(1, int(len(expected) * min(1.0, max(0.0, min_percent))))
-
-    while True:
-        active = _active_nodes()
-        have = len(expected & active)
-        if have >= need:
-            return (have, active)
-        if time.time() >= deadline:
-            # keep the best snapshot for logs/return
-            if len(expected & active) > len(expected & best_seen):
-                best_seen = active
-            logger.warning(
-                f"WOL wait timeout: {have}/{len(expected)} nodes active "
-                f"(need {need}). Missing: {sorted(expected - active)}"
-            )
-            return (len(expected & best_seen), best_seen)
-        best_seen = active if len(expected & active) > len(expected & best_seen) else best_seen
-        time.sleep(max(0.1, poll_sec))
-
-def wake_all_nodes(wait: bool = False,
-                   timeout_sec: int = WOL_WAIT_TIMEOUT_SEC,
-                   min_percent: float = WOL_WAIT_MIN_PERCENT):
+def _parse_possible_ts(val) -> int:
     """
-    Wake ALL nodes discovered in nodes:mac (persistent), regardless of recent activity.
-    If wait=True, block until at least `min_percent` of nodes are active (or timeout).
-    Returns number of WOL packets sent (unique hosts).
+    Try to coerce a heartbeat value into an integer epoch seconds.
+    Accepts bare string/number, or dict-like with ts/last fields.
+    Returns 0 if unknown.
     """
-    targets = _load_wol_nodes()
-    if not targets:
-        logger.warning("WOL: no nodes found in Redis hash 'nodes:mac'.")
-        return 0
+    try:
+        if isinstance(val, (int, float)):
+            return int(val)
+        if isinstance(val, str):
+            return int(float(val.strip()))
+        if isinstance(val, dict):
+            for k in ("ts", "last", "last_ts", "last_seen"):
+                if k in val:
+                    return int(float(val[k]))
+    except Exception:
+        pass
+    return 0
 
-    sent = 0
-    for host, cfg in targets.items():
-        mac = cfg.get("mac")
-        bcast = cfg.get("bcast") or WOL_DEFAULT_BCAST
-        if not mac:
-            continue
+def _active_from_heartbeats(cutoff_ts: int) -> set[str]:
+    """
+    Hosts active due to generic heartbeat keys.
+    We check a couple of common patterns and accept either a raw value
+    or a hash with ts/last timestamp fields.
+    Patterns:
+      - heartbeat:<hostname>
+      - node:heartbeat:<hostname>
+    """
+    active = set()
+    patterns = ("heartbeat:*", "node:heartbeat:*")
+    for pat in patterns:
         try:
-            _send_magic(mac, bcast)
-            sent += 1
-            logger.info(f"WOL: sent to {host} ({mac}) via {bcast}")
+            for key in redis_client.scan_iter(pat):
+                try:
+                    parts = key.split(":")
+                    if len(parts) < 2:
+                        continue
+                    host = parts[-1]
+                    if not host:
+                        continue
+                    t = 0
+                    # Try as string value first
+                    v = redis_client.get(key)
+                    if v is not None:
+                        t = _parse_possible_ts(v)
+                    else:
+                        # Maybe it's a hash
+                        h = redis_client.hgetall(key) or {}
+                        if h:
+                            t = _parse_possible_ts(h)
+                    if t >= cutoff_ts:
+                        active.add(host)
+                except Exception:
+                    continue
         except Exception as e:
-            logger.warning(f"WOL: failed for {host} ({mac}): {e}")
+            logger.debug(f"_active_from_heartbeats: scan {pat} failed: {e}")
+    return active
 
-    logger.info(f"WOL: packets sent for {sent} host(s)")
+def get_active_nodes():
+    """
+    Return ONLY nodes that are active based on recent metrics OR heartbeats
+    within ACTIVE_WINDOW_SEC.
+    Format: [{'hostname': 'thinman01', 'mac': 'aa:bb:cc:dd:ee:ff'}, ...]
+    """
+    mac_map = {n["hostname"]: n["mac"] for n in get_all_nodes()}
+    cutoff = int(time.time()) - ACTIVE_WINDOW_SEC
 
-    if wait:
-        expected_hosts = set(targets.keys())
-        have, active = _await_nodes(expected_hosts, timeout_sec=timeout_sec, min_percent=min_percent)
-        logger.info(f"WOL: wait complete: {have}/{len(expected_hosts)} active "
-                    f"(min {int(len(expected_hosts)*min_percent)}).")
-    return sent
+    # Active if: recent metrics OR recent generic heartbeat
+    active_hosts = set()
+    active_hosts |= _active_from_metrics(cutoff)
+    active_hosts |= _active_from_heartbeats(cutoff)
 
+    # Return only nodes we know MACs for
+    result = [{"hostname": h, "mac": mac_map[h]} for h in active_hosts if h in mac_map]
+    return result
 
-# NEW: wake a single node by hostname
-@app.post('/nodes/wake/<hostname>')
-def nodes_wake_one(hostname):
-    nodes = _load_wol_nodes()
-    cfg = nodes.get(hostname)
-    if not cfg:
-        return jsonify({'error': f'Unknown node {hostname} or missing MAC in nodes:mac'}), 404
-    mac = cfg.get('mac')
-    bcast = cfg.get('bcast') or WOL_DEFAULT_BCAST
+# ---------- Warm-up & launch helpers (wait for heartbeats instead of blind sleep) ----------
+
+# Tunables (can be overridden via env)
+CLUSTER_WARMUP_SEC  = int(os.getenv("CLUSTER_WARMUP_SEC", "60"))  # max wait for nodes to appear
+MIN_WARMUP_WORKERS  = int(os.getenv("MIN_WARMUP_WORKERS", "20"))   # desired active workers before start
+PARTS_PER_WORKER    = int(os.getenv("PARTS_PER_WORKER", "1"))     # hint only
+MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
+MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
+
+def _natural_key(host: str):
+    m = re.search(r'(\d+)', host or '')
+    return (int(m.group(1)) if m else 0, host or '')
+
+def _current_active_hostnames() -> list[str]:
+    nodes = get_active_nodes()
+    hosts = sorted([n["hostname"] for n in nodes], key=_natural_key)
+    return hosts
+
+def _wait_for_workers(min_count: int, timeout_sec: int) -> list[str]:
+    deadline = time.time() + max(0, int(timeout_sec))
+    best: list[str] = []
+    while time.time() < deadline:
+        cur = _current_active_hostnames()
+        if len(cur) >= min_count:
+            return cur
+        if len(cur) > len(best):
+            best = cur
+        time.sleep(1)
+    return best
+
+def _launch_after_warmup(job_key: str, job_id: str, filename: str):
+    """
+    Wake the cluster, wait for heartbeats, store audit + parts_hint, then start transcode.
+    """
     try:
-        _send_magic(mac, bcast)
-        logger.info(f"WOL: sent to {hostname} ({mac}) via {bcast}")
-        return jsonify({'status': 'ok', 'host': hostname, 'mac': mac})
-    except Exception as e:
-        logger.warning(f"WOL: failed for {hostname} ({mac}): {e}")
-        return jsonify({'error': str(e)}), 500
+        # Fire WOL for all known nodes (reuse existing route function)
+        try:
+            nodes_wake_all()  # ignore JSON response
+        except Exception as e:
+            logger.warning("nodes_wake_all() raised: %s", e)
 
-@app.post('/nodes/wake_all')
-def nodes_wake_all():
-    try:
-        sent = wake_all_nodes(wait=False)   # UI should return quickly
-        # Optional: show how many are currently active right now (best-effort)
-        active_now = len(_active_nodes())
-        return jsonify({'status': 'ok', 'sent': sent, 'active_now': active_now})
-    except Exception as e:
-        logger.exception("Wake All failed")
-        return jsonify({'error': str(e)}), 500
+        wanted = max(1, MIN_WARMUP_WORKERS)
+        seen = _wait_for_workers(wanted, CLUSTER_WARMUP_SEC)
 
+        # Compute parts hint
+        parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
+
+        # Stash info for UI/debug + hint for tasks.transcode_video
+        redis_client.hset(job_key, mapping={
+            'warmup_workers_json': json.dumps(seen),
+            'warmup_worker_count': len(seen),
+            'warmup_wait_s': CLUSTER_WARMUP_SEC,
+            'parts_hint': parts_hint,
+        })
+
+        # Kick the pipeline
+        transcode_video(job_id, f'/watch/{filename}')
+    except Exception as e:
+        logger.exception("[%s] launch_after_warmup failed", job_id)
+        # Mark FAILED so UI surfaces the problem
+        try:
+            redis_client.hset(job_key, mapping={'status': STATUS_FAILED, 'error': str(e)})
+        except Exception:
+            pass
 
 # -------------------------- Views --------------------------
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.get('/metrics')
+def metrics_page():
+    return render_template('metrics.html')
 
 # --- Nodes page & data ---
 def _resolve_ip(hostname: str) -> str:
@@ -249,53 +261,47 @@ def _resolve_ip(hostname: str) -> str:
     except Exception:
         return ""
 
-def _natural_key(host: str):
-    m = re.search(r'(\d+)', host or '')
-    return (int(m.group(1)) if m else 0, host or '')
-
 @app.get('/nodes_data')
 def nodes_data():
     """
     Returns list of nodes with hostname, ip, mac, last_seen_ts, active.
-    MACs come from persistent 'nodes:mac'; last_seen from metrics:node:* (if present).
+    Uses only get_all_nodes() and get_active_nodes() for consistency.
     """
-    mapping = redis_client.hgetall('nodes:mac') or {}
-    cutoff = int(time.time()) - (WOL_TTL_SEC + WOL_TTL_GRACE_SEC)
-    items = []
-    for host, mac in mapping.items():
-        host = (host or '').strip()
-        mac  = (mac or '').strip()
-        if not host or not mac:
-            continue
-        ts = 0
+    all_nodes = get_all_nodes()
+    active_hosts = set(n["hostname"] for n in get_active_nodes())
+
+    def last_seen(host):
         try:
             md = redis_client.hgetall(f"metrics:node:{host}") or {}
-            ts = int(float(md.get('ts', 0) or 0))
+            return int(float(md.get('ts', 0) or 0))
         except Exception:
-            ts = 0
+            return 0
+
+    items = []
+    for n in all_nodes:
+        host = n["hostname"]
+        mac  = n["mac"]
         items.append({
             "hostname": host,
             "ip": _resolve_ip(host),
             "mac": mac,
-            "last_seen_ts": ts,
-            "active": bool(ts and ts >= cutoff),
+            "last_seen_ts": last_seen(host),
+            "active": host in active_hosts,
         })
     items.sort(key=lambda x: _natural_key(x["hostname"]))
     return jsonify({"nodes": items})
 
-# NEW: real nodes page
 @app.get('/nodes')
 def nodes_page():
     return render_template('nodes.html')
 
-# --- new route: metrics snapshot (all nodes) ---
+# --- metrics snapshot (kept; fields may be absent if agents don't send them) ---
 @app.get('/metrics_snapshot')
 def metrics_snapshot():
     nodes = []
     for key in redis_client.scan_iter("metrics:node:*"):
         try:
             data = redis_client.hgetall(key) or {}
-            # coerce numeric fields
             out = {
                 "key": key,
                 "hostname": data.get("hostname") or key.split(":")[-1],
@@ -311,7 +317,6 @@ def metrics_snapshot():
             nodes.append(out)
         except Exception:
             pass
-    # sort by hostname for stable bar order
     nodes.sort(key=lambda n: n["hostname"])
     return jsonify({"nodes": nodes})
 
@@ -358,7 +363,6 @@ def post_global_settings():
 # ------------------------ Jobs API -------------------------
 @app.get('/jobs')
 def list_jobs():
-    # --- gather all jobs ---
     jobs = []
     for key in redis_client.scan_iter("job:*"):
         try:
@@ -394,11 +398,9 @@ def list_jobs():
         except Exception:
             pass
 
-    # --- if no pagination params, return full list (back-compat) ---
     if 'page' not in request.args:
         return jsonify(jobs)
 
-    # --- pagination + sorting ---
     try:
         page = max(1, int(request.args.get('page', 1)))
     except Exception:
@@ -409,8 +411,8 @@ def list_jobs():
     except Exception:
         page_size = 10
 
-    sort_by = (request.args.get('sort_by') or 'date').lower()   # 'date'|'filename'|'status'|'encode'
-    sort_dir = (request.args.get('sort_dir') or 'desc').lower() # 'asc' or 'desc'
+    sort_by = (request.args.get('sort_by') or 'date').lower()
+    sort_dir = (request.args.get('sort_dir') or 'desc').lower()
 
     status_order = {'READY': 0, 'RUNNING': 1, 'STOPPED': 2, 'FAILED': 3, 'DONE': 4}
 
@@ -472,6 +474,8 @@ def add_job():
 
     full_path = os.path.join("/watch", filename.lstrip('/'))
     job_id = str(uuid.uuid4())
+    job_key = f"job:{job_id}"
+
     now = str(time.time())
     global_settings = redis_client.hgetall('settings:global') or {}
 
@@ -482,7 +486,7 @@ def add_job():
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
 
-    status = STATUS_RUNNING if auto_start_effective else STATUS_READY
+    status = STATUS_STARTING if auto_start_effective else STATUS_READY
     job_settings = {
         'job_id': job_id,
         'filename': filename,
@@ -503,28 +507,20 @@ def add_job():
         'source_file_size': 0,
         'total_frames': 0
     }
-    redis_client.hset(f"job:{job_id}", mapping=job_settings)
+    redis_client.hset(job_key, mapping=job_settings)
 
     # Kick off async probe on a worker
     probe_source(job_id, full_path)
 
-    # Optionally auto-start segmentation
     if auto_start_effective:
-        try:
-            wake_all_nodes(wait=True)
-        except Exception as e:
-            logger.warning(f"WOL during add_job failed: {e}")
-        transcode_video(job_id, f'/watch/{filename}')
+        # Confirm STARTING + warm-up launch
+        redis_client.hset(job_key, mapping={'status': STATUS_STARTING, 'started_at': now})
+        _launch_after_warmup(job_key, job_id, filename)
 
     return jsonify({'status': 'success', 'job_id': job_id}), 201
 
 @app.route('/copy_job', methods=['POST'])
 def copy_job():
-    """
-    Create a new PAUSED job by copying per-job settings (e.g., filename,
-    number_parts, segment_duration) from an existing job. Do NOT copy
-    stats/metadata (progress, timings, dirs, etc).
-    """
     data = request.get_json(silent=True) or {}
     source_job_id = data.get('job_id')
     if not source_job_id:
@@ -605,15 +601,10 @@ def start_job(job_id):
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
     now = str(time.time())
-    redis_client.hset(job_key, mapping={'status': STATUS_RUNNING, 'started_at': now})
+    redis_client.hset(job_key, mapping={'status': STATUS_STARTING, 'started_at': now})
 
-    try:
-        wake_all_nodes(wait=True)
-    except Exception as e:
-        logger.warning(f"WOL during start_job failed: {e}")
-
-    transcode_video(job_id, f'/watch/{filename}')
-
+    # Wake, wait for heartbeats, set hint, then launch
+    _launch_after_warmup(job_key, job_id, filename)
     return jsonify({'status': 'started'}), 200
 
 @app.post('/restart_job/<job_id>')
@@ -630,6 +621,7 @@ def restart_job(job_id):
     if not filename:
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
+    # ------ Reset job state and start fresh ------
     job_dir = job.get('job_dir', '')
 
     logger.info(f"[{job_id}] Deleting job dir {job_dir!r}")
@@ -654,7 +646,6 @@ def restart_job(job_id):
         job.get('number_parts', globals_map.get('number_parts')),
         2
     )
-
     serialize_existing = job.get('serialize_pipeline', (globals_map.get('serialize_pipeline', '0')))
 
     for key in redis_client.scan_iter(f"{job_key}*"):
@@ -667,7 +658,7 @@ def restart_job(job_id):
     new_job = {
         'job_id': job_id,
         'filename': filename,
-        'status': STATUS_RUNNING,
+        'status': STATUS_STARTING,
         'created_at': str(now),
         'started_at': str(now),
         'segment_duration': segment_duration,
@@ -681,12 +672,8 @@ def restart_job(job_id):
     }
     redis_client.hset(f"job:{job_id}", mapping=new_job)
 
-    try:
-        wake_all_nodes(wait=True)
-    except Exception as e:
-        logger.warning(f"WOL during restart_job failed: {e}")
-
-    transcode_video(job_id, f'/watch/{filename}')
+    # Wake, wait for heartbeats, set hint, then launch
+    _launch_after_warmup(f"job:{job_id}", job_id, filename)
     return jsonify({'status': 'started'}), 200
 
 @app.get('/dashboard')
@@ -727,7 +714,6 @@ def delete_job(job_id):
 
 @app.get('/preview/<job_id>')
 def preview_video(job_id):
-
     job_key = f"job:{job_id}"
     if not redis_client.exists(job_key):
         logger.warning(f"[{job_id}] Key not found '{job_key}'")
@@ -739,7 +725,6 @@ def preview_video(job_id):
         logger.warning(f"[{job_id}] 'Output not found '{output_path}'")
         return jsonify({'error': 'Output not found'}), 404
 
-    # Let the browser seek; Werkz eug/Flask will handle range requests for local files.
     return send_file(output_path, mimetype='video/mp4', conditional=True)
 
 # ------------------ Job info / utilities -------------------
@@ -750,7 +735,6 @@ def job_properties(job_id):
         return jsonify({'error': 'Job not found'}), 404
     job_data = {k: v for k, v in redis_client.hgetall(key).items()}
     return jsonify(job_data)
-
 
 # ---------------- Per-job settings (PAUSED only) ------------
 @app.route('/job_settings/<job_id>', methods=['GET', 'POST'])
@@ -780,7 +764,6 @@ def job_settings(job_id):
 
     # POST
     job = redis_client.hgetall(job_key)
-    # Allow changing when the job is not actively RUNNING
     if job.get('status') in ['RUNNING']:
         return jsonify({'error': 'Job is RUNNING; stop it or copy/restart to change settings.'}), 400
 
@@ -830,3 +813,112 @@ def legacy_stop_task(job_id):
 @app.delete('/delete_task/<job_id>')
 def legacy_delete_task(job_id):
     return delete_job(job_id)
+
+# -------------------- Node utilities (delete) --------------------
+@app.delete('/nodes/delete/<hostname>')
+def nodes_delete(hostname):
+    """
+    Remove a node's MAC mapping and associated metrics.
+    """
+    host = (hostname or '').strip()
+    if not host:
+        return jsonify({'error': 'Hostname required'}), 400
+    try:
+        removed = 0
+        if redis_client.hexists("nodes:mac", host):
+            redis_client.hdel("nodes:mac", host)
+            removed += 1
+        # Best-effort: remove metrics key too
+        redis_client.delete(f"metrics:node:{host}")
+        return jsonify({'status': 'ok', 'removed': removed})
+    except Exception as e:
+        logger.exception("nodes_delete failed")
+        return jsonify({'error': str(e)}), 500
+
+# -------------------- Node Wake-on-LAN (direct UDP from host) --------------------
+
+# Env tunables for WOL on the host:
+# - WOL_BROADCASTS: comma-separated list of broadcast IPs (default "255.255.255.255")
+# - WOL_PORT: UDP port (default 9)
+# - WOL_REPEATS: number of times to send packet to each broadcast (default 3)
+WOL_BROADCASTS = [x.strip() for x in os.getenv("WOL_BROADCASTS", "255.255.255.255").split(",") if x.strip()]
+WOL_PORT = int(os.getenv("WOL_PORT", "9"))
+WOL_REPEATS = max(1, int(os.getenv("WOL_REPEATS", "3")))
+
+def _mac_bytes(mac: str) -> bytes:
+    """
+    Normalize MAC string and return 6 raw bytes.
+    Accepts 'aa:bb:cc:dd:ee:ff', 'aa-bb-cc-dd-ee-ff', 'aabbccddeeff'.
+    """
+    s = re.sub(r'[^0-9a-fA-F]', '', mac or '')
+    if len(s) != 12:
+        raise ValueError(f"Invalid MAC: {mac!r}")
+    return bytes.fromhex(s)
+
+def _build_magic_packet(mac: str) -> bytes:
+    mb = _mac_bytes(mac)
+    return b'\xff' * 6 + mb * 16
+
+def _send_magic_udp(mac: str, broadcasts=None, port: int = WOL_PORT, repeats: int = WOL_REPEATS):
+    """
+    Send a WOL magic packet to one or more broadcast addresses.
+    Returns (sent_count, errors_list).
+    """
+    if not broadcasts:
+        broadcasts = WOL_BROADCASTS
+    pkt = _build_magic_packet(mac)
+    sent = 0
+    errors = []
+    for bcast in broadcasts:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(0.5)
+                for _ in range(max(1, int(repeats))):
+                    s.sendto(pkt, (bcast, int(port)))
+                    sent += 1
+        except Exception as e:
+            errors.append(f"{bcast}:{port} -> {e}")
+    return sent, errors
+
+@app.post('/nodes/wake/<hostname>')
+def nodes_wake_one(hostname):
+    """
+    Wake a single node by hostname using its MAC stored in Redis at nodes:mac.
+    """
+    nodes = {n["hostname"]: n["mac"] for n in get_all_nodes()}
+    host = (hostname or '').strip()
+    mac = nodes.get(host)
+    if not mac:
+        return jsonify({'error': f'Unknown node {host} or missing MAC in nodes:mac'}), 404
+    try:
+        sent, errors = _send_magic_udp(mac)
+        if errors:
+            logger.warning("WOL partial errors for %s (%s): %s", host, mac, "; ".join(errors))
+        logger.info("WOL sent to %s (%s), packets=%d", host, mac, sent)
+        return jsonify({'status': 'ok', 'host': host, 'mac': mac, 'packets': sent, 'errors': errors})
+    except Exception as e:
+        logger.exception("WOL failed for %s", host)
+        return jsonify({'error': str(e)}), 500
+
+@app.post('/nodes/wake_all')
+def nodes_wake_all():
+    """
+    Wake all known nodes from nodes:mac.
+    """
+    try:
+        nodes = get_all_nodes()
+        total_hosts = len(nodes)
+        total_packets = 0
+        errors = {}
+        for n in nodes:
+            sent, errs = _send_magic_udp(n["mac"])
+            total_packets += sent
+            if errs:
+                errors[n["hostname"]] = errs
+        logger.info("WOL sent to %d host(s), total packets=%d", total_hosts, total_packets)
+        # 'sent' matches what the front-end toast expects (number of hosts)
+        return jsonify({'status': 'ok', 'sent': total_hosts, 'total_packets': total_packets, 'errors': errors})
+    except Exception as e:
+        logger.exception("Wake All failed")
+        return jsonify({'error': str(e)}), 500
