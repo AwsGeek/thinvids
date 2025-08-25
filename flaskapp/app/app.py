@@ -11,6 +11,7 @@ from math import ceil
 import socket
 import re
 import struct
+from typing import List
 
 import redis
 from redis.retry import Retry
@@ -62,9 +63,9 @@ STATUS_STOPPED = 'STOPPED'
 STATUS_FAILED = 'FAILED'
 STATUS_DONE    = 'DONE'
 
-# ------------------------ Node discovery (no WOL publish) ------------------------
+# ------------------------ Node discovery (fast path) ------------------------
 
-# Nodes are considered "active" if their last signal (metrics/heartbeat) is within this window
+# Nodes are considered "active" if their last metrics timestamp is within this window
 ACTIVE_WINDOW_SEC = int(os.getenv("ACTIVE_WINDOW_SEC", "5"))
 
 def get_all_nodes():
@@ -85,102 +86,39 @@ def get_all_nodes():
         logger.warning(f"get_all_nodes: failed to read nodes:mac: {e}")
     return out
 
-def _active_from_metrics(cutoff_ts: int) -> set[str]:
-    """
-    Hosts active due to recent metrics:node:<host> 'ts' field.
-    """
-    active = set()
-    try:
-        for key in redis_client.scan_iter("metrics:node:*"):
-            try:
-                data = redis_client.hgetall(key) or {}
-                ts = int(float(data.get("ts", 0)))
-                host = data.get("hostname") or key.split(":")[-1]
-                if host and ts >= cutoff_ts:
-                    active.add(host)
-            except Exception:
-                continue
-    except Exception as e:
-        logger.warning(f"_active_from_metrics: error scanning metrics: {e}")
-    return active
-
-def _parse_possible_ts(val) -> int:
-    """
-    Try to coerce a heartbeat value into an integer epoch seconds.
-    Accepts bare string/number, or dict-like with ts/last fields.
-    Returns 0 if unknown.
-    """
-    try:
-        if isinstance(val, (int, float)):
-            return int(val)
-        if isinstance(val, str):
-            return int(float(val.strip()))
-        if isinstance(val, dict):
-            for k in ("ts", "last", "last_ts", "last_seen"):
-                if k in val:
-                    return int(float(val[k]))
-    except Exception:
-        pass
-    return 0
-
-def _active_from_heartbeats(cutoff_ts: int) -> set[str]:
-    """
-    Hosts active due to generic heartbeat keys.
-    We check a couple of common patterns and accept either a raw value
-    or a hash with ts/last timestamp fields.
-    Patterns:
-      - heartbeat:<hostname>
-      - node:heartbeat:<hostname>
-    """
-    active = set()
-    patterns = ("heartbeat:*", "node:heartbeat:*")
-    for pat in patterns:
-        try:
-            for key in redis_client.scan_iter(pat):
-                try:
-                    parts = key.split(":")
-                    if len(parts) < 2:
-                        continue
-                    host = parts[-1]
-                    if not host:
-                        continue
-                    t = 0
-                    # Try as string value first
-                    v = redis_client.get(key)
-                    if v is not None:
-                        t = _parse_possible_ts(v)
-                    else:
-                        # Maybe it's a hash
-                        h = redis_client.hgetall(key) or {}
-                        if h:
-                            t = _parse_possible_ts(h)
-                    if t >= cutoff_ts:
-                        active.add(host)
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.debug(f"_active_from_heartbeats: scan {pat} failed: {e}")
-    return active
+def _natural_key(host: str):
+    m = re.search(r'(\d+)', host or '')
+    return (int(m.group(1)) if m else 0, host or '')
 
 def get_active_nodes():
     """
-    Return ONLY nodes that are active based on recent metrics OR heartbeats
-    within ACTIVE_WINDOW_SEC.
+    Return ONLY nodes that are active based on recent metrics within ACTIVE_WINDOW_SEC.
+    Uses nodes:mac for the universe, then pipelines HGET(ts) on metrics:node:<host>.
     Format: [{'hostname': 'thinman01', 'mac': 'aa:bb:cc:dd:ee:ff'}, ...]
     """
     mac_map = {n["hostname"]: n["mac"] for n in get_all_nodes()}
+    if not mac_map:
+        return []
+
     cutoff = int(time.time()) - ACTIVE_WINDOW_SEC
+    hosts = list(mac_map.keys())
 
-    # Active if: recent metrics OR recent generic heartbeat
-    active_hosts = set()
-    active_hosts |= _active_from_metrics(cutoff)
-    active_hosts |= _active_from_heartbeats(cutoff)
+    pipe = redis_client.pipeline()
+    for h in hosts:
+        pipe.hget(f"metrics:node:{h}", "ts")
+    ts_vals = pipe.execute()
 
-    # Return only nodes we know MACs for
-    result = [{"hostname": h, "mac": mac_map[h]} for h in active_hosts if h in mac_map]
+    result = []
+    for h, ts in zip(hosts, ts_vals):
+        try:
+            t = int(float(ts or 0))
+        except Exception:
+            t = 0
+        if t >= cutoff:
+            result.append({"hostname": h, "mac": mac_map[h]})
     return result
 
-# ---------- Warm-up & launch helpers (wait for heartbeats instead of blind sleep) ----------
+# ---------- Warm-up & launch helpers (wait for heartbeats/metrics) ----------
 
 # Tunables (can be overridden via env)
 CLUSTER_WARMUP_SEC  = int(os.getenv("CLUSTER_WARMUP_SEC", "60"))  # max wait for nodes to appear
@@ -189,18 +127,14 @@ PARTS_PER_WORKER    = int(os.getenv("PARTS_PER_WORKER", "1"))     # hint only
 MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
 
-def _natural_key(host: str):
-    m = re.search(r'(\d+)', host or '')
-    return (int(m.group(1)) if m else 0, host or '')
-
-def _current_active_hostnames() -> list[str]:
+def _current_active_hostnames() -> List[str]:
     nodes = get_active_nodes()
     hosts = sorted([n["hostname"] for n in nodes], key=_natural_key)
     return hosts
 
-def _wait_for_workers(min_count: int, timeout_sec: int) -> list[str]:
+def _wait_for_workers(min_count: int, timeout_sec: int) -> List[str]:
     deadline = time.time() + max(0, int(timeout_sec))
-    best: list[str] = []
+    best: List[str] = []
     while time.time() < deadline:
         cur = _current_active_hostnames()
         if len(cur) >= min_count:
@@ -254,6 +188,11 @@ def index():
 def metrics_page():
     return render_template('metrics.html')
 
+# -------------------- tiny in-process caches --------------------
+# (shield front-end polling from re-hitting Redis every time)
+_metrics_cache = (0.0, None)  # (ts, payload dict)
+_jobs_cache    = (0.0, None)  # (ts, list of job dicts)
+
 # --- Nodes page & data ---
 def _resolve_ip(hostname: str) -> str:
     try:
@@ -295,30 +234,53 @@ def nodes_data():
 def nodes_page():
     return render_template('nodes.html')
 
-# --- metrics snapshot (kept; fields may be absent if agents don't send them) ---
+# --- metrics snapshot (batched + cached) ---
 @app.get('/metrics_snapshot')
 def metrics_snapshot():
+    global _metrics_cache
+    now = time.time()
+    ts, cached = _metrics_cache
+    # serve cached snapshot if it's fresh (<0.5s)
+    if cached and (now - ts) < 0.5:
+        return jsonify(cached)
+
+    # derive host list from nodes:mac (no keyspace SCAN)
+    hosts = [n["hostname"] for n in get_all_nodes()]
+    if not hosts:
+        payload = {"nodes": []}
+        _metrics_cache = (now, payload)
+        return jsonify(payload)
+
+    # batch HGETALL for each metrics hash
+    pipe = redis_client.pipeline()
+    for h in hosts:
+        pipe.hgetall(f"metrics:node:{h}")
+    raw_list = pipe.execute()
+
     nodes = []
-    for key in redis_client.scan_iter("metrics:node:*"):
+    for host, data in zip(hosts, raw_list):
+        if not data:
+            continue
         try:
-            data = redis_client.hgetall(key) or {}
-            out = {
-                "key": key,
-                "hostname": data.get("hostname") or key.split(":")[-1],
-                "ts": int(float(data.get("ts", 0))),
-                "cpu": float(data.get("cpu", 0.0)),
-                "gpu": float(data.get("gpu", -1.0)),
-                "mem": float(data.get("mem", 0.0)),
-                "mem_used": int(float(data.get("mem_used", 0))),
-                "mem_total": int(float(data.get("mem_total", 0))),
-                "rx_bps": int(float(data.get("rx_bps", 0))),
-                "tx_bps": int(float(data.get("tx_bps", 0)))
-            }
-            nodes.append(out)
+            nodes.append({
+                "key": f"metrics:node:{host}",
+                "hostname": data.get("hostname") or host,
+                "ts": int(float(data.get("ts", 0) or 0)),
+                "cpu": float(data.get("cpu", 0.0) or 0.0),
+                "gpu": float(data.get("gpu", -1.0) or -1.0),
+                "mem": float(data.get("mem", 0.0) or 0.0),
+                "mem_used": int(float(data.get("mem_used", 0) or 0)),
+                "mem_total": int(float(data.get("mem_total", 0) or 0)),
+                "rx_bps": int(float(data.get("rx_bps", 0) or 0)),
+                "tx_bps": int(float(data.get("tx_bps", 0) or 0)),
+            })
         except Exception:
-            pass
-    nodes.sort(key=lambda n: n["hostname"])
-    return jsonify({"nodes": nodes})
+            continue
+
+    nodes.sort(key=lambda n: _natural_key(n["hostname"]))
+    payload = {"nodes": nodes}
+    _metrics_cache = (now, payload)
+    return jsonify(payload)
 
 # ------------------- Global settings API -------------------
 @app.get('/global_settings')
@@ -363,44 +325,72 @@ def post_global_settings():
 # ------------------------ Jobs API -------------------------
 @app.get('/jobs')
 def list_jobs():
-    jobs = []
-    for key in redis_client.scan_iter("job:*"):
-        try:
-            job_id = key.split(':', 1)[1]
-            raw = redis_client.hgetall(key)
-            job_data = {k: v for k, v in raw.items()}
+    """
+    Fast jobs listing:
+      - Maintains `jobs:all` set as index of job keys.
+      - Auto-seeds from keyspace once if the set is empty (to include existing jobs).
+      - Pipelines HGETALL for all jobs, with a 0.5s in-process cache.
+    """
+    global _jobs_cache
 
+    now = time.time()
+    ts, cached_list = _jobs_cache
+
+    # refresh cache if stale
+    if cached_list is None or (now - ts) >= 0.5:
+        keys = list(redis_client.smembers("jobs:all") or [])
+
+        # Fallback seeding if index missing (first run / migration)
+        if not keys:
+            # One-time SCAN (kept off hot path by cache + subsequent index usage)
+            keys = [k for k in redis_client.scan_iter("job:*", count=1000)]
+            if keys:
+                try:
+                    redis_client.sadd("jobs:all", *keys)
+                except Exception:
+                    pass
+
+        # batch HGETALL
+        pipe = redis_client.pipeline()
+        for k in keys:
+            pipe.hgetall(k)
+        raws = pipe.execute()
+
+        jobs = []
+        for k, job_data in zip(keys, raws):
+            if not job_data:
+                # clean up dead membership if needed
+                try:
+                    redis_client.srem("jobs:all", k)
+                except Exception:
+                    pass
+                continue
+
+            job_id = (k.split(':', 1)[1]) if ':' in k else k
             started = float(job_data.get('started_at', '0') or 0)
-            ended = float(job_data.get('ended_at', '0') or 0)
+            ended   = float(job_data.get('ended_at', '0') or 0)
             created = float(job_data.get('created_at', '0') or 0)
-            now = time.time()
-            elapsed = int((ended if ended > 0 else now) - started) if started > 0 else 0
-
-            total = int(job_data.get('total_chunks', '0') or 0)
-            done = int(job_data.get('completed_chunks', '0') or 0)
-            stitched = int(job_data.get('stitched_chunks', '0') or 0)
-
-            segment_progress = int(job_data.get('segment_progress', '0') or 0)
-            encode_progress  = int(job_data.get('encode_progress',  '0') or 0)
-            combine_progress = int(job_data.get('combine_progress', '0') or 0)
+            nowf    = time.time()
+            elapsed = int((ended if ended > 0 else nowf) - started) if started > 0 else 0
 
             jobs.append({
                 'job_id': job_id,
                 **job_data,
-                'segment_progress': segment_progress,
-                'encode_progress': encode_progress,
-                'combine_progress': combine_progress,
+                'segment_progress': int(job_data.get('segment_progress', '0') or 0),
+                'encode_progress':  int(job_data.get('encode_progress',  '0') or 0),
+                'combine_progress': int(job_data.get('combine_progress', '0') or 0),
                 'elapsed': elapsed,
                 'started': started,
                 'created': created,
-                'stitched_chunks': stitched
+                'stitched_chunks': int(job_data.get('stitched_chunks', '0') or 0),
             })
-        except Exception:
-            pass
 
-    if 'page' not in request.args:
-        return jsonify(jobs)
+        _jobs_cache = (now, jobs)
+        jobs_list = jobs
+    else:
+        jobs_list = cached_list
 
+    # ---- sorting/paging (retain your existing behavior) ----
     try:
         page = max(1, int(request.args.get('page', 1)))
     except Exception:
@@ -413,6 +403,7 @@ def list_jobs():
 
     sort_by = (request.args.get('sort_by') or 'date').lower()
     sort_dir = (request.args.get('sort_dir') or 'desc').lower()
+    reverse = (sort_dir != 'asc')
 
     status_order = {'READY': 0, 'RUNNING': 1, 'STOPPED': 2, 'FAILED': 3, 'DONE': 4}
 
@@ -434,20 +425,21 @@ def list_jobs():
             secondary = created if started == 0 else started
             return (paused_bucket, secondary)
 
-    reverse = (sort_dir != 'asc')
-
     if sort_by == 'date':
-        jobs.sort(key=lambda j: (0 if float(j.get('started') or 0) == 0 else 1,
-                                 float(j.get('created') or 0) if float(j.get('started') or 0) == 0
-                                 else float(j.get('started') or 0)),
-                  reverse=False)
-        paused = [j for j in jobs if float(j.get('started') or 0) == 0]
-        running = [j for j in jobs if float(j.get('started') or 0) != 0]
-        paused.sort(key=lambda j: float(j.get('created') or 0), reverse=True if reverse else False)
-        running.sort(key=lambda j: float(j.get('started') or 0), reverse=True if reverse else False)
+        jobs_sorted = sorted(
+            jobs_list,
+            key=lambda j: (0 if float(j.get('started') or 0) == 0 else 1,
+                           float(j.get('created') or 0) if float(j.get('started') or 0) == 0
+                           else float(j.get('started') or 0)),
+            reverse=False
+        )
+        paused = [j for j in jobs_sorted if float(j.get('started') or 0) == 0]
+        running = [j for j in jobs_sorted if float(j.get('started') or 0) != 0]
+        paused.sort(key=lambda j: float(j.get('created') or 0), reverse=reverse)
+        running.sort(key=lambda j: float(j.get('started') or 0), reverse=reverse)
         jobs_sorted = paused + running
     else:
-        jobs_sorted = sorted(jobs, key=sort_key, reverse=reverse)
+        jobs_sorted = sorted(jobs_list, key=sort_key, reverse=reverse)
 
     total = len(jobs_sorted)
     total_pages = max(1, ceil(total / page_size))
@@ -508,6 +500,11 @@ def add_job():
         'total_frames': 0
     }
     redis_client.hset(job_key, mapping=job_settings)
+    # index the job for fast listing
+    try:
+        redis_client.sadd("jobs:all", job_key)
+    except Exception:
+        pass
 
     # Kick off async probe on a worker
     probe_source(job_id, full_path)
@@ -573,7 +570,14 @@ def copy_job():
         'completed_chunks': 0,
         'stitched_chunks': 0
     }
-    redis_client.hset(f"job:{new_job_id}", mapping=new_job)
+    new_key = f"job:{new_job_id}"
+    redis_client.hset(new_key, mapping=new_job)
+    # index the job for fast listing
+    try:
+        redis_client.sadd("jobs:all", new_key)
+    except Exception:
+        pass
+
     logger.info(f"[{new_job_id}] Copied from {source_job_id} with filename={filename}, "
                 f"segment_duration={segment_duration}, number_parts={number_parts} (PAUSED)")
 
@@ -703,6 +707,12 @@ def delete_job(job_id):
 
     for key in redis_client.scan_iter(f"{job_key}*"):
         redis_client.delete(key)
+
+    # remove from the jobs index
+    try:
+        redis_client.srem("jobs:all", job_key)
+    except Exception:
+        pass
 
     if job_dir and os.path.exists(job_dir):
         try:
