@@ -1,28 +1,42 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# Require node name prefix and SSH username as arguments
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <node_name_prefix>"
-  exit 1
+INV=${INV:-./ansible_hosts.ini}
+GROUP=${GROUP:-thinman_workers}
+UNIT=${UNIT:-thinman-worker}
+FOLLOW=${FOLLOW:--f}   # export FOLLOW= to not follow
+
+# Get clean hostnames from the inventory
+mapfile -t HOSTS < <(ansible -i "$INV" --list-hosts "$GROUP" | awk 'NR>1{print $1}')
+if ((${#HOSTS[@]}==0)); then
+  echo "No hosts found for group '$GROUP' in '$INV'"; exit 1
 fi
 
-prefix="$1"
-ssh_user="jerry"
+pids=()
 
-# Discover node names matching the prefix
-nodes=($(docker node ls --format '{{.Hostname}}' | grep "^${prefix}"))
+cleanup() {
+  # Send SIGTERM to each pipeline's process group, then SIGKILL as a backstop
+  for pid in "${pids[@]}"; do
+    kill -TERM -"${pid}" 2>/dev/null || true
+  done
+  sleep 0.2
+  for pid in "${pids[@]}"; do
+    kill -KILL -"${pid}" 2>/dev/null || true
+  done
+  wait || true
+}
+trap cleanup INT TERM EXIT
 
-if [ ${#nodes[@]} -eq 0 ]; then
-  echo "No nodes found matching prefix '$prefix'"
-  exit 1
-fi
+for h in "${HOSTS[@]}"; do
+  [[ $h =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Skipping invalid hostname: $h" >&2; continue; }
 
-# Collect lines: each will be hostname<TAB>IP<TAB>username
-host_ips=()
-for node in "${nodes[@]}"; do
-  host_ips+=("$node	$ssh_user")
+  # Start each stream in its own session/process-group so we can nuke it cleanly.
+  setsid bash -c "
+    exec ssh -o StrictHostKeyChecking=accept-new jerry@${h} \
+      sudo journalctl -u '${UNIT}' ${FOLLOW} -o cat \
+    | stdbuf -oL sed -u 's/^/[${h}] /'
+  " &
+  pids+=("$!")
 done
 
-# Run log tailing in parallel
-parallel --lb -j 0 --colsep '\t' --tagstring '{1}' \
-  'ssh -o LogLevel=ERROR -t {2}@{1} "sudo docker compose logs -f"' ::: "${host_ips[@]}"
+wait

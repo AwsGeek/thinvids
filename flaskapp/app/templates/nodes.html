@@ -94,22 +94,50 @@
     }
 
     function setActions(td, hostname, active) {
-      // Update actions cell without nuking the whole row
-      td.innerHTML = '';
-      if (!active) {
-        const btn = document.createElement('button');
-        btn.className = 'wake-btn bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
-        btn.textContent = 'Wake';
-        btn.addEventListener('click', async () => {
+        td.innerHTML = '';
+
+        // Wake (only when offline, as before)
+        if (!active) {
+          const btn = document.createElement('button');
+          btn.className = 'wake-btn bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
+          btn.textContent = 'Wake';
+          btn.addEventListener('click', async () => {
+            try {
+              const r = await fetch(`/nodes/wake/${encodeURIComponent(hostname)}`, { method: 'POST' });
+              const j = await r.json().catch(()=>({}));
+              if (r.ok) toast(`Sent WOL to ${hostname}`); else toast(j.error || `Failed to wake ${hostname}`, false);
+            } catch { toast(`Failed to wake ${hostname}`, false); }
+          });
+          td.appendChild(btn);
+        }
+
+        // Delete (always available)
+        const delBtn = document.createElement('button');
+        delBtn.className = 'ml-2 bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-sm';
+        delBtn.textContent = 'Delete';
+        delBtn.title = 'Remove this node from Redis and the list';
+        delBtn.addEventListener('click', async () => {
+          if (!confirm(`Delete node "${hostname}"?\nThis removes its MAC mapping and metrics from Redis.`)) return;
           try {
-            const r = await fetch(`/nodes/wake/${encodeURIComponent(hostname)}`, { method: 'POST' });
+            const r = await fetch(`/nodes/delete/${encodeURIComponent(hostname)}`, { method: 'DELETE' });
             const j = await r.json().catch(()=>({}));
-            if (r.ok) toast(`Sent WOL to ${hostname}`); else toast(j.error || `Failed to wake ${hostname}`, false);
-          } catch { toast(`Failed to wake ${hostname}`, false); }
+            if (r.ok) {
+              toast(`Removed ${hostname}`);
+              const row = document.querySelector(`tr[data-host="${hostname}"]`);
+              if (row) row.remove();
+              // Show empty state if nothing remains
+              if (!document.querySelector('#nodes-body tr')) {
+                empty.classList.remove('hidden');
+              }
+            } else {
+              toast(j.error || `Failed to remove ${hostname}`, false);
+            }
+          } catch {
+            toast(`Failed to remove ${hostname}`, false);
+          }
         });
-        td.appendChild(btn);
+        td.appendChild(delBtn);
       }
-    }
 
     async function loadNodes() {
       try {
