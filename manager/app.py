@@ -56,12 +56,9 @@ redis_client = redis.Redis(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-STATUS_READY = 'READY'
-STATUS_STARTING = 'STARTING'
-STATUS_RUNNING = 'RUNNING'
-STATUS_STOPPED = 'STOPPED'
-STATUS_FAILED = 'FAILED'
-STATUS_DONE    = 'DONE'
+from common import (
+    STATUS_READY, STATUS_STARTING, STATUS_WAITING, STATUS_RUNNING, STATUS_STOPPED, STATUS_FAILED, STATUS_DONE
+)
 
 # ------------------------ Node discovery (fast path) ------------------------
 
@@ -122,7 +119,7 @@ def get_active_nodes():
 
 # Tunables (can be overridden via env)
 CLUSTER_WARMUP_SEC  = int(os.getenv("CLUSTER_WARMUP_SEC", "60"))  # max wait for nodes to appear
-MIN_WARMUP_WORKERS  = int(os.getenv("MIN_WARMUP_WORKERS", "20"))   # desired active workers before start
+MIN_WARMUP_WORKERS  = int(os.getenv("MIN_WARMUP_WORKERS", "3"))   # desired active workers before start
 PARTS_PER_WORKER    = int(os.getenv("PARTS_PER_WORKER", "1"))     # hint only
 MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
@@ -146,17 +143,24 @@ def _wait_for_workers(min_count: int, timeout_sec: int) -> List[str]:
 
 def _launch_after_warmup(job_key: str, job_id: str, filename: str):
     """
-    Wake the cluster, wait for heartbeats, store audit + parts_hint, then start transcode.
+    Wake the cluster, wait for heartbeats when needed, store audit + parts_hint, then start transcode.
     """
     try:
-        # Fire WOL for all known nodes (reuse existing route function)
+        # Best-effort WOL
         try:
-            nodes_wake_all()  # ignore JSON response
+            nodes_wake_all()
         except Exception as e:
             logger.warning("nodes_wake_all() raised: %s", e)
 
-        wanted = max(1, MIN_WARMUP_WORKERS)
-        seen = _wait_for_workers(wanted, CLUSTER_WARMUP_SEC)
+        # If workers are already active, don't wait the full warmup window.
+        existing = _current_active_hostnames()
+        if existing:
+            seen = existing
+        else:
+            # Target at most what's realistically available
+            total_known = max(1, len(get_all_nodes()))
+            wanted = max(1, min(MIN_WARMUP_WORKERS, total_known))
+            seen = _wait_for_workers(wanted, CLUSTER_WARMUP_SEC)
 
         # Compute parts hint
         parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
@@ -170,14 +174,15 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
         })
 
         # Kick the pipeline
+        redis_client.hset(job_key, mapping={'status': STATUS_WAITING, 'waiting_at': time.time()})
         transcode_video(job_id, f'/watch/{filename}')
     except Exception as e:
         logger.exception("[%s] launch_after_warmup failed", job_id)
-        # Mark FAILED so UI surfaces the problem
         try:
             redis_client.hset(job_key, mapping={'status': STATUS_FAILED, 'error': str(e)})
         except Exception:
             pass
+
 
 # -------------------------- Views --------------------------
 @app.route('/')
@@ -283,45 +288,68 @@ def metrics_snapshot():
     _metrics_cache = (now, payload)
     return jsonify(payload)
 
-# ------------------- Global settings API -------------------
-@app.get('/global_settings')
+GLOBAL_SETTINGS_KEY = "global:settings"
+DEFAULTS = {
+    "suspend_enabled": "0",     # off by default
+    "suspend_idle_sec": "300",  # 5 minutes
+    "suspend_gc_enabled": "0",  # off by default
+}
+
+def _to_bool(v):
+    return str(v).lower() in ("1", "true", "yes", "on")
+
+def _load_global_settings():
+    data = redis_client.hgetall(GLOBAL_SETTINGS_KEY) or {}
+    merged = {**DEFAULTS, **data}
+    return {
+        "suspend_enabled": _to_bool(merged.get("suspend_enabled")),
+        "suspend_idle_sec": int(merged.get("suspend_idle_sec") or 300),
+        "suspend_gc_enabled": _to_bool(merged.get("suspend_gc_enabled")),
+    }
+
+@app.get("/settings")
 def get_global_settings():
-    g = redis_client.hgetall('settings:global') or {}
-    segment_duration = int(g.get('segment_duration', 10))
-    number_parts = int(g.get('number_parts', 2))
-    auto_start = g.get('auto_start', '1') == '1'
-    serialize_pipeline = g.get('serialize_pipeline', '0') == '1'
-    return jsonify({
-        'segment_duration': segment_duration,
-        'number_parts': number_parts,
-        'auto_start': auto_start,
-        'serialize_pipeline': serialize_pipeline,
+    """
+    Returns:
+    {
+        "suspend_enabled": bool,
+        "suspend_idle_sec": int,
+        "suspend_gc_enabled": bool
+    }
+    """
+    return jsonify(_load_global_settings())
+
+@app.post("/settings")
+def post_global_settings():
+    """
+    Accepts JSON:
+    {
+        "suspend_enabled": bool,
+        "suspend_idle_sec": int (>=30),
+        "suspend_gc_enabled": bool
+    }
+    """
+    payload = request.get_json(silent=True) or {}
+    try:
+        suspend_enabled = bool(payload.get("suspend_enabled", False))
+        suspend_gc_enabled = bool(payload.get("suspend_gc_enabled", False))
+        idle = int(payload.get("suspend_idle_sec", 300))
+        if idle < 30:
+            idle = 30  # sane floor
+    except Exception:
+        return jsonify({"error": "invalid payload"}), 400
+
+    redis_client.hset(GLOBAL_SETTINGS_KEY, mapping={
+        "suspend_enabled": "1" if suspend_enabled else "0",
+        "suspend_idle_sec": str(idle),
+        "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
     })
 
-@app.post('/global_settings')
-def post_global_settings():
-    data = request.get_json(silent=True) or {}
-    try:
-        segment_duration = int(data.get('segment_duration', 10))
-        number_parts = int(data.get('number_parts', 2))
-        auto_start = bool(data.get('auto_start', True))
-        serialize_pipeline = bool(data.get('serialize_pipeline', False))
-
-        if not (1 <= segment_duration <= 300):
-            return "Segment length must be between 1 and 300 seconds.", 400
-        if not (1 <= number_parts <= 8):
-            return "Number of parts must be between 1 and 8.", 400
-
-        redis_client.hset('settings:global', mapping={
-            'segment_duration': segment_duration,
-            'number_parts': number_parts,
-            'auto_start': '1' if auto_start else '0',
-            'serialize_pipeline': '1' if serialize_pipeline else '0',
-        })
-        return jsonify({'status': 'ok'})
-    except Exception:
-        logger.exception("Failed to save global settings")
-        return "Failed to save global settings.", 500
+    return jsonify({
+        "suspend_enabled": suspend_enabled,
+        "suspend_idle_sec": idle,
+        "suspend_gc_enabled": suspend_gc_enabled,
+    })
 
 # ------------------------ Jobs API -------------------------
 @app.get('/jobs')
@@ -626,16 +654,23 @@ def restart_job(job_id):
     if not filename:
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
-    # ------ Reset job state and start fresh ------
+    # Remove working directory (best-effort)
     job_dir = job.get('job_dir', '')
-
-    logger.info(f"[{job_id}] Deleting job dir {job_dir!r}")
+    logger.info(f"[{job_id}] Cleaning job dir {job_dir!r}")
     if job_dir and os.path.exists(job_dir):
         try:
             shutil.rmtree(job_dir)
         except Exception as e:
             logger.warning(f"[{job_id}] Failed to delete job directory {job_dir}: {e}")
 
+    # Remove ONLY per-job subkeys (chunks, progress shards, etc), keep the base hash
+    for key in redis_client.scan_iter(f"{job_key}:*"):
+        try:
+            redis_client.delete(key)
+        except Exception:
+            pass
+
+    # Carry over settings (with sane fallbacks)
     globals_map = redis_client.hgetall('settings:global')
     def _int(v, default):
         try:
@@ -643,43 +678,56 @@ def restart_job(job_id):
         except Exception:
             return default
 
-    segment_duration = _int(
-        job.get('segment_duration', globals_map.get('segment_duration')),
-        10
-    )
-    number_parts = _int(
-        job.get('number_parts', globals_map.get('number_parts')),
-        2
-    )
-    serialize_existing = job.get('serialize_pipeline', (globals_map.get('serialize_pipeline', '0')))
-
-    for key in redis_client.scan_iter(f"{job_key}*"):
-        redis_client.delete(key)
+    segment_duration = _int(job.get('segment_duration', globals_map.get('segment_duration', 10)), 10)
+    number_parts     = _int(job.get('number_parts',     globals_map.get('number_parts', 2)), 2)
+    serialize_val    = job.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
+    selected_v_stream= job.get('selected_v_stream', 0)
+    selected_a_stream= job.get('selected_a_stream', 0)
 
     now = time.time()
-    selected_v_stream = job.get('selected_v_stream', 0)
-    selected_a_stream = job.get('selected_a_stream', 0)
-
-    new_job = {
+    new_fields = {
         'job_id': job_id,
         'filename': filename,
         'status': STATUS_STARTING,
-        'created_at': str(now),
+        'created_at': str(now),      # treat as a new run for sorting
         'started_at': str(now),
         'segment_duration': segment_duration,
         'number_parts': number_parts,
-        'serialize_pipeline': '1' if str(serialize_existing) in ('1','true','True') else '0',
+        'serialize_pipeline': '1' if str(serialize_val) in ('1', 'true', 'True') else '0',
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
         'completed_chunks': 0,
         'stitched_chunks': 0,
+        # Optional: clear/source fields so probe/worker can repopulate
+        'source_codec': '',
+        'source_resolution': '',
+        'source_duration': '0',
+        'source_fps': '0',
+        'source_file_size': 0,
+        'total_frames': 0,
     }
-    redis_client.hset(f"job:{job_id}", mapping=new_job)
+
+    # Overwrite base hash in one go (no delete -> no set race)
+    redis_client.hset(job_key, mapping=new_fields)
+
+    # Ensure membership in the UI index (fixes the disappearing job)
+    try:
+        redis_client.sadd("jobs:all", job_key)
+    except Exception:
+        pass
+
+    # Refresh metadata promptly (like add_job)
+    try:
+        full_path = os.path.join("/watch", filename.lstrip('/'))
+        probe_source(job_id, full_path)   # async
+    except Exception as e:
+        logger.warning(f"[{job_id}] probe_source dispatch failed: {e}")
 
     # Wake, wait for heartbeats, set hint, then launch
-    _launch_after_warmup(f"job:{job_id}", job_id, filename)
+    _launch_after_warmup(job_key, job_id, filename)
     return jsonify({'status': 'started'}), 200
+
 
 @app.get('/dashboard')
 def dashboard():

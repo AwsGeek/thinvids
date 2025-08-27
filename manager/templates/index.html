@@ -164,11 +164,11 @@
   const statusColorClass = (s='') => {
     s = String(s).toUpperCase();
     if (s==='READY') return 'text-gray-700';
-    if (s==='STARTING') return 'text-orange-600';
-    if (s==='RUNNING') return 'text-blue-600';
+    if (s==='STARTING'||s==='WAITING') return 'text-yellow-600';
+    if (s==='RUNNING') return 'text-green-600';
     if (s==='STOPPED') return 'text-orange-600';
     if (s==='FAILED') return 'text-red-600';
-    if (s==='DONE'||s==='COMPLETED') return 'text-green-600';
+    if (s==='DONE'||s==='COMPLETED') return 'text-black-600';
     return 'text-gray-700';
   };
   function toast(message, ok=true) {

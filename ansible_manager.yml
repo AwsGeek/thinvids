@@ -13,6 +13,7 @@
     projects_dir: /projects
     watch_dir: /watch
     library_dir: /library
+    config_dir: /config
 
     # Redis (manager uses same Redis as workers)
     redis_host: swarm3
@@ -43,6 +44,7 @@
     nfs_opts: "nolock,soft,_netdev"
     nfs_watch_export:   /volume1/shared/projects/media/archive
     nfs_library_export: /volume1/shared/projects/media/library
+    nfs_config_export:   /volume1/shared/projects/transcoder/config
 
     # Optional centralized journald upload
     enable_journal_upload: false
@@ -91,6 +93,7 @@
       loop:
         - "{{ watch_dir }}"
         - "{{ library_dir }}"
+        - "{{ config_dir }}"
 
     # --- NFS mounts (idempotent) ---
     - name: Mount /watch (NFS)
@@ -105,6 +108,14 @@
       ansible.builtin.mount:
         path: "{{ library_dir }}"
         src: "{{ nfs_server }}:{{ nfs_library_export }}"
+        fstype: "{{ nfs_fstype }}"
+        opts: "{{ nfs_opts }}"
+        state: mounted
+
+    - name: Mount /config (NFS)
+      ansible.builtin.mount:
+        path: "{{ config_dir }}"
+        src: "{{ nfs_server }}:{{ nfs_config_export }}"
         fstype: "{{ nfs_fstype }}"
         opts: "{{ nfs_opts }}"
         state: mounted
@@ -126,7 +137,7 @@
     # --- Deploy only what workers need: worker/ + agent.py ---
     - name: Sync manager code
       ansible.posix.synchronize:
-        src: "{{ code_src }}/flaskapp/app/"
+        src: "{{ code_src }}/manager/"
         dest: "{{ app_root }}/current/"
         delete: yes
         rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
@@ -135,13 +146,26 @@
 
     - name: Install tasks.py from worker tree
       ansible.builtin.copy:
-        src: "{{ code_src }}/worker/app/tasks.py"
+        src: "{{ code_src }}/worker/tasks.py"
         dest: "{{ app_root }}/current/tasks.py"
         owner: "{{ thinman_user }}"
         group: "{{ thinman_group }}"
         mode: "0644"
       notify: restart thinvids_manager
       tags: build_app # Add a tag here
+
+    - name: Install common.py
+      ansible.builtin.copy:
+        src: "{{ code_src }}/common.py"
+        dest: "{{ app_root }}/current/common.py"
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0644"
+      notify: 
+        - restart thinvids_manager 
+        - restart thinvids_watcher
+      tags: build_app # Add a tag here
+
 
     - name: Purge old bytecode (avoid stale imports)
       ansible.builtin.command: "find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +"
@@ -178,7 +202,7 @@
           Description=Thinvids Manager (Flask via Gunicorn)
           After=network-online.target remote-fs.target
           Wants=network-online.target remote-fs.target
-          RequiresMountsFor={{ watch_dir }} {{ library_dir }}
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }} 
 
           [Service]
           Type=simple
@@ -250,7 +274,7 @@
           Description=Thinvids Watcher (submit new files to manager)
           After=network-online.target remote-fs.target thinvids_manager.service
           Wants=network-online.target remote-fs.target thinvids_manager.service
-          RequiresMountsFor={{ watch_dir }}
+          RequiresMountsFor={{ watch_dir }} {{ config_dir }}
 
           [Service]
           Type=simple
@@ -258,6 +282,7 @@
           Group={{ thinman_group }}
           WorkingDirectory={{ app_root }}/current
           Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=CONFIG_ROOT={{ config_dir }}
           Environment=MANAGER_HTTP_PORT={{ manager_http_port }}
           # Optional tunables:
           # Environment=STABILIZE_CHECKS=5

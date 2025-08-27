@@ -132,7 +132,7 @@
     - name: Sync worker code
       ansible.posix.synchronize:
         src: "{{ code_src }}/worker/"
-        dest: "{{ app_root }}/current/worker/"
+        dest: "{{ app_root }}/current/"
         delete: yes
         rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
       notify: restart thinman-worker
@@ -145,12 +145,24 @@
 
     - name: Install agent.py
       ansible.builtin.copy:
-        src: "{{ code_src }}/agent.py"
+        src: "{{ code_src }}/agent/agent.py"
         dest: /usr/local/bin/agent.py
         owner: root
         group: root
         mode: "0755"
       notify: restart thinman-agent
+      tags: build_app # Add a tag here
+
+    - name: Install common.py
+      ansible.builtin.copy:
+        src: "{{ code_src }}/common.py"
+        dest: "{{ app_root }}/current/common.py"
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0644"
+      notify: 
+        - restart thinman-worker 
+        - restart thinman-agent
       tags: build_app # Add a tag here
 
     # --- Services (Require NFS mounts before starting) ---
@@ -199,8 +211,8 @@
           User={{ thinman_user }}
           Group={{ thinman_group }}
           SupplementaryGroups=video render
-          WorkingDirectory={{ app_root }}/current/worker/app
-          Environment=PYTHONPATH={{ app_root }}/current:{{ app_root }}/current/worker/app
+          WorkingDirectory={{ app_root }}/current
+          Environment=PYTHONPATH={{ app_root }}/current:{{ app_root }}/current
           Environment=REDIS_HOST={{ redis_host }}
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{% block title %}Trans the Vids!{% endblock %}</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <!-- Chart.js is fine to load globally; pages that don't use it just won't reference it -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+  {% block head_extra %}{% endblock %}
+</head>
+<body class="bg-gray-100">
+  <div class="container mx-auto p-4">
+    <!-- Shared header -->
+    <div class="flex items-center justify-between mb-4">
+        <a href="/" class="flex items-center gap-2 group" title="Home">
+            <span class="text-2xl font-bold">Trans the Vids!</span>
+        </a>
+        <div class="flex items-center gap-2">
+            <button id="open-home" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+                <span class="material-icons">home</span>
+                Home
+            </button>
+            <button id="open-nodes" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">dns</span>
+            Nodes
+            </button>
+            <button id="open-metrics" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">show_chart</span>
+            Metrics
+            </button>
+            <button id="open-global-settings" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">settings</span>
+            Settings
+            </button>
+        </div>
+    </div>
+    {% block content %}{% endblock %}
+  </div>
+
+  <!-- Toast root for all pages -->
+  <div id="toast-root" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
+
+  <!-- Global Settings Modal (shared) -->
+  <div id="global-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 items-center justify-center">
+    <div class="bg-white rounded shadow-xl w-full max-w-lg p-6 relative">
+      <button id="gs-close" class="absolute top-2 right-2 text-gray-600 hover:text-black">
+        <span class="material-icons">close</span>
+      </button>
+      <h2 class="text-xl font-semibold mb-4">Global Settings</h2>
+
+      <form id="global-settings-form" class="space-y-4" onsubmit="return false;">
+        <div class="flex items-center gap-2">
+          <input id="gs-suspend-enabled" type="checkbox" class="h-4 w-4">
+          <label for="gs-suspend-enabled" class="text-sm">Suspend workers when idle</label>
+        </div>
+
+        <div>
+          <label for="gs-idle-seconds" class="block text-sm font-medium mb-1">Idle time before suspend (seconds)</label>
+          <input id="gs-idle-seconds" type="number" min="30" step="10" class="border p-2 rounded w-full">
+          <p class="text-xs text-gray-600 mt-1">Minimum 30 seconds.</p>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-gc-enabled" type="checkbox" class="h-4 w-4">
+          <label for="gs-gc-enabled" class="text-sm">Garbage collect projects before suspend</label>
+        </div>
+
+        <div class="flex gap-2 pt-2">
+          <button id="gs-save" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
+          <button id="gs-cancel" type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300">Close</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Shared helpers (toast + global settings + SHARED METRICS CACHE) -->
+  <script>
+    // -------- Toast ----------
+    function toast(msg, ok=true){
+      const root = document.getElementById('toast-root');
+      if (!root) return;
+      const n = document.createElement('div');
+      n.className = `px-3 py-2 rounded text-white shadow ${ok?'bg-green-600':'bg-red-600'}`;
+      n.textContent = msg;
+      root.appendChild(n);
+      setTimeout(()=>n.remove(), 2200);
+    }
+
+    // -------- Global Settings Modal ----------
+    (function(){
+      const modal   = document.getElementById('global-settings-modal');
+      const openBtn = document.getElementById('open-global-settings');
+      const closeX  = document.getElementById('gs-close');
+      const closeBtn= document.getElementById('gs-cancel');
+      const saveBtn = document.getElementById('gs-save');
+
+      const chkEnabled = document.getElementById('gs-suspend-enabled');
+      const numIdle    = document.getElementById('gs-idle-seconds');
+      const chkGC      = document.getElementById('gs-gc-enabled');
+
+      function show(){ modal.classList.remove('hidden'); modal.classList.add('flex'); }
+      function hide(){ modal.classList.add('hidden'); modal.classList.remove('flex'); }
+
+      async function load(){
+        try{
+          const r = await fetch('/settings');
+          if (!r.ok) throw new Error('load failed');
+          const d = await r.json();
+          chkEnabled.checked = !!d.suspend_enabled;
+          numIdle.value = Number(d.suspend_idle_sec ?? 300);
+          chkGC.checked = !!d.suspend_gc_enabled;
+        }catch{ toast('Failed to load global settings', false); }
+      }
+      async function save(){
+        try{
+          const payload = {
+            suspend_enabled: !!chkEnabled.checked,
+            suspend_idle_sec: Math.max(30, parseInt(numIdle.value || 300, 10)),
+            suspend_gc_enabled: !!chkGC.checked
+          };
+          const r = await fetch('/settings', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(payload)
+          });
+          if (!r.ok) throw new Error('save failed');
+          toast('Settings saved');
+          hide();
+        }catch{ toast('Failed to save settings', false); }
+      }
+
+      openBtn?.addEventListener('click', async ()=>{ await load(); show(); });
+      closeX?.addEventListener('click', hide);
+      closeBtn?.addEventListener('click', hide);
+      saveBtn?.addEventListener('click', save);
+    })();
+</script>
+
+    <!-- Global nav handlers -->
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const hook = (id, href) => { const b=document.getElementById(id); if (b) b.onclick=()=>location.href=href; };
+      hook('open-home','/');
+      hook('open-nodes','/nodes');
+      hook('open-metrics','/metrics');
+    });
+  </script>
+
+  <!-- Shared per-second network cache (ALL pages use the same storage) -->
+  <script>
+    window.NETCACHE = (function(){
+      const KEY   = 'thinvids_netcache_v1';
+      const LIMIT = 1800; // keep up to 30 minutes of per-second samples
+      function load(){
+        try{
+          const raw = localStorage.getItem(KEY);
+          const d = raw ? JSON.parse(raw) : null;
+          if (!d || !Array.isArray(d.labels) || typeof d.hosts !== 'object') return { labels: [], hosts: {} };
+          return d;
+        }catch{ return { labels: [], hosts: {} }; }
+      }
+      function save(c){ try{ localStorage.setItem(KEY, JSON.stringify(c)); }catch{} }
+      function push(ts, sampleByHost){
+        const c = load();
+        const last = c.labels[c.labels.length-1] || 0;
+        if (ts <= last) return c;
+        c.labels.push(ts);
+
+        const over = Math.max(0, c.labels.length - LIMIT);
+        if (over){
+          c.labels = c.labels.slice(over);
+          for (const h of Object.keys(c.hosts)){
+            c.hosts[h].rx = c.hosts[h].rx.slice(over);
+            c.hosts[h].tx = c.hosts[h].tx.slice(over);
+          }
+        }
+
+        const union = new Set([...Object.keys(c.hosts), ...Object.keys(sampleByHost||{})]);
+        for (const h of union){
+          if (!c.hosts[h]){
+            c.hosts[h] = { rx: Array(c.labels.length-1).fill(null), tx: Array(c.labels.length-1).fill(null) };
+          }
+          const s = sampleByHost[h];
+          c.hosts[h].rx.push(s ? s.rx : null);
+          c.hosts[h].tx.push(s ? s.tx : null);
+        }
+        save(c);
+        return c;
+      }
+      return { load, save, push, KEY, LIMIT };
+    })();
+  </script>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
