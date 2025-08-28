@@ -414,9 +414,7 @@ def list_jobs():
         elif sort_by == 'encode':
             return (encode, started, filename)
         else:  # 'date'
-            paused_bucket = 0 if started == 0 else 1
-            secondary = created if started == 0 else started
-            return (paused_bucket, secondary)
+            return max(started, created)
 
     jobs_sorted = sorted(jobs_list, key=sort_key, reverse=reverse)
 

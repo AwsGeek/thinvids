@@ -2,7 +2,7 @@
 import os, time, json, socket, subprocess, signal, re, shutil
 import psutil
 
-from common import get_redis, get_logging, get_settings
+from common import get_redis, get_logging, get_settings, all_jobs_are_idle, as_bool, as_int
 redis_client = get_redis()
 logger = get_logging("agent")
 
@@ -246,6 +246,7 @@ def _get_global_suspend_settings():
 
     return suspend_enabled, idle_sec, gc_before
 
+
 # ---------------- Main loop: unified metrics + heartbeat (1 Hz) ----------------
 def main():
     last_net = psutil.net_io_counters()
@@ -332,6 +333,7 @@ def main():
         # Consider idle if CPU and GPU are both below thresholds (GPU may be absent)
         gpu_idle = (gpu is None) or (gpu_val <= IDLE_GPU_PCT_MAX)
         is_idle  = (cpu <= IDLE_CPU_PCT_MAX) and gpu_idle
+        is_idle  = all_jobs_are_idle()
 
         now = time.time()
 
@@ -367,6 +369,9 @@ def main():
                 # On resume, reset timers
                 last_suspend_ts = time.time()
                 idle_since = None
+            else:
+                logger.info(f"Sleeping in {int(effective_idle_threshold - idle_dur)}s")
+
         else:
             idle_since = None
 

@@ -173,8 +173,10 @@ def as_int(x, default=0) -> int:
     try: return int(x)
     except: return default
 
-def get_settings(r: redis.Redis) -> Dict:
+def get_settings() -> Dict:
 
+    redis_client = get_redis()
+    
     now = time_now()
     # refresh at most every 10 seconds
     if now - cached_settings["ts"] >= CACHED_SETTINGS_TTL:
@@ -192,3 +194,36 @@ def get_settings(r: redis.Redis) -> Dict:
 
     return settings
 
+def all_jobs_are_idle() -> bool:
+
+    redis_client = get_redis()
+    
+    active = [Status.RUNNING, Status.WAITING, Status.STARTING]
+
+    # Pull indexed job keys; seed from keyspace if empty
+    keys = list(redis_client.smembers("jobs:all") or [])
+    if not keys:
+        keys = [k for k in redis_client.scan_iter("job:*", count=1000)]
+        if keys:
+            try:
+                redis_client.sadd("jobs:all", *keys)
+            except Exception:
+                pass
+    if not keys:
+        return False
+
+    # Batch HGET status for each job
+    pipe = redis_client.pipeline()
+    for k in keys:
+        pipe.hget(k, "status")
+    try:
+        statuses = pipe.execute()
+    except Exception:
+        # On error, be conservative
+        return False
+
+    for s in statuses:
+        if s in active:
+            return False
+
+    return True
