@@ -418,21 +418,7 @@ def list_jobs():
             secondary = created if started == 0 else started
             return (paused_bucket, secondary)
 
-    if sort_by == 'date':
-        jobs_sorted = sorted(
-            jobs_list,
-            key=lambda j: (0 if float(j.get('started') or 0) == 0 else 1,
-                           float(j.get('created') or 0) if float(j.get('started') or 0) == 0
-                           else float(j.get('started') or 0)),
-            reverse=False
-        )
-        paused = [j for j in jobs_sorted if float(j.get('started') or 0) == 0]
-        running = [j for j in jobs_sorted if float(j.get('started') or 0) != 0]
-        paused.sort(key=lambda j: float(j.get('created') or 0), reverse=reverse)
-        running.sort(key=lambda j: float(j.get('started') or 0), reverse=reverse)
-        jobs_sorted = paused + running
-    else:
-        jobs_sorted = sorted(jobs_list, key=sort_key, reverse=reverse)
+    jobs_sorted = sorted(jobs_list, key=sort_key, reverse=reverse)
 
     total = len(jobs_sorted)
     total_pages = max(1, ceil(total / page_size))
@@ -528,7 +514,7 @@ def get_video_details(job_id: str, file_path: str):
         if _is_english(a.get('language', '')):
             a_sel = i
             break
-            
+
     pv = video_streams[0] if video_streams else {}
     fps = float(pv.get('fps', 0) or 0)
     total_frames = int(pv.get('nb_frames') or 0)
@@ -766,6 +752,13 @@ def restart_job(job_id):
         'source_fps': '0',
         'source_file_size': 0,
         'total_frames': 0,
+        'elapsed': 0,
+        'segment_elapsed': 0,
+        'encode_elapsed': 0,
+        'combine_elapsed': 0,
+        'segment_progress': 0,
+        'encode_progress': 0,
+        'combine_progress': 0,
         'streams_json': job.get('streams_json')
 
     }

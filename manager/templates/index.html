@@ -2,6 +2,34 @@
 {% block title %}Trans the Vids!{% endblock %}
 {% block head_extra %}
   <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+  <style>
+    /* Single-line everywhere by default */
+    #job-table th, #job-table td { white-space: nowrap; vertical-align: middle; }
+
+    /* Fixed widths for progress columns (match w-28 / 7rem) */
+    #job-table col.progress-col { width: 7rem; }
+
+    /* Keep other, non-Name columns as tight as possible */
+    #job-table col.shrink { width: 1%; }
+
+    /* Name column: takes remaining space; inner element ellipsizes */
+    #job-table td.name-cell { width: auto; }
+    #job-table .name-clip { display: block; max-width: 100%; }
+    #job-table .name-text {
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: bottom;
+    }
+
+    /* Progress bar container uses full cell width (7rem via colgroup) */
+    .prog-wrap { width: 100%; }
+
+    /* Slightly denser rows */
+    #job-table th, #job-table td { padding-top: .25rem; padding-bottom: .25rem; }
+  </style>
 {% endblock %}
 
 {% block content %}
@@ -30,19 +58,34 @@
 <h2 class="text-xl font-semibold my-2">Current Jobs</h2>
 
 <table id="job-table" class="w-full border-collapse bg-white">
+  <!-- Column sizing: most are tiny; Name grows; progress fixed -->
+  <colgroup>
+    <col class="shrink"><!-- ID -->
+    <col><!-- Name (flex) -->
+    <col class="shrink"><!-- Size -->
+    <col class="shrink"><!-- Dim -->
+    <col class="shrink"><!-- Codec -->
+    <col class="shrink"><!-- Bitrate -->
+    <col class="progress-col"><!-- Split -->
+    <col class="progress-col"><!-- Encode -->
+    <col class="progress-col"><!-- Stitch -->
+    <col class="shrink"><!-- Started -->
+    <col class="shrink"><!-- Elapsed -->
+    <col class="shrink"><!-- Status -->
+    <col class="shrink"><!-- Actions -->
+  </colgroup>
+
   <thead>
-    <tr class="bg-gray-200">
+    <tr class="bg-gray-200 text-xs">
       <th class="px-2 py-1 text-left">ID</th>
       <th class="px-2 py-1 text-left">Name</th>
       <th class="px-2 py-1 text-left">Size</th>
-      <th class="px-2 py-1 text-left">Dim</th>
       <th class="px-2 py-1 text-left">Codec</th>
-      <th class="px-2 py-1 text-left">Bitrate (kbps)</th>
       <th class="px-2 py-1 text-center">Split</th>
       <th class="px-2 py-1 text-center">Encode</th>
       <th class="px-2 py-1 text-center">Stitch</th>
       <th class="px-2 py-1 text-left">Started</th>
-      <th class="px-2 py-1 text-left">Elapsed</th>
+      <th class="px-2 py-1 text-left">Time</th>
       <th class="px-2 py-1 text-left">Status</th>
       <th class="px-2 py-1 text-left">Actions</th>
     </tr>
@@ -157,7 +200,7 @@
   const safeOn = (id, evt, handler) => { const n = el(id); if (n) n.addEventListener(evt, handler); };
   const shortHost = h => { if (!h) return ''; const m = String(h).match(/(\d+)/); return m ? m[1] : h; };
   const tsStr = ts => new Date(ts * 1000).toLocaleTimeString();
-  const formatDateTime = ts => { if (!ts || isNaN(ts)) return ''; const d = new Date(ts * 1000); return d.toLocaleString(); };
+  const formatDateTime = ts => new Date(ts * 1000).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const formatBytes = b => { const n = Number(b); if (!n || n < 0) return '…'; const u=['B','KB','MB','GB','TB']; const i=Math.floor(Math.log(n)/Math.log(1024)); const v=n/Math.pow(1024,i); return `${v.toFixed(v>=10?0:1)} ${u[i]}`; };
   const formatKbps = v => { const n = parseFloat(v); if (!isFinite(n) || n<=0) return '…'; return Math.round(n).toLocaleString(); };
   const formatElapsed = secs => { const s = Number(secs||0); const m = Math.floor(s/60), r = Math.floor(s%60); return `${m}:${String(r).padStart(2,'0')}`; };
@@ -168,7 +211,7 @@
     if (s==='RUNNING') return 'text-green-600';
     if (s==='STOPPED') return 'text-orange-600';
     if (s==='FAILED') return 'text-red-600';
-    if (s==='DONE'||s==='COMPLETED') return 'text-black-600';
+    if (s==='DONE'||s==='COMPLETED') return 'text-blue-600';
     return 'text-gray-700';
   };
   function toast(message, ok=true) {
@@ -352,7 +395,7 @@
   function progressBar(percent, elapsed){
     const p = Number(percent||0);
     return `
-      <div class="relative w-full h-4 bg-gray-200 rounded">
+      <div class="relative prog-wrap h-4 bg-gray-200 rounded">
         <div class="absolute top-0 left-0 h-4 rounded bg-blue-500" style="width:${p}%"></div>
         <div class="absolute right-1 inset-0 text-right text-xs leading-4 font-medium text-black">${p}%</div>
         <div class="absolute left-1 inset-0 text-left text-xs leading-4 font-medium text-black">${formatElapsed(elapsed)}</div>
@@ -364,7 +407,7 @@
     const params = new URLSearchParams({
       page: String(CURRENT_PAGE),
       page_size: String(PAGE_SIZE),
-      sort_by: 'date',        // always date
+      sort_by: 'date',
       sort_dir: CURRENT_DIR
     });
     const response = await fetch(`/jobs?${params.toString()}`);
@@ -390,7 +433,7 @@
       const nameColor = statusColorClass(job.status||'');
 
       const canStart   = job.status === 'READY';
-      const canStop    = (job.status === 'STARTING' || job.status === 'RUNNING');
+      const canStop    = (job.status === 'STARTING' || job.status === 'WAITING' || job.status === 'RUNNING');
       const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'DONE');
 
       const vcrBtnHtml = canStart
@@ -402,13 +445,16 @@
                 : ''));
 
       const isDone = String(job.status||'').toUpperCase()==='DONE';
-      const nameCellHTML = isDone
-        ? `<button class="font-bold underline ${nameColor} hover:opacity-80 name-preview"
+      const nameInner = isDone
+        ? `<button class="name-text font-bold underline ${nameColor} hover:opacity-80 name-preview"
              title="Preview"
              data-title="${displayName.replace(/"/g,'&quot;')}"
              data-jobid="${job.job_id}"
              data-fps="${Number(job.source_fps||0)}">${displayName}</button>`
-        : `<span class="font-bold ${nameColor}">${displayName}</span>`;
+        : `<span class="name-text font-bold ${nameColor}">${displayName}</span>`;
+
+      const nameCellHTML =
+        `<div class="name-clip" title="${displayName.replace(/"/g,'&quot;')}">${nameInner}</div>`;
 
       const srcKbps = (() => {
         const kbpsStored = parseFloat(job.source_bitrate_kbps);
@@ -419,20 +465,16 @@
       })();
 
       row.innerHTML = `
-        <td class="px-2 py-1 whitespace-nowrap">${idShort}</td>
-        <td class="px-2 py-1">${nameCellHTML}</td>
+        <td class="px-2 py-1">${idShort}</td>
+        <td class="px-2 py-1 name-cell">${nameCellHTML}</td>
         <td class="px-2 py-1">${formatBytes(job.source_file_size)}</td>
-        <td class="px-2 py-1">${job.source_resolution || '…'}</td>
         <td class="px-2 py-1">${job.source_codec || '…'}</td>
-        <td class="px-2 py-1">${formatKbps(srcKbps)}</td>
-        <td class="px-2 py-1 text-center w-28">${progressBar(job.segment_progress||0, job.segment_elapsed||0)}</td>
-        <td class="px-2 py-1 text-center w-28">${progressBar(job.encode_progress||0, job.encode_elapsed||0)}</td>
-        <td class="px-2 py-1 text-center w-28">${progressBar(job.combine_progress||0, job.combine_elapsed||0)}</td>
-        <td class="px-2 py-1 whitespace-normal break-words">${formatDateTime(job.started)}</td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.segment_progress||0, job.segment_elapsed||0)}</div></td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.encode_progress||0, job.encode_elapsed||0)}</div></td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.combine_progress||0, job.combine_elapsed||0)}</div></td>
+        <td class="px-2 py-1">${formatDateTime(job.started)}</td>
         <td class="px-2 py-1">${formatElapsed(job.elapsed)}</td>
-        <td class="px-2 py-1">
-          <span class="font-medium ${nameColor}">${job.status || 'READY'}</span>
-        </td>
+        <td class="px-2 py-1"><span class="font-medium ${nameColor}">${job.status || 'READY'}</span></td>
         <td class="px-2 py-1">
           <div class="flex items-center justify-center gap-1">
             ${job.filename && job.filename !== 'undefined'
@@ -504,11 +546,11 @@
     const raw = data.streams;
     const streams = typeof raw === 'string' ? (JSON.parse(raw)||{video:[],audio:[]}) : (raw||{video:[],audio:[]});
     (streams.video||[]).forEach((v,idx)=>{
-      const label = [`#${idx}`, v.codec||'', (v.width&&v.height)?`${v.width}x${v.height}`:'', v.fps?`${Number(v.fps).toFixed(2)}fps`:'', v.title?`“${v.title}”`:'' ].filter(Boolean).join(' · ');
+      const label = [`#${idx}`, v.codec||'', (v.width&&v.height)?`${v.width}x${v.height}`:'', v.fps?`${Number(v.fps).toFixed(2)}fps`:'', v.title?`“${v.title}”`:''].filter(Boolean).join(' · ');
       const o = document.createElement('option'); o.value=String(idx); o.textContent=label; vSel.appendChild(o);
     });
     (streams.audio||[]).forEach((a,idx)=>{
-      const label = [`#${idx}`, a.codec||'', a.channel_layout||(a.channels?`${a.channels}ch`:''), a.language||'', a.title?`“${a.title}”`:'', a.disposition_default?'(default)':'' ].filter(Boolean).join(' · ');
+      const label = [`#${idx}`, a.codec||'', a.channel_layout||(a.channels?`${a.channels}ch`:''), a.language||'', a.title?`“${a.title}”`:'', a.disposition_default?'(default)':''].filter(Boolean).join(' · ');
       const o = document.createElement('option'); o.value=String(idx); o.textContent=label; aSel.appendChild(o);
     });
     const setSelectIndexByValue = (sel,val,fallback=0)=>{ if(!sel||!sel.options.length)return; let i=parseInt(val,10); if(Number.isNaN(i)) i=fallback; if(i<0||i>=sel.options.length) i=fallback; sel.selectedIndex=i; };
