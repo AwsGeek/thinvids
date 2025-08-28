@@ -33,6 +33,7 @@
       - python3-psutil
       - python3-redis
       - rsync
+      - ffmpeg
       - nfs-common
 
     # Python packages (in venv)

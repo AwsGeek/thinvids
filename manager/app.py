@@ -11,9 +11,10 @@ import socket
 import re
 import struct
 from typing import List
+import subprocess
 
 # import backend task planner
-from tasks import transcode_video, probe_source
+from tasks import transcode_video
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -447,6 +448,109 @@ def list_jobs():
         'items': items
     })
 
+
+def get_video_details(job_id: str, file_path: str):
+    job_key = f"job:{job_id}"
+
+    real_input = file_path
+    if not os.path.exists(real_input):
+        job = redis.hgetall(job_key) or {}
+        filename = job.get('filename') or ''
+        alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
+        if os.path.exists(alt):
+            real_input = alt
+
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
+        '-of', 'json', real_input
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
+
+    info = json.loads(res.stdout or '{}')
+    fmt = info.get('format', {}) or {}
+    streams = info.get('streams', []) or []
+
+    # format metrics
+    try: duration_s = float(fmt.get('duration', 0) or 0)
+    except Exception: duration_s = 0.0
+    size_b = int(fmt.get('size', 0) or 0)
+    try: fmt_bps = int(fmt.get('bit_rate', 0) or 0)
+    except Exception: fmt_bps = 0
+    kbps = (fmt_bps/1000.0) if fmt_bps>0 else (((size_b*8)/duration_s/1000.0) if (size_b and duration_s) else 0.0)
+
+    video_streams, audio_streams = [], []
+    for s in streams:
+        base = {
+            'index': int(s.get('index', 0)),
+            'codec': s.get('codec_name') or '',
+            'disposition_default': bool((s.get('disposition') or {}).get('default', 0)),
+            'title': ((s.get('tags') or {}).get('title') or ''),
+            'language': ((s.get('tags') or {}).get('language') or '')
+        }
+        if s.get('codec_type') == 'video':
+            afr = s.get('avg_frame_rate') or '0'
+            try:
+                fps = (float(afr.split('/')[0]) / float(afr.split('/')[1])) if '/' in afr else float(afr)
+            except Exception:
+                fps = 0.0
+            video_streams.append({**base,
+                'width': int(s.get('width') or 0),
+                'height': int(s.get('height') or 0),
+                'fps': fps,
+                'nb_frames': int(s.get('nb_frames', 0) or 0)
+            })
+        elif s.get('codec_type') == 'audio':
+            audio_streams.append({**base,
+                'channels': int(s.get('channels') or 0),
+                'channel_layout': s.get('channel_layout') or ''
+            })
+
+    # Default to the first video stream
+    v_sel = 0
+
+    def _is_english(lang: str) -> bool:
+        if not lang:
+            return False
+        L = lang.strip().lower()
+        return (
+            L == 'eng' or
+            L == 'en' or
+            L == 'english' or
+            L.startswith('en-')  # e.g., en-us, en-gb
+        )
+
+    a_sel = 0
+    # Prefer first English audio stream; fallback to 0
+    for i, a in enumerate(audio_streams):
+        if _is_english(a.get('language', '')):
+            a_sel = i
+            break
+            
+    pv = video_streams[0] if video_streams else {}
+    fps = float(pv.get('fps', 0) or 0)
+    total_frames = int(pv.get('nb_frames') or 0)
+    if total_frames == 0 and duration_s and fps:
+        total_frames = int(duration_s * fps)
+
+    mapping = {
+        'source_file_size': size_b,
+        'source_duration': f"{duration_s:.2f}" if duration_s else '0',
+        'source_codec': pv.get('codec',''),
+        'source_resolution': f"{pv.get('width',0)}x{pv.get('height',0)}" if pv else '',
+        'source_fps': f"{fps:.2f}" if fps else '0',
+        'streams_json': json.dumps({'video': video_streams, 'audio': audio_streams}),
+        'source_bitrate_kbps': f"{kbps:.0f}" if kbps>0 else '0',
+        'selected_v_stream': v_sel,
+        'selected_a_stream': a_sel,
+    }
+    if total_frames:
+        mapping['total_frames'] = total_frames
+
+    return mapping
+
 @app.post('/add_job')
 def add_job():
     data = request.get_json(silent=True) or {}
@@ -491,15 +595,14 @@ def add_job():
         'source_file_size': 0,
         'total_frames': 0
     }
-    redis_client.hset(job_key, mapping=job_settings)
-    # index the job for fast listing
-    try:
-        redis_client.sadd("jobs:all", job_key)
-    except Exception:
-        pass
-
     # Kick off async probe on a worker
-    probe_source(job_id, full_path)
+    video_details = get_video_details(job_id, full_path)
+    job_settings = {**job_settings, **video_details}
+
+    redis_client.hset(job_key, mapping=job_settings)
+
+    # index the job for fast listing
+    redis_client.sadd("jobs:all", job_key)
 
     if auto_start_effective:
         # Confirm STARTING + warm-up launch
@@ -573,13 +676,6 @@ def copy_job():
 
     logger.info(f"[{new_job_id}] Copied from {source_job_id} with filename={filename}, "
                 f"segment_duration={segment_duration}, number_parts={number_parts} (PAUSED)")
-
-    try:
-        full_path = os.path.join("/watch", filename.lstrip('/'))
-        probe_source(new_job_id, full_path)   # async
-        logger.info(f"[{new_job_id}] Launched probe_source (source had no streams_json)")
-    except Exception as e:
-        logger.warning(f"[{new_job_id}] probe_source dispatch failed: {e}")
 
     return jsonify({'status': 'success', 'job_id': new_job_id}), 201
 
@@ -670,6 +766,8 @@ def restart_job(job_id):
         'source_fps': '0',
         'source_file_size': 0,
         'total_frames': 0,
+        'streams_json': job.get('streams_json')
+
     }
 
     # Overwrite base hash in one go (no delete -> no set race)
@@ -680,13 +778,6 @@ def restart_job(job_id):
         redis_client.sadd("jobs:all", job_key)
     except Exception:
         pass
-
-    # Refresh metadata promptly (like add_job)
-    try:
-        full_path = os.path.join("/watch", filename.lstrip('/'))
-        probe_source(job_id, full_path)   # async
-    except Exception as e:
-        logger.warning(f"[{job_id}] probe_source dispatch failed: {e}")
 
     # Wake, wait for heartbeats, set hint, then launch
     _launch_after_warmup(job_key, job_id, filename)

@@ -143,14 +143,6 @@ def _ffprobe_stream0(input_path: str):
     except Exception:
         return {"codec":"","width":0,"height":0,"fps":0.0,"nb_frames":0,"size":0,"bit_rate":0}
 
-def _pick_stream_indices(job_key: str) -> Tuple[int, int]:
-    j = redis.hgetall(job_key) or {}
-    try: v = int(j.get("selected_v_stream", 0))
-    except Exception: v = 0
-    try: a = int(j.get("selected_a_stream", 0))
-    except Exception: a = 0
-    return max(0, v), max(0, a)
-
 def _part_paths(job_id: str, idx: int) -> Tuple[str, str]:
     base_dir  = os.path.join(PROJECT_ROOT, job_id)
     parts_dir = os.path.join(base_dir, "parts")
@@ -304,103 +296,6 @@ def _start_http_once():
         _HTTP_STARTED = True
 
 # -------------------- Tasks --------------------
-
-@huey.task()
-def probe_source(job_id: str, file_path: str):
-    """
-    One-shot ffprobe; stores source metadata + stream lists.
-    """
-    job_key = _job_key(job_id)
-    try:
-        real_input = file_path
-        if not os.path.exists(real_input):
-            job = redis.hgetall(job_key) or {}
-            filename = job.get('filename') or ''
-            alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
-            if os.path.exists(alt):
-                real_input = alt
-
-        cmd = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
-            '-of', 'json', real_input
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
-
-        info = json.loads(res.stdout or '{}')
-        fmt = info.get('format', {}) or {}
-        streams = info.get('streams', []) or []
-
-        # format metrics
-        try: duration_s = float(fmt.get('duration', 0) or 0)
-        except Exception: duration_s = 0.0
-        size_b = int(fmt.get('size', 0) or 0)
-        try: fmt_bps = int(fmt.get('bit_rate', 0) or 0)
-        except Exception: fmt_bps = 0
-        kbps = (fmt_bps/1000.0) if fmt_bps>0 else (((size_b*8)/duration_s/1000.0) if (size_b and duration_s) else 0.0)
-
-        video_streams, audio_streams = [], []
-        for s in streams:
-            base = {
-                'index': int(s.get('index', 0)),
-                'codec': s.get('codec_name') or '',
-                'disposition_default': bool((s.get('disposition') or {}).get('default', 0)),
-                'title': ((s.get('tags') or {}).get('title') or ''),
-                'language': ((s.get('tags') or {}).get('language') or '')
-            }
-            if s.get('codec_type') == 'video':
-                afr = s.get('avg_frame_rate') or '0'
-                try:
-                    fps = (float(afr.split('/')[0]) / float(afr.split('/')[1])) if '/' in afr else float(afr)
-                except Exception:
-                    fps = 0.0
-                video_streams.append({**base,
-                    'width': int(s.get('width') or 0),
-                    'height': int(s.get('height') or 0),
-                    'fps': fps,
-                    'nb_frames': int(s.get('nb_frames', 0) or 0)
-                })
-            elif s.get('codec_type') == 'audio':
-                audio_streams.append({**base,
-                    'channels': int(s.get('channels') or 0),
-                    'channel_layout': s.get('channel_layout') or ''
-                })
-
-        # select indices
-        v_sel, a_sel = _pick_stream_indices(job_key)
-        if not (0 <= v_sel < len(video_streams)): v_sel = 0
-        if not (0 <= a_sel < len(audio_streams)): a_sel = 0
-
-        pv = video_streams[0] if video_streams else {}
-        fps = float(pv.get('fps', 0) or 0)
-        total_frames = int(pv.get('nb_frames') or 0)
-        if total_frames == 0 and duration_s and fps:
-            total_frames = int(duration_s * fps)
-
-        mapping = {
-            'source_file_size': size_b,
-            'source_duration': f"{duration_s:.2f}" if duration_s else '0',
-            'source_codec': pv.get('codec',''),
-            'source_resolution': f"{pv.get('width',0)}x{pv.get('height',0)}" if pv else '',
-            'source_fps': f"{fps:.2f}" if fps else '0',
-            'streams_json': json.dumps({'video': video_streams, 'audio': audio_streams}),
-            'source_bitrate_kbps': f"{kbps:.0f}" if kbps>0 else '0',
-            'selected_v_stream': v_sel,
-            'selected_a_stream': a_sel,
-        }
-        if total_frames:
-            mapping['total_frames'] = total_frames
-        redis.hset(job_key, mapping=mapping)
-        logger.info(f"[{job_id}] Probe complete")
-        return {'status':'OK'}
-    except Exception as e:
-        logger.exception(f"[{job_id}] Probe error")
-        return {'status':'ERROR','error':str(e)}
-
-
-
 LOCK_NAME = "transcode-video-lock"
 
 @huey.task(retries=999999, retry_delay=5)        # keep retrying while another run holds the lock
@@ -476,8 +371,8 @@ def transcode_video(job_id: str, file_path: str):
         seg_t0 = _now()
         redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0})
 
-        # Which streams to carry
-        v_sel, a_sel = _pick_stream_indices(job_key)
+        v_sel = int(job.get("selected_v_stream", 0))
+        a_sel = int(job.get("selected_v_stream", 0))
         redis.hset(job_key, mapping={'selected_v_stream': v_sel, 'selected_a_stream': a_sel})
 
         # Prepare parts dir + naming
