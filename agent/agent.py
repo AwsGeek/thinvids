@@ -2,17 +2,9 @@
 import os, time, json, socket, subprocess, signal, re, shutil
 import psutil
 
-import redis
-from redis.retry import Retry
-from redis.backoff import ExponentialBackoff
-
-import logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s [agent] %(message)s"
-)
-log = logging.getLogger("agent")
+from common import get_redis, get_logging, get_settings
+redis_client = get_redis()
+logger = get_logging("agent")
 
 # ---------------- Env / Config ----------------
 REDIS_HOST = os.getenv("REDIS_HOST", "swarm3")  # central Redis host
@@ -39,13 +31,6 @@ KEY      = f"metrics:node:{HOSTNAME}"
 
 # Global settings key (controller-managed)
 GLOBAL_SETTINGS_KEY = "global:settings"
-
-redis_client = redis.Redis(
-    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True,
-    socket_keepalive=True, socket_timeout=5, socket_connect_timeout=5,
-    health_check_interval=30, retry_on_timeout=True,
-    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
-)
 
 # ---------------- GPU sampling helpers ----------------
 def _extract_video_busy(sample: dict):
@@ -229,7 +214,7 @@ def remove_stale_projects(base_dir: str):
     except FileNotFoundError:
         return
     except Exception as e:
-        log.warning("GC: listdir failed for %s: %s", base_dir, e)
+        logger.warning("GC: listdir failed for %s: %s", base_dir, e)
         return
 
     removed = 0
@@ -243,51 +228,21 @@ def remove_stale_projects(base_dir: str):
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
         except Exception as e:
-            log.warning("GC: failed to remove %s: %s", path, e)
+            logger.warning("GC: failed to remove %s: %s", path, e)
 
     if removed:
-        log.info("GC: removed %d GUID project dirs under %s", removed, base_dir)
-
-# ---------------- Global settings fetch (with light caching) ----------------
-_last_settings = {"ts": 0, "data": {}}
+        logger.info("GC: removed %d GUID project dirs under %s", removed, base_dir)
 
 def _get_global_suspend_settings():
-    """
-    Reads controller-managed settings from Redis and returns a tuple:
-      (suspend_enabled: bool, suspend_idle_sec: int, gc_before_suspend: bool)
 
-    Falls back to local env defaults if settings are missing.
-    """
-    now = time.time()
-    # refresh at most every 10 seconds
-    if now - _last_settings["ts"] >= 10:
-        try:
-            data = redis_client.hgetall(GLOBAL_SETTINGS_KEY) or {}
-        except Exception as e:
-            log.debug("Failed to fetch global settings: %s", e)
-            data = {}
-        _last_settings["data"] = data
-        _last_settings["ts"] = now
-    else:
-        data = _last_settings["data"]
-
-    def as_bool(x, default=False):
-        if x is None: return default
-        s = str(x).strip().lower()
-        return s in ("1", "true", "yes", "on", "y", "t")
-
-    def as_int(x, default=0):
-        try: return int(x)
-        except: return default
-
-    log.info(f"{data}")
+    settings = get_settings()
     
     # merge with local defaults
-    suspend_enabled = SUSPEND_ENABLED and as_bool(data.get("suspend_enabled"), True)
-    idle_sec = as_int(data.get("suspend_idle_sec"), SUSPEND_AFTER_IDLE_SEC)
+    suspend_enabled = SUSPEND_ENABLED and as_bool(settings.get("suspend_enabled"), True)
+    idle_sec = as_int(settings.get("suspend_idle_sec"), SUSPEND_AFTER_IDLE_SEC)
     if idle_sec <= 0:
         idle_sec = SUSPEND_AFTER_IDLE_SEC
-    gc_before = as_bool(data.get("suspend_gc_enabled"), False)
+    gc_before = as_bool(settings.get("suspend_gc_enabled"), False)
 
     return suspend_enabled, idle_sec, gc_before
 
@@ -319,9 +274,9 @@ def main():
         if node_mac and time.time() >= next_mac_publish:
             try:
                 redis_client.hset("nodes:mac", HOSTNAME, node_mac)
-                log.debug("Updated nodes:mac mapping: %s -> %s", HOSTNAME, node_mac)
+                logger.debug("Updated nodes:mac mapping: %s -> %s", HOSTNAME, node_mac)
             except Exception as e:
-                log.warning("Failed to publish nodes:mac mapping: %s", e)
+                logger.warning("Failed to publish nodes:mac mapping: %s", e)
             next_mac_publish = time.time() + 3600  # refresh hourly
 
         # ---- Collect metrics (acts as heartbeat too) ----
@@ -364,7 +319,7 @@ def main():
             redis_client.hset(KEY, mapping=payload)
             redis_client.expire(KEY, TTL_SEC)
         except Exception as e:
-            log.warning("Failed to publish metrics: %s", e)
+            logger.warning("Failed to publish metrics: %s", e)
 
         # ---- Idle detection & suspend (controller-gated) ----
         # Pull global flags (with small cache)
@@ -394,7 +349,7 @@ def main():
                 if g_gc_enabled:
                     remove_stale_projects(GC_BASE_DIR)
 
-                log.info(
+                logger.info(
                     "Idle for %ds (cpu=%.1f%%, gpu=%.1f%%), threshold=%ds, suspend_enabled=%s -> suspending",
                     int(idle_dur), cpu, (gpu_val if gpu is not None else -1), effective_idle_threshold,
                     effective_suspend_enabled
@@ -408,7 +363,7 @@ def main():
                 try:
                     subprocess.run(["systemctl", "suspend"], check=False)
                 except Exception as e:
-                    log.warning("Suspend command failed: %s", e)
+                    logger.warning("Suspend command failed: %s", e)
                 # On resume, reset timers
                 last_suspend_ts = time.time()
                 idle_since = None

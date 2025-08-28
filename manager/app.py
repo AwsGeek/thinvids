@@ -1,5 +1,4 @@
 from flask import Flask, render_template, render_template_string, request, jsonify, abort, send_file
-from huey import RedisHuey
 import uuid
 import time
 import os
@@ -13,52 +12,16 @@ import re
 import struct
 from typing import List
 
-import redis
-from redis.retry import Retry
-from redis.backoff import ExponentialBackoff
-
 # import backend task planner
 from tasks import transcode_video, probe_source
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 
-# NOTE: container/service hostnames; adjust if needed
-huey = RedisHuey(
-    'tasks',
-    host='redis',
-    port=6379,
-    db=0,
-    # Huey/redis-py connection hardening:
-    blocking=True,
-    read_timeout=15,                 # block-pop read
-    socket_timeout=5,                # per-op timeout
-    socket_connect_timeout=5,        # connect timeout
-    socket_keepalive=True,           # keep sockets alive through NAT/overlay resets
-    health_check_interval=30,        # auto PING on idle sockets
-    retry_on_timeout=True,           # retry timeouts
-    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),  # 1s,2s,4s... capped
-)
-
-redis_client = redis.Redis(
-    host='redis',
-    port=6379,
-    db=1,
-    decode_responses=True,
-    socket_keepalive=True,
-    socket_timeout=5,
-    socket_connect_timeout=5,
-    health_check_interval=30,
-    retry_on_timeout=True,
-    retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
-)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-from common import (
-    STATUS_READY, STATUS_STARTING, STATUS_WAITING, STATUS_RUNNING, STATUS_STOPPED, STATUS_FAILED, STATUS_DONE
-)
+from common import Status, get_huey, get_redis, get_logging
+huey = get_huey()
+redis_client = get_redis()
+logger = get_logging("manager")
 
 # ------------------------ Node discovery (fast path) ------------------------
 
@@ -174,12 +137,12 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
         })
 
         # Kick the pipeline
-        redis_client.hset(job_key, mapping={'status': STATUS_WAITING, 'waiting_at': time.time()})
+        redis_client.hset(job_key, mapping={'status': Status.WAITING.value, 'waiting_at': time.time()})
         transcode_video(job_id, f'/watch/{filename}')
     except Exception as e:
         logger.exception("[%s] launch_after_warmup failed", job_id)
         try:
-            redis_client.hset(job_key, mapping={'status': STATUS_FAILED, 'error': str(e)})
+            redis_client.hset(job_key, mapping={'status': Status.FAILED.value, 'error': str(e)})
         except Exception:
             pass
 
@@ -507,11 +470,11 @@ def add_job():
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
 
-    status = STATUS_STARTING if auto_start_effective else STATUS_READY
+    status = Status.STARTING if auto_start_effective else Status.READY
     job_settings = {
         'job_id': job_id,
         'filename': filename,
-        'status': status,
+        'status': status.value,
         'created_at': now,
         'started_at': now if auto_start_effective else '0',
         'total_chunks': 0,
@@ -540,7 +503,7 @@ def add_job():
 
     if auto_start_effective:
         # Confirm STARTING + warm-up launch
-        redis_client.hset(job_key, mapping={'status': STATUS_STARTING, 'started_at': now})
+        redis_client.hset(job_key, mapping={'status': Status.STARTING.value, 'started_at': now})
         _launch_after_warmup(job_key, job_id, filename)
 
     return jsonify({'status': 'success', 'job_id': job_id}), 201
@@ -587,7 +550,7 @@ def copy_job():
     new_job = {
         'job_id': new_job_id,
         'filename': filename,
-        'status': STATUS_READY,
+        'status': Status.READY.value,
         'created_at': str(now),
         'started_at': '0',
         'segment_duration': segment_duration,
@@ -597,7 +560,8 @@ def copy_job():
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
         'completed_chunks': 0,
-        'stitched_chunks': 0
+        'stitched_chunks': 0,
+        'streams_json': src.get('streams_json')
     }
     new_key = f"job:{new_job_id}"
     redis_client.hset(new_key, mapping=new_job)
@@ -626,7 +590,7 @@ def start_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if job.get('status') != STATUS_READY:
+    if Status.parse(job.get('status')) != Status.READY:
         return jsonify({'status': 'invalid', 'message': 'Job is not in READY state'}), 400
 
     filename = job.get('filename')
@@ -634,7 +598,7 @@ def start_job(job_id):
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
     now = str(time.time())
-    redis_client.hset(job_key, mapping={'status': STATUS_STARTING, 'started_at': now})
+    redis_client.hset(job_key, mapping={'status': Status.STARTING.value, 'started_at': now})
 
     # Wake, wait for heartbeats, set hint, then launch
     _launch_after_warmup(job_key, job_id, filename)
@@ -647,7 +611,7 @@ def restart_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if job.get('status') not in [STATUS_STOPPED, STATUS_FAILED, STATUS_DONE]:
+    if Status.parse(job.get('status')) not in [Status.STOPPED, Status.FAILED, Status.DONE]:
         return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/DONE state.'}), 400
 
     filename = job.get('filename')
@@ -688,7 +652,7 @@ def restart_job(job_id):
     new_fields = {
         'job_id': job_id,
         'filename': filename,
-        'status': STATUS_STARTING,
+        'status': Status.STARTING.value,
         'created_at': str(now),      # treat as a new run for sorting
         'started_at': str(now),
         'segment_duration': segment_duration,
@@ -739,7 +703,7 @@ def stop_job(job_id):
     if not redis_client.exists(job_key):
         return jsonify({'status': 'not found'}), 404
 
-    redis_client.hset(job_key, 'status', STATUS_STOPPED)
+    redis_client.hset(job_key, 'status', Status.STOPPED.value)
     huey.revoke_by_id(job_id)
     return jsonify({'status': 'stopped'}), 200
 
