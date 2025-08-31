@@ -364,7 +364,15 @@ def list_jobs():
             ended   = float(job_data.get('ended_at', '0') or 0)
             created = float(job_data.get('created_at', '0') or 0)
             nowf    = time.time()
-            elapsed = int((ended if ended > 0 else nowf) - started) if started > 0 else 0
+            elapsed = 0
+
+            status =  Status.parse(job_data.get('status'))
+            if status in [Status.RUNNING, Status.WAITING, Status.STARTING]:
+                elapsed = nowf - started
+            elif ended:
+                elapsed = ended - started
+            
+
 
             jobs.append({
                 'job_id': job_id,
@@ -733,8 +741,8 @@ def restart_job(job_id):
         'job_id': job_id,
         'filename': filename,
         'status': Status.STARTING.value,
-        'created_at': str(now),      # treat as a new run for sorting
         'started_at': str(now),
+        'ended_at': 0,
         'segment_duration': segment_duration,
         'number_parts': number_parts,
         'serialize_pipeline': '1' if str(serialize_val) in ('1', 'true', 'True') else '0',
@@ -743,20 +751,16 @@ def restart_job(job_id):
         'total_chunks': 0,
         'completed_chunks': 0,
         'stitched_chunks': 0,
-        # Optional: clear/source fields so probe/worker can repopulate
-        'source_codec': '',
-        'source_resolution': '',
-        'source_duration': '0',
-        'source_fps': '0',
-        'source_file_size': 0,
-        'total_frames': 0,
-        'elapsed': 0,
+        'segment_started': 0,
         'segment_elapsed': 0,
-        'encode_elapsed': 0,
-        'combine_elapsed': 0,
         'segment_progress': 0,
+        'encode_started': 0,
+        'encode_elapsed': 0,
         'encode_progress': 0,
+        'combine_started': 0,
+        'combine_elapsed': 0,
         'combine_progress': 0,
+        'elapsed': 0,
         'streams_json': job.get('streams_json')
 
     }

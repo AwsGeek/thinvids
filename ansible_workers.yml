@@ -40,7 +40,7 @@
       - ethtool
 
     # Python packages (in venv)
-    pip_packages: [huey, redis, requests, psutil]
+    pip_packages: [huey, redis, requests]
 
     # NFS settings (mirror your compose config)
     nfs_server: 192.168.0.5
@@ -60,21 +60,6 @@
         name: "{{ base_packages }}"
         state: present
 
-    # Ensure polkit is present (pkg name differs by distro)
-    - name: Install polkit
-      ansible.builtin.package:
-        name: "{{ 'policykit-1' if ansible_facts.os_family == 'Debian' else 'polkit' }}"
-        state: present
-
-    # Create the rules directory if the package didn’t create it
-    - name: Ensure polkit rules directory exists
-      ansible.builtin.file:
-        path: /etc/polkit-1/rules.d
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
     - name: Ensure thinman group
       ansible.builtin.group:
         name: "{{ thinman_group }}"
@@ -93,22 +78,6 @@
         append: yes
         shell: /bin/bash
         create_home: yes
-
-    - name: Allow Thinman user to suspend via polkit
-      ansible.builtin.copy:
-        dest: /etc/polkit-1/rules.d/60-thinman-suspend.rules
-        mode: "0644"
-        content: |
-          polkit.addRule(function(action, subject) {
-            if (subject.isInGroup("{{ thinman_group }}") && (
-                action.id == "org.freedesktop.login1.suspend" ||
-                action.id == "org.freedesktop.login1.suspend-multiple-sessions"
-            )) {
-              return polkit.Result.YES;
-            }
-          });
-      notify: restart polkit
-
 
     # --- Directories (mountpoints + app dir) ---
     - name: Create application directory
@@ -178,9 +147,9 @@
       ansible.builtin.copy:
         src: "{{ code_src }}/agent/agent.py"
         dest: "{{ app_root }}/current/agent.py"
-        owner: "{{ thinman_user }}"
-        group: "{{ thinman_group }}"
-        mode: "0644"
+        owner: root
+        group: root
+        mode: "0755"
       notify: restart thinman-agent
       tags: build_app # Add a tag here
 
@@ -196,8 +165,7 @@
         - restart thinman-agent
       tags: build_app # Add a tag here
 
-    # --- Services (Require NFS mounts before starting) ---
-    - name: thinman-agent.service
+    - name: thinman-agent.service (root using worker venv)
       ansible.builtin.copy:
         dest: /etc/systemd/system/thinman-agent.service
         mode: "0644"
@@ -209,21 +177,24 @@
 
           [Service]
           Type=simple
-          User={{ thinman_user }}
-          Group={{ thinman_group }}
-          SupplementaryGroups=video render
+          User=root
+          Group=root
           WorkingDirectory={{ app_root }}/current
           Restart=always
           RestartSec=2
           SyslogIdentifier=thinman-agent
+
+          # So agent/common.py in {{ app_root }}/current is importable
+          Environment=PYTHONPATH={{ app_root }}/current:{{ app_root }}/current
+
+          # App settings
           Environment=REDIS_HOST={{ redis_host }}
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB={{ redis_db_data }}
           Environment=TTL_SEC={{ ttl_sec }}
           Environment=NODE_NAME=%H
-          # make sure Python can see your app folder (common.py, agent.py, etc.)
-          Environment=PYTHONPATH={{ app_root }}/current:{{ app_root }}/current
-          # run with the venv interpreter where huey/redis/requests are installed
+
+          # Use the SAME venv as the worker
           ExecStart={{ app_root }}/venv/bin/python agent.py
 
           [Install]
@@ -362,6 +333,15 @@
               ;;
           esac
 
+    - name: Remove agent capability drop-in (no longer needed as root)
+      ansible.builtin.file:
+        path: /etc/systemd/system/thinman-agent.service.d/capabilities.conf
+        state: absent
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        
   handlers:
     - name: systemd daemon-reload
       ansible.builtin.systemd:
@@ -380,9 +360,4 @@
     - name: restart networking
       ansible.builtin.service:
         name: networking
-        state: restarted
-
-    - name: restart polkit
-      ansible.builtin.systemd:
-        name: polkit
         state: restarted

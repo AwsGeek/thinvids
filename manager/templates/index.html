@@ -392,13 +392,13 @@
   }
 
   // ---- jobs table ----
-  function progressBar(percent, elapsed){
+  function progressBar(elapsed, percent){
     const p = Number(percent||0);
     return `
       <div class="relative prog-wrap h-4 bg-gray-200 rounded">
         <div class="absolute top-0 left-0 h-4 rounded bg-blue-500" style="width:${p}%"></div>
-        <div class="absolute right-1 inset-0 text-right text-xs leading-4 font-medium text-black">${p}%</div>
         <div class="absolute left-1 inset-0 text-left text-xs leading-4 font-medium text-black">${formatElapsed(elapsed)}</div>
+        <div class="absolute right-1 inset-0 text-right text-xs leading-4 font-medium text-black">${p}%</div>
       </div>`;
   }
 
@@ -469,9 +469,9 @@
         <td class="px-2 py-1 name-cell">${nameCellHTML}</td>
         <td class="px-2 py-1">${formatBytes(job.source_file_size)}</td>
         <td class="px-2 py-1">${job.source_codec || '…'}</td>
-        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.segment_progress||0, job.segment_elapsed||0)}</div></td>
-        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.encode_progress||0, job.encode_elapsed||0)}</div></td>
-        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.combine_progress||0, job.combine_elapsed||0)}</div></td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.segment_elapsed||0, job.segment_progress||0)}</div></td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.encode_elapsed ||0, job.encode_progress ||0)}</div></td>
+        <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.combine_elapsed||0, job.combine_progress||0)}</div></td>
         <td class="px-2 py-1">${formatDateTime(job.started)}</td>
         <td class="px-2 py-1">${formatElapsed(job.elapsed)}</td>
         <td class="px-2 py-1"><span class="font-medium ${nameColor}">${job.status || 'READY'}</span></td>
@@ -608,7 +608,43 @@
     player.pause(); player.currentTime = Math.max(0, player.currentTime + delta*step);
   }
 
+  // --- modal helpers: close when clicking outside or pressing Escape ---
+  function attachOutsideToClose(modalId, onClose){
+    const overlay = document.getElementById(modalId);
+    if (!overlay) return;
+    // Close when clicking the dimmed backdrop (overlay itself)
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) onClose();
+    });
+  }
+
+  // Existing close helpers (already in your file)
+  function closeModal(id){ document.getElementById(id)?.classList.add('hidden'); }
+  function closeVideoModal(){
+    const modal = document.getElementById('video-modal');
+    const player = document.getElementById('video-player');
+    player.pause(); player.removeAttribute('src'); player.load();
+    modal.classList.add('hidden'); modal.classList.remove('flex');
+  }  
+  
   window.addEventListener('DOMContentLoaded', ()=>{
+
+    // Close by clicking outside the modal content
+    attachOutsideToClose('properties-modal', () => closeModal('properties-modal'));
+    attachOutsideToClose('job-settings-modal', () => closeModal('job-settings-modal'));
+    attachOutsideToClose('video-modal', closeVideoModal);
+
+    // Close any open modal with Escape
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const propsOpen = !document.getElementById('properties-modal')?.classList.contains('hidden');
+      const jobOpen   = !document.getElementById('job-settings-modal')?.classList.contains('hidden');
+      const vidOpen   = !document.getElementById('video-modal')?.classList.contains('hidden');
+      if (propsOpen) closeModal('properties-modal');
+      if (jobOpen)   closeModal('job-settings-modal');
+      if (vidOpen)   closeVideoModal();
+    });
+    
     safeOn('btn-back-frame','click',()=>stepFrame(-1));
     safeOn('btn-fwd-frame','click', ()=>stepFrame(1));
 
@@ -630,5 +666,8 @@
     setInterval(fetchMetrics, 1000);
     setInterval(fetchAndUpdateMiniNet, 1000);
   });
+
+
+
 </script>
 {% endblock %}

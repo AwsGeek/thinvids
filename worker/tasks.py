@@ -311,7 +311,7 @@ def transcode_video(job_id: str, file_path: str):
     job_key = _job_key(job_id)
     job = redis.hgetall(job_key)
 
-    logger.info(f"VTT [{job_id}] Starting transcode job")
+    logger.info(f"[{job_id}] Starting transcode job")
 
     try:
         _start_http_once()  # HTTP server for parts
@@ -371,9 +371,11 @@ def transcode_video(job_id: str, file_path: str):
         seg_t0 = _now()
         redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0})
 
-        v_sel = int(job.get("selected_v_stream", 0))
-        a_sel = int(job.get("selected_v_stream", 0))
-        redis.hset(job_key, mapping={'selected_v_stream': v_sel, 'selected_a_stream': a_sel})
+        logger.info(f"[{job_id}] {job}")
+        v_sel = int(job.get("selected_v_stream"))
+        a_sel = int(job.get("selected_a_stream"))
+        logger.info(f"[{job_id}] Video stream: {v_sel}")
+        logger.info(f"[{job_id}] Audio stream: {a_sel}")
 
         # Prepare parts dir + naming
         parts_dir = os.path.join(PROJECT_ROOT, job_id, "parts")
@@ -465,7 +467,7 @@ def transcode_video(job_id: str, file_path: str):
                         pass
 
                     if not _is_job_halted(job_id):
-                        logger.info(f"VTT [{job_id}] Split part {part_idx}")
+                        logger.info(f"[{job_id}] Split part {part_idx}")
                         encode_part(job_id, part_idx, master_url, v_sel, a_sel)
 
                 previous_chunk_path = chunk_path
@@ -491,7 +493,7 @@ def transcode_video(job_id: str, file_path: str):
                 return {'status': 'FAILED', 'reason': f'move part {part_idx} failed'}
 
             if not _is_job_halted(job_id):
-                logger.info(f"VTT [{job_id}] Split last part {part_idx}")
+                logger.info(f"[{job_id}] Split last part {part_idx}")
                 encode_part(job_id, part_idx, master_url, v_sel, a_sel)
                 total_chunks = part_idx
 
@@ -574,7 +576,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                         try: os.remove(in_path)
                         except Exception: pass
                         return {'status': 'ABORTED'}
-        logger.info(f"VTT [{job_id}] Downloaded part {idx}")
+        logger.info(f"[{job_id}] Downloaded part {idx}")
 
         # Encode (monitor only for halt; do NOT update encode_progress here)
         cmd = [
@@ -596,12 +598,10 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             logger.warning(f"[{job_id}] encode_part {idx}: halted before encoding part")
             return {'status': 'ABORTED'}
 
-        # mark encode_started once
-        encode_started_now = _now()
-        try:
-            redis.hsetnx(job_key, 'encode_started', encode_started_now)
-        except Exception:
-            pass
+        encode_started = int(redis.hget(job_key, 'encode_started') or 0)
+        if encode_started == 0:
+            encode_started = int(_now())
+            redis.hset(job_key, 'encode_started', encode_started)
 
         pr = subprocess.Popen(
             cmd,
@@ -638,7 +638,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             logger.error(f"[{job_id}] encode_part {idx} failed (rc={rc})")
             raise subprocess.CalledProcessError(rc, cmd)
 
-        logger.info(f"VTT [{job_id}] Encoded part {idx}")
+        logger.info(f"[{job_id}] Encoded part {idx}")
 
         # Upload result to stitcher
         put_url = f"{stitch_host.rstrip('/')}/job/{job_id}/result/{idx}"
@@ -656,7 +656,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             if r.status_code // 100 != 2:
                 raise RuntimeError(f"PUT failed {r.status_code}: {r.text[:300]}")
 
-        logger.info(f"VTT [{job_id}] Uploaded part {idx}")
+        logger.info(f"[{job_id}] Uploaded part {idx}")
 
         # Cleanup local tmpfs
         for p in (in_path, out_path):
@@ -674,12 +674,8 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                 pipe.execute()
 
             # encode_elapsed (compute once based on first encode_started)
-            try:
-                enc_start = float(redis.hget(job_key, 'encode_started') or encode_started_now)
-            except Exception:
-                enc_start = encode_started_now
-            elapsed = round(_now() - enc_start, 2)
-            redis.hset(job_key, 'encode_elapsed', elapsed)
+            encode_elapsed = int(_now() - encode_started)
+            redis.hset(job_key, 'encode_elapsed', encode_elapsed)
 
             # encode_progress = int(parts_done / parts_total * 100)
             try:
