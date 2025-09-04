@@ -252,6 +252,8 @@ def metrics_snapshot():
     _metrics_cache = (now, payload)
     return jsonify(payload)
 
+GLOBAL_SETTINGS_KEY = "global:settings"
+
 @app.get("/settings")
 def get_settings():
     return _get_settings()
@@ -552,6 +554,7 @@ def add_job():
         'segment_duration': segment_duration,
         'number_parts': number_parts,
         'serialize_pipeline': '1' if serialize_global else '0',
+        'software_encode': '0',  # per-job default: disabled
         # placeholders (worker fills in)
         'source_codec': '',
         'source_resolution': '',
@@ -609,6 +612,7 @@ def copy_job():
         2
     )
     serialize_src = src.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
+    frame_src = src.get('software_encode', '0')
 
     new_job_id = str(uuid.uuid4())
     now = time.time()
@@ -624,6 +628,7 @@ def copy_job():
         'segment_duration': segment_duration,
         'number_parts': number_parts,
         'serialize_pipeline': '1' if str(serialize_src) in ('1','true','True') else '0',
+        'software_encode': '1' if str(frame_src) in ('1','true','True') else '0',
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -706,6 +711,7 @@ def restart_job(job_id):
     segment_duration = _int(job.get('segment_duration', globals_map.get('segment_duration', 10)), 10)
     number_parts     = _int(job.get('number_parts',     globals_map.get('number_parts', 2)), 2)
     serialize_val    = job.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
+    frame_val        = job.get('software_encode', '0')
     selected_v_stream= job.get('selected_v_stream', 0)
     selected_a_stream= job.get('selected_a_stream', 0)
 
@@ -719,6 +725,7 @@ def restart_job(job_id):
         'segment_duration': segment_duration,
         'number_parts': number_parts,
         'serialize_pipeline': '1' if str(serialize_val) in ('1', 'true', 'True') else '0',
+        'software_encode': '1' if str(frame_val) in ('1', 'true', 'True') else '0',
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -839,6 +846,7 @@ def job_settings(job_id):
             'segment_duration': int(job.get('segment_duration', '10')),
             'number_parts': int(job.get('number_parts', '2')),
             'serialize_pipeline': job.get('serialize_pipeline', '0'),
+            'software_encode': job.get('software_encode', '0'),
             'streams': streams_json,
             'selected_v_stream': job.get('selected_v_stream', '0'),
             'selected_a_stream': job.get('selected_a_stream', '0'),
@@ -855,6 +863,8 @@ def job_settings(job_id):
         parts = int(data.get('number_parts', job.get('number_parts', 2)))
         serialize_pipeline = bool(data.get('serialize_pipeline',
                                    job.get('serialize_pipeline', '0') in ('1','true','True')))
+        software_encode = bool(data.get('software_encode',
+                              job.get('software_encode', '0') in ('1','true','True')))
         v_sel = data.get('selected_v_stream', job.get('selected_v_stream', 0))
         a_sel = data.get('selected_a_stream', job.get('selected_a_stream', 0))
 
@@ -867,6 +877,7 @@ def job_settings(job_id):
             'selected_v_stream': v_sel,
             'selected_a_stream': a_sel,
             'serialize_pipeline': '1' if serialize_pipeline else '0',
+            'software_encode': '1' if software_encode else '0',
         }
         redis_client.hset(job_key, mapping=mapping)
 

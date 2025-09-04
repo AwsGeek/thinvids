@@ -38,6 +38,7 @@
       - intel-gpu-tools
       - nfs-common
       - ethtool
+      - fonts-dejavu-core
 
     # Python packages (in venv)
     pip_packages: [huey, redis, requests]

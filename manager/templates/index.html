@@ -155,6 +155,11 @@
         <input id="job-serialize-pipeline" type="checkbox" class="h-4 w-4">
         <label for="job-serialize-pipeline" class="text-sm">Serialize pipeline for this job</label>
       </div>
+      <!-- Frame stamps setting -->
+      <div class="flex items-center gap-2">
+        <input id="job-software-encode" type="checkbox" class="h-4 w-4">
+        <label for="job-software-encode" class="text-sm">Software encode (slow)</label>
+      </div>
       <div class="flex gap-2 pt-2">
         <button id="save-job-settings-btn" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 hidden">Save</button>
         <button id="start-job-btn" class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 hidden">Start Job</button>
@@ -559,6 +564,14 @@
     el('settings-segment-duration').disabled = !editable;
     el('settings-number-parts').disabled = !editable;
     vSel.disabled = !editable; aSel.disabled = !editable;
+    // frame stamps setting
+    const fsBox = el('job-software-encode');
+    fsBox.checked = String(data.software_encode||'0') === '1';
+    fsBox.disabled = !editable;
+    // serialize pipeline
+    el('job-serialize-pipeline').checked = (String(data.serialize_pipeline||'0') === '1');
+    el('job-serialize-pipeline').disabled = !editable;
+
     el('save-job-settings-btn').classList.toggle('hidden', !editable);
     el('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase()==='READY'));
     el('job-settings-help').innerHTML = editable
@@ -576,9 +589,10 @@
     const selected_v_stream= el('settings-v-stream').selectedIndex;
     const selected_a_stream= el('settings-a-stream').selectedIndex;
     const serialize_pipeline = el('job-serialize-pipeline').checked;
+    const software_encode = el('job-software-encode').checked;
     const res = await fetch(`/job_settings/${job_id}`,{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ segment_duration, number_parts, selected_v_stream, selected_a_stream, serialize_pipeline })
+      body: JSON.stringify({ segment_duration, number_parts, selected_v_stream, selected_a_stream, serialize_pipeline, software_encode })
     });
     if (res.ok){ closeModal('job-settings-modal'); fetchJobs(); }
     else { alert((await res.text())||'Failed to save settings'); }

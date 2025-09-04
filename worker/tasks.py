@@ -93,7 +93,12 @@ def _active_nodes() -> List[str]:
     return actives
 
 def _bsf_for_codec(codec: str) -> str:
-    return 'hevc_mp4toannexb' if codec == 'hevc' else 'h264_mp4toannexb'
+    if codec == 'hevc':
+        return 'hevc_mp4toannexb' 
+    elif codec == 'av1':
+        return ""
+    else:
+        return 'h264_mp4toannexb'
 
 def _ffprobe_duration(input_path: str) -> float:
     try:
@@ -383,7 +388,7 @@ def transcode_video(job_id: str, file_path: str):
         temp_pattern = os.path.join(parts_dir, "chunk_%03d.ts")
 
         # Segment duration target from P (fallback 10s if unknown)
-        segment_duration = max(1.0, float(duration) / float(P)) if (duration and P) else 10.0
+        segment_duration = int(max(1.0, float(duration) / float(P)) if (duration and P) else 10.0)
         bsf = _bsf_for_codec(codec)
 
         cmd = [
@@ -399,7 +404,6 @@ def transcode_video(job_id: str, file_path: str):
             '-bsf:v', bsf,
             '-f', 'segment',
             '-segment_time', f"{segment_duration:.6f}",
-            '-force_key_frames', f"expr:gte(t,n_forced*{segment_duration:.6f})",
             '-reset_timestamps', '1',
             temp_pattern
         ]
@@ -578,20 +582,34 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                         return {'status': 'ABORTED'}
         logger.info(f"[{job_id}] Downloaded part {idx}")
 
-        # Encode (monitor only for halt; do NOT update encode_progress here)
-        cmd = [
-            'ffmpeg','-hide_banner','-nostats','-loglevel','error',
-            '-progress','pipe:2',                # progress to stderr; we just watch for halts
-            '-vaapi_device', VAAPI_DEVICE,
-            '-i', in_path,
-            '-map','0:v:0',
-            '-vf', SCALE_FILTER,
-            '-c:v','h264_vaapi',
-            '-rc_mode', VAAPI_RC_MODE,
-            '-qp', VAAPI_QP,
-            '-map','0:a?', *AUDIO_ARGS.split(),
-            out_path
-        ]
+
+        software_encode = int(redis.hget(job_key, 'software_encode') or 0)
+        if software_encode:
+            cmd = [
+                'ffmpeg','-hide_banner','-nostats','-loglevel','error',
+                '-progress','pipe:2',
+                '-i', in_path,
+                '-map','0:v:0',
+                '-c:v','libx264','-preset','veryfast','-crf','23',
+                '-map','0:a?', *AUDIO_ARGS.split(),
+                out_path
+            ]  
+        else:
+            # Fast VAAPI path (default)
+            cmd = [
+                'ffmpeg','-hide_banner','-nostats','-loglevel','error',
+                '-progress','pipe:2',                # progress to stderr; we just watch for halts
+                '-vaapi_device', VAAPI_DEVICE,
+                '-i', in_path,
+                '-map','0:v:0',
+                '-vf', SCALE_FILTER,
+                '-c:v','h264_vaapi',
+                '-rc_mode', VAAPI_RC_MODE,
+                '-qp', VAAPI_QP,
+                '-map','0:a?', *AUDIO_ARGS.split(),
+                out_path
+            ]
+
         logger.info(f"[{job_id}] encode_part {idx}: {' '.join(cmd)}")
 
         if _is_job_halted(job_id):
