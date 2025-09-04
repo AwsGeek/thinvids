@@ -19,7 +19,7 @@ from tasks import transcode_video
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 
-from common import Status, get_huey, get_redis, get_logging
+from common import Status, get_huey, get_redis, get_logging, get_settings as _get_settings
 huey = get_huey()
 redis_client = get_redis()
 logger = get_logging("manager")
@@ -252,36 +252,9 @@ def metrics_snapshot():
     _metrics_cache = (now, payload)
     return jsonify(payload)
 
-GLOBAL_SETTINGS_KEY = "global:settings"
-DEFAULTS = {
-    "suspend_enabled": "0",     # off by default
-    "suspend_idle_sec": "300",  # 5 minutes
-    "suspend_gc_enabled": "0",  # off by default
-}
-
-def _to_bool(v):
-    return str(v).lower() in ("1", "true", "yes", "on")
-
-def _load_global_settings():
-    data = redis_client.hgetall(GLOBAL_SETTINGS_KEY) or {}
-    merged = {**DEFAULTS, **data}
-    return {
-        "suspend_enabled": _to_bool(merged.get("suspend_enabled")),
-        "suspend_idle_sec": int(merged.get("suspend_idle_sec") or 300),
-        "suspend_gc_enabled": _to_bool(merged.get("suspend_gc_enabled")),
-    }
-
 @app.get("/settings")
-def get_global_settings():
-    """
-    Returns:
-    {
-        "suspend_enabled": bool,
-        "suspend_idle_sec": int,
-        "suspend_gc_enabled": bool
-    }
-    """
-    return jsonify(_load_global_settings())
+def get_settings():
+    return _get_settings()
 
 @app.post("/settings")
 def post_global_settings():

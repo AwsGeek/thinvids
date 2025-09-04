@@ -518,7 +518,7 @@ def transcode_video(job_id: str, file_path: str):
         redis.hset(job_key, 'status', Status.FAILED.value)
         return {'status': 'FAILED', 'error': str(e)}
 
-@huey.task(retries=1, retry_delay=5)
+@huey.task()
 def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int = 0, stitch_host: Optional[str] = None):
     """
     Worker task:
