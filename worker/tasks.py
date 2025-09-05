@@ -1,10 +1,11 @@
 # worker/app/tasks.py
 # Master-orchestrated pipeline with tmpfs + built-in HTTP server.
-# - transcode_video(job_id, file_path): runs on the node that picks up this task ("master") – segments & dispatches encodes
-# - stitch_parts(job_id): runs on any node ("stitcher") – receives encoded parts via HTTP PUT, stitches, writes final to NFS
-# - encode_part(job_id, idx, master_host, ...): runs on any node; GETs from master, PUTs to stitcher
+# - transcode(job_id, file_path): orchestration entrypoint (master) – runs stitch() then split()
+# - split(job_id, file_path): runs on the node that picks up this task ("master") – segments & dispatches encodes
+# - stitch(job_id): runs on any node ("stitcher") – receives encoded parts via HTTP PUT, stitches, writes final to NFS
+# - encode(job_id, idx, master_host, ...): runs on any node; GETs from master, PUTs to stitcher
 #
-# Also includes probe_source() and a legacy shim segment_video()->transcode_video().
+# Also includes probe_source() utilities.
 
 from huey import RedisHuey
 
@@ -164,6 +165,7 @@ def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
     return s in (Status.FAILED, Status.STOPPED)
 
+
 # --------------- Built-in HTTP server (shared) ----------------
 
 _HTTP_SERVER = None
@@ -300,17 +302,31 @@ def _start_http_once():
         _HTTP_THREAD.start()
         _HTTP_STARTED = True
 
+
 # -------------------- Tasks --------------------
 LOCK_NAME = "transcode-video-lock"
 
 @huey.task(retries=999999, retry_delay=5)        # keep retrying while another run holds the lock
 @huey.lock_task(LOCK_NAME)     # <- must be the innermost decorator
-def transcode_video(job_id: str, file_path: str):
+def transcode(job_id: str, file_path: str):
     """
-    Master-side orchestration:
+    Orchestration entrypoint:
+      - Kick off stitch(job_id) so the stitcher publishes stitch_host.
+      - Run split(job_id, file_path) to segment and dispatch encodes.
+    """
+    # Start stitcher first so encoders have a destination
+    stitch(job_id)
+    # Perform split/dispatch on this node (master)
+    return split(job_id, file_path)
+
+
+@huey.task()
+def split(job_id: str, file_path: str):
+    """
+    Master-side segmentation & dispatch:
       - Start HTTP server (serve parts).
-      - Kick off stitch_parts(job_id) so the stitcher publishes stitch_host.
-      - Segment source and dispatch encode_part for each segment.
+      - Probe source, set metadata, advertise master_host.
+      - Segment source and dispatch encode(job_id, idx, ...) for each segment.
       - No waiting or stitching here anymore.
     """
     job_key = _job_key(job_id)
@@ -362,13 +378,7 @@ def transcode_video(job_id: str, file_path: str):
         master_url = f"http://{master_host_name}:{HTTP_PORT}"
         redis.hset(job_key, 'master_host', master_url)
 
-        # Kick off stitcher immediately so encoders have a destination
-        stitch_parts(job_id)
-
-        # Decide number of parts:
-        # 1) Prefer parts_hint from manager
-        # 2) Else derive from active workers * PARTS_PER_WORKER
-        # 3) Clamp to [MIN_PARTS, MAX_PARTS]
+        # Decide number of parts (keep previous fixed estimate of 100)
         actives = _active_nodes()
         P = 100 # Make progress updates easy
         logger.info(f"[{job_id}] Target parts (estimate): {P}")
@@ -472,7 +482,7 @@ def transcode_video(job_id: str, file_path: str):
 
                     if not _is_job_halted(job_id):
                         logger.info(f"[{job_id}] Split part {part_idx}")
-                        encode_part(job_id, part_idx, master_url, v_sel, a_sel)
+                        encode(job_id, part_idx, master_url, v_sel, a_sel)
 
                 previous_chunk_path = chunk_path
                 previous_chunk_index = chunk_index
@@ -498,7 +508,7 @@ def transcode_video(job_id: str, file_path: str):
 
             if not _is_job_halted(job_id):
                 logger.info(f"[{job_id}] Split last part {part_idx}")
-                encode_part(job_id, part_idx, master_url, v_sel, a_sel)
+                encode(job_id, part_idx, master_url, v_sel, a_sel)
                 total_chunks = part_idx
 
         if total_chunks <= 0:
@@ -518,12 +528,13 @@ def transcode_video(job_id: str, file_path: str):
         return {'status': 'QUEUED', 'parts': total_chunks}
 
     except Exception as e:
-        logger.exception(f"[{job_id}] transcode_video failed")
+        logger.exception(f"[{job_id}] split failed")
         redis.hset(job_key, 'status', Status.FAILED.value)
         return {'status': 'FAILED', 'error': str(e)}
 
+
 @huey.task()
-def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int = 0, stitch_host: Optional[str] = None):
+def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int = 0, stitch_host: Optional[str] = None):
     """
     Worker task:
       - GET /job/<job_id>/part/<idx> from MASTER
@@ -535,7 +546,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
     logger.info(f"[{job_id}] Preparing to encode part {idx}")
     try:
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] encode_part {idx}: halted before start")
+            logger.warning(f"[{job_id}] encode {idx}: halted before start")
             return {'status': 'ABORTED'}
 
         import requests
@@ -549,7 +560,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                 if stitch_host:
                     break
                 if _is_job_halted(job_id):
-                    logger.warning(f"[{job_id}] encode_part {idx}: halted while waiting for stitch_host")
+                    logger.warning(f"[{job_id}] encode {idx}: halted while waiting for stitch_host")
                     return {'status': 'ABORTED'}
                 time.sleep(0.25)
             if not stitch_host:
@@ -566,7 +577,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
         logger.info(f"[{job_id}] GET part {idx} from {get_url}")
 
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] encode_part {idx}: halted before downloading part")
+            logger.warning(f"[{job_id}] encode {idx}: halted before downloading part")
             return {'status': 'ABORTED'}
 
         with requests.get(get_url, stream=True, timeout=30) as r:
@@ -576,12 +587,11 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                     if chunk:
                         f.write(chunk)
                     if _is_job_halted(job_id):
-                        logger.warning(f"[{job_id}] encode_part {idx}: halted during download")
+                        logger.warning(f"[{job_id}] encode {idx}: halted during download")
                         try: os.remove(in_path)
                         except Exception: pass
                         return {'status': 'ABORTED'}
         logger.info(f"[{job_id}] Downloaded part {idx}")
-
 
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
         if software_encode:
@@ -610,10 +620,10 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                 out_path
             ]
 
-        logger.info(f"[{job_id}] encode_part {idx}: {' '.join(cmd)}")
+        logger.info(f"[{job_id}] encode {idx}: {' '.join(cmd)}")
 
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] encode_part {idx}: halted before encoding part")
+            logger.warning(f"[{job_id}] encode {idx}: halted before encoding part")
             return {'status': 'ABORTED'}
 
         encode_started = int(redis.hget(job_key, 'encode_started') or 0)
@@ -634,7 +644,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
             if pr.stderr is not None:
                 for _line in pr.stderr:
                     if _is_job_halted(job_id):
-                        logger.warning(f"[{job_id}] encode_part {idx}: halted — terminating ffmpeg")
+                        logger.warning(f"[{job_id}] encode {idx}: halted — terminating ffmpeg")
                         pr.terminate()
                         try:
                             pr.wait(timeout=5)
@@ -653,7 +663,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
 
         rc = pr.wait()
         if rc != 0 or not os.path.exists(out_path):
-            logger.error(f"[{job_id}] encode_part {idx} failed (rc={rc})")
+            logger.error(f"[{job_id}] encode {idx} failed (rc={rc})")
             raise subprocess.CalledProcessError(rc, cmd)
 
         logger.info(f"[{job_id}] Encoded part {idx}")
@@ -663,7 +673,7 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
         logger.info(f"[{job_id}] PUT result {idx} to {put_url}")
 
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] encode_part {idx}: halted before uploading encoded part")
+            logger.warning(f"[{job_id}] encode {idx}: halted before uploading encoded part")
             try: os.remove(out_path)
             except Exception: pass
             return {'status': 'ABORTED'}
@@ -709,22 +719,20 @@ def encode_part(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: 
                     redis.hset(job_key, 'encode_progress', prog)
 
         except Exception as e:
-            logger.error(f"[{job_id}] encode_part {idx} progress update error: {e}")
+            logger.error(f"[{job_id}] encode {idx} progress update error: {e}")
 
         return {'status':'COMPLETED','idx': idx}
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"[{job_id}] encode_part {idx} failed: {getattr(e, 'stderr', '')}")
+        logger.error(f"[{job_id}] encode {idx} failed: {getattr(e, 'stderr', '')}")
         raise
     except Exception:
-        logger.exception(f"[{job_id}] encode_part {idx} unexpected error")
+        logger.exception(f"[{job_id}] encode {idx} unexpected error")
         raise
-
-
 
 
 @huey.task()
-def stitch_parts(job_id: str):
+def stitch(job_id: str):
     """
     Runs on the "stitcher" node.
     - Starts HTTP server for receiving encoded parts via PUT.
@@ -751,7 +759,7 @@ def stitch_parts(job_id: str):
                 pass
             time.sleep(0.5)
         if P <= 0:
-            logger.error(f"[{job_id}] stitch_parts: parts_total not set")
+            logger.error(f"[{job_id}] stitch: parts_total not set")
             return {'status':'FAILED','reason':'parts_total not set'}
 
         enc_dir = os.path.join(PROJECT_ROOT, job_id, "encoded")
@@ -785,7 +793,7 @@ def stitch_parts(job_id: str):
 
         while _now() < wait_deadline:
             if _is_job_halted(job_id):
-                logger.warning(f"[{job_id}] stitch_parts aborted (job halted)")
+                logger.warning(f"[{job_id}] stitch aborted (job halted)")
                 return {'status':'ABORTED'}
             ready = _ready_set()
             done_fs = len(ready)
@@ -808,7 +816,7 @@ def stitch_parts(job_id: str):
 
         if len(_ready_set()) < P:
             missing = sorted(expected - _ready_set())
-            logger.error(f"[{job_id}] stitch_parts timeout; missing: {missing}")
+            logger.error(f"[{job_id}] stitch timeout; missing: {missing}")
             redis.hset(job_key, 'status', Status.FAILED.value)
             return {'status':'FAILED','reason':'timeout waiting for encoded parts'}
 
@@ -838,7 +846,7 @@ def stitch_parts(job_id: str):
         logger.info(f"[{job_id}] Stitch cmd: {' '.join(stitch_cmd)}")
 
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] stitch_parts halted before stitching")
+            logger.warning(f"[{job_id}] stitch halted before stitching")
             return {'status': 'ABORTED'}
 
         proc = subprocess.Popen(stitch_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -854,7 +862,7 @@ def stitch_parts(job_id: str):
                 if line.startswith('out_time_ms='):
 
                     if _is_job_halted(job_id):
-                        logger.warning(f"[{job_id}] stitch_parts halted while stitching")
+                        logger.warning(f"[{job_id}] stitch halted while stitching")
                         proc.terminate()
                         proc.wait()
                         return {'status': 'ABORTED'}
@@ -888,7 +896,7 @@ def stitch_parts(job_id: str):
             return {'status': 'FAILED', 'reason': 'stitch failed'}
 
         if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] stitch_parts halted before moving file")
+            logger.warning(f"[{job_id}] stitch halted before moving file")
             return {'status': 'ABORTED'}
 
         # Move final to library + set metadata
@@ -969,6 +977,6 @@ def stitch_parts(job_id: str):
         return {'status': 'COMPLETED', 'output': final_path}
 
     except Exception as e:
-        logger.exception(f"[{job_id}] stitch_parts failed")
+        logger.exception(f"[{job_id}] stitch failed")
         redis.hset(job_key, 'status', Status.FAILED.value)
         return {'status': 'FAILED', 'error': str(e)}

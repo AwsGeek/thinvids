@@ -14,7 +14,7 @@ from typing import List
 import subprocess
 
 # import backend task planner
-from tasks import transcode_video
+from tasks import transcode
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -129,7 +129,7 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
         # Compute parts hint
         parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
 
-        # Stash info for UI/debug + hint for tasks.transcode_video
+        # Stash info for UI/debug + hint for tasks.transcode
         redis_client.hset(job_key, mapping={
             'warmup_workers_json': json.dumps(seen),
             'warmup_worker_count': len(seen),
@@ -139,7 +139,7 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
 
         # Kick the pipeline
         redis_client.hset(job_key, mapping={'status': Status.WAITING.value, 'waiting_at': time.time()})
-        transcode_video(job_id, f'/watch/{filename}')
+        transcode(job_id, f'/watch/{filename}')
     except Exception as e:
         logger.exception("[%s] launch_after_warmup failed", job_id)
         try:
