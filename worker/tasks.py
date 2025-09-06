@@ -734,20 +734,27 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
 @huey.task()
 def stitch(job_id: str):
     """
-    Runs on the "stitcher" node.
-    - Starts HTTP server for receiving encoded parts via PUT.
-    - Publishes stitch_host to Redis so encoders know where to upload.
-    - Waits for all encoded parts; stitches and moves final to /library.
+    Stitcher node:
+      - Serves PUTs for encoded parts and advertises stitch_host.
+      - Waits for all parts with conservative, head-of-line-focused retries.
+      - On persistent misses/timeouts -> fail. On success -> concat-copy to final.
     """
     job_key = _job_key(job_id)
     try:
         _start_http_once()
         stitch_host = f"http://{ENV('HOSTNAME') or socket.gethostname()}:{HTTP_PORT}"
-        # advertise stitcher location ASAP
         redis.hset(job_key, mapping={'stitch_host': stitch_host})
         logger.info(f"[{job_id}] Stitcher ready at {stitch_host}")
 
-        # read total parts (wait a bit until master sets it)
+        # ---- Tunables (safe defaults; can be overriden via env) ----
+        MAX_RETRIES                    = int(ENV("STITCH_MAX_RETRIES", "3"))
+        RETRY_INTERVAL_SEC             = float(ENV("STITCH_RETRY_INTERVAL_SEC", "45"))
+        STALL_BEFORE_RETRY_SEC         = float(ENV("STITCH_STALL_BEFORE_RETRY_SEC", "90"))
+        MISS_MIN_AGE_SEC               = float(ENV("STITCH_MISS_MIN_AGE_SEC", "90"))
+        RETRY_WINDOW_AHEAD             = int(ENV("STITCH_RETRY_WINDOW_AHEAD", "8"))   # how far past the contiguous frontier we consider
+        MAX_PARALLEL_REDISPATCH        = int(ENV("STITCH_MAX_PARALLEL_REDISPATCH", "3"))
+
+        # ---- Wait for parts_total ----
         deadline = _now() + 300
         P = 0
         while _now() < deadline:
@@ -777,28 +784,77 @@ def stitch(job_id: str):
                     st = os.stat(f)
                 except Exception:
                     continue
+                # consider file ready if stable for a short moment
                 if st.st_size > 0 and (now_ts - st.st_mtime) > 0.8:
                     i = int(m.group(1))
                     if 1 <= i <= P:
                         ready.add(i)
             return ready
 
-        # wait for all encoded parts
+        # Keys to persist state across restarts
+        retry_cnt_key   = f"job_retry_counts:{job_id}"        # H[idx] = int
+        retry_ts_key    = f"job_retry_ts:{job_id}"            # H[idx] = epoch float
+        miss_seen_key   = f"job_missing_first_seen:{job_id}"  # H[idx] = epoch float
+        inflight_key    = f"job_retry_inflight:{job_id}"      # S = {idx,...}
+
         expected = set(range(1, P + 1))
         try:
-            src_dur = float(redis.hget(job_key, 'source_duration') or 0)
+            src_dur = float(redis.hget(job_key, 'source_duration') or 0.0)
         except Exception:
             src_dur = 0.0
+
+        # Overall deadline (unchanged heuristic)
         wait_deadline = _now() + max(300.0, (src_dur or 0) * 3)
+        est_part_secs = max(5.0, (src_dur / P) if (src_dur and P) else 10.0)
+
+        # Stall detection: only retry if nothing new arrived for a while
+        last_ready_count = -1
+        last_change_ts   = _now()
+
+        # Helper: schedule (re)encode conservatively
+        def _retry_part(idx: int):
+            job = redis.hgetall(job_key) or {}
+            master_host = job.get('master_host') or stitch_host
+            try:
+                v_sel = int(job.get('selected_v_stream') or 0)
+            except Exception:
+                v_sel = 0
+            try:
+                a_sel = int(job.get('selected_a_stream') or 0)
+            except Exception:
+                a_sel = 0
+
+            # Avoid duplicate redispatch if already inflight
+            added = redis.sadd(inflight_key, idx)
+            if not added:
+                return False  # already inflight from a prior retry
+
+            logger.warning(f"[{job_id}] stitch: re-dispatching part {idx}")
+            encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host)
+
+            now_ts = _now()
+            pipe = redis.pipeline()
+            pipe.hincrby(retry_cnt_key, idx, 1)
+            pipe.hset(retry_ts_key, idx, now_ts)
+            pipe.execute()
+            return True
 
         while _now() < wait_deadline:
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] stitch aborted (job halted)")
                 return {'status':'ABORTED'}
+
             ready = _ready_set()
             done_fs = len(ready)
 
-            # mirror encode progress as a convenience (in case encoders didn't)
+            # Clear inflight markers for any that have arrived
+            try:
+                if ready:
+                    redis.srem(inflight_key, *list(ready))
+            except Exception:
+                pass
+
+            # progress mirroring
             try:
                 cur = int(redis.hget(job_key, 'encode_progress') or 0)
                 prog = int((done_fs / P) * 100) if P else 0
@@ -808,17 +864,119 @@ def stitch(job_id: str):
             except Exception:
                 pass
 
-            P = int(redis.hget(job_key, 'parts_total') or 0)
+            # stall tracking
+            if done_fs != last_ready_count:
+                last_ready_count = done_fs
+                last_change_ts   = _now()
+
+            # update P if master corrected it
+            try:
+                P_current = int(redis.hget(job_key, 'parts_total') or P)
+                if P_current != P and P_current > 0:
+                    expected = set(range(1, P_current + 1))
+                    P = P_current
+            except Exception:
+                pass
+
             if done_fs >= P:
                 break
 
-            time.sleep(1.0)
+            # --- Conservative retry strategy ---
+            now_ts = _now()
+            # Find largest contiguous ready prefix (head-of-line)
+            frontier = 0
+            for i in range(1, P + 1):
+                if i in ready:
+                    frontier = i
+                else:
+                    break
 
-        if len(_ready_set()) < P:
-            missing = sorted(expected - _ready_set())
-            logger.error(f"[{job_id}] stitch timeout; missing: {missing}")
+            # Only consider a small window beyond the frontier
+            horizon = min(P, frontier + RETRY_WINDOW_AHEAD)
+            window_missing = [i for i in range(frontier + 1, horizon + 1) if i not in ready]
+
+            # Record first-seen-missing timestamps
+            if window_missing:
+                pipe = redis.pipeline()
+                for idx in window_missing:
+                    # set if absent
+                    if not redis.hexists(miss_seen_key, idx):
+                        pipe.hset(miss_seen_key, idx, now_ts)
+                pipe.execute()
+
+            # Retry only if globally stalled
+            stalled = (now_ts - last_change_ts) >= STALL_BEFORE_RETRY_SEC
+
+            dispatched = 0
+            if stalled and window_missing:
+                for idx in window_missing:
+                    if dispatched >= MAX_PARALLEL_REDISPATCH:
+                        break
+
+                    try:
+                        first_seen = float(redis.hget(miss_seen_key, idx) or 0.0)
+                    except Exception:
+                        first_seen = 0.0
+                    # per-part age guard
+                    if first_seen <= 0 or (now_ts - first_seen) < max(MISS_MIN_AGE_SEC, est_part_secs * 1.5):
+                        continue
+
+                    # retry budget & spacing
+                    try:
+                        cnt = int(redis.hget(retry_cnt_key, idx) or 0)
+                    except Exception:
+                        cnt = 0
+                    try:
+                        last_retry = float(redis.hget(retry_ts_key, idx) or 0.0)
+                    except Exception:
+                        last_retry = 0.0
+
+                    if cnt >= MAX_RETRIES:
+                        continue
+                    if (now_ts - last_retry) < RETRY_INTERVAL_SEC:
+                        continue
+
+                    if _retry_part(idx):
+                        dispatched += 1
+
+            # Early-fail if some window-missing parts exhausted retries and have been stale well beyond expectation
+            early_fail = False
+            for idx in window_missing:
+                try:
+                    cnt = int(redis.hget(retry_cnt_key, idx) or 0)
+                    last_retry = float(redis.hget(retry_ts_key, idx) or 0.0)
+                    first_seen = float(redis.hget(miss_seen_key, idx) or 0.0)
+                except Exception:
+                    cnt, last_retry, first_seen = 0, 0.0, 0.0
+
+                if cnt >= MAX_RETRIES:
+                    # give extra grace after last retry proportional to part estimate
+                    if (now_ts - max(last_retry, first_seen)) > max(2 * est_part_secs, STALL_BEFORE_RETRY_SEC):
+                        early_fail = True
+                        logger.error(f"[{job_id}] stitch: giving up on part {idx} after {cnt} retries")
+                        break
+
+            if early_fail:
+                break
+
+            # pacing
+            time.sleep(0.5 if dispatched == 0 else 1.0)
+
+        # Final readiness check
+        final_ready = _ready_set()
+        if len(final_ready) < P:
+            missing = sorted(expected - final_ready)
+            logger.error(f"[{job_id}] stitch timeout or retries exhausted; missing: {missing}")
             redis.hset(job_key, 'status', Status.FAILED.value)
-            return {'status':'FAILED','reason':'timeout waiting for encoded parts'}
+            try:
+                redis.delete(f"job_done_parts:{job_id}")
+                redis.delete(retry_cnt_key)
+                redis.delete(retry_ts_key)
+                redis.delete(miss_seen_key)
+                redis.delete(inflight_key)
+            except Exception:
+                pass
+            return {'status':'FAILED','reason':'missing encoded parts after conservative retries'}
 
         # ---- Stitch (concat copy) ----
         base_dir = os.path.join(PROJECT_ROOT, job_id)
@@ -860,15 +1018,13 @@ def stitch(job_id: str):
                     continue
                 line = line.strip()
                 if line.startswith('out_time_ms='):
-
                     if _is_job_halted(job_id):
                         logger.warning(f"[{job_id}] stitch halted while stitching")
                         proc.terminate()
                         proc.wait()
                         return {'status': 'ABORTED'}
-
                     try:
-                        out_ms = int(line.split('=', 1)[1] or '0')
+                        out_ms = int(line.split('=', 1)[1] or 0)
                     except Exception:
                         out_ms = 0
                     if total_us > 0:
@@ -959,7 +1115,7 @@ def stitch(job_id: str):
         except Exception:
             pass
 
-        # Final combine progress update
+        # Final combine progress update + cleanup of retry metadata
         redis.hset(job_key, mapping={
             'status': Status.DONE.value,
             'output_path': final_path,
@@ -967,9 +1123,12 @@ def stitch(job_id: str):
             'combine_progress': 100,
             'combine_elapsed': round(_now() - combine_t0, 2),
         })
-
         try:
             redis.delete(f"job_done_parts:{job_id}")
+            redis.delete(retry_cnt_key)
+            redis.delete(retry_ts_key)
+            redis.delete(miss_seen_key)
+            redis.delete(inflight_key)
             redis.hdel(f"job:{job_id}", "awaiting_parts")
         except Exception:
             pass
