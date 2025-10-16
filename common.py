@@ -59,13 +59,14 @@ and helpers for parsing and sorting by status.
 from enum import Enum
 
 class Status(str, Enum):
-    READY    = 'READY'
-    STARTING = 'STARTING'
-    WAITING  = 'WAITING'
-    RUNNING  = 'RUNNING'
-    STOPPED  = 'STOPPED'
-    FAILED   = 'FAILED'
-    DONE     = 'DONE'
+    READY     = "READY"
+    STARTING  = "STARTING"
+    WAITING   = "WAITING"
+    RUNNING   = "RUNNING"
+    STAMPING  = "STAMPING"   # <— NEW
+    STOPPED   = "STOPPED"
+    FAILED    = "FAILED"
+    DONE      = "DONE"
 
     # --- helpers -----------------------------------------------------------
     @staticmethod

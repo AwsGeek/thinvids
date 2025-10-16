@@ -10,16 +10,18 @@
 from huey import RedisHuey
 
 import os
+import re
 import time
 import json
 import glob
+import uuid
 import shutil
 import socket
 import logging
 import subprocess
 import threading
-import re
 from typing import List, Tuple, Optional
+from collections import deque
 
 from common import ENV, Status, get_huey, get_redis, get_logging
 huey = get_huey()
@@ -373,6 +375,19 @@ def split(job_id: str, file_path: str):
             'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0'
         })
 
+        # --- FAIL FAST: GPU doesn't support AV1 decode ---
+        # Normalize codec name (ffprobe reports "av1")
+        if (codec or "").strip().lower() in {"av1", "av01"}:
+            msg = "Unsupported input codec: AV1. GPU decode not available; failing fast."
+            logger.error(f"[{job_id}] {msg}")
+            # Mark job failed and store a human-friendly reason
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': msg,
+            })
+            return {'status': 'FAILED', 'reason': msg}
+
+
         # Advertise master URL
         master_host_name = ENV("HOSTNAME") or socket.gethostname()
         master_url = f"http://{master_host_name}:{HTTP_PORT}"
@@ -544,13 +559,41 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
       - Early-exit if the job is halted at any point
     """
     logger.info(f"[{job_id}] Preparing to encode part {idx}")
+
+    worker_name = ENV("HOSTNAME") or socket.gethostname()
+    job_key = _job_key(job_id)
+
+    def _fail(reason: str, stage: str):
+        # Mark whole job failed and save a useful reason
+        mapping = {
+            'status': Status.FAILED.value,
+            'error': f"part {idx} ({stage}): {reason}",
+            'failed_part': idx,
+            'failed_stage': stage,
+            'failed_worker': worker_name,
+            'ended_at': _now(),
+        }
+        try:
+            redis.hset(job_key, mapping=mapping)
+        except Exception:
+            pass
+        logger.error(f"[{job_id}] {mapping['error']}")
+        # best-effort cleanup
+        for p in (locals().get('in_path'), locals().get('out_path')):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        return {'status': 'FAILED', 'reason': mapping['error']}
+
     try:
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode {idx}: halted before start")
             return {'status': 'ABORTED'}
 
         import requests
-        job_key = _job_key(job_id)
+        stage = "resolve-stitcher"
 
         # resolve stitch_host if not provided
         if not stitch_host:
@@ -573,6 +616,7 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
         out_path = os.path.join(wtmp, f"out_{idx:03d}.mp4")
 
         # Download part from master
+        stage = "download"
         get_url = f"{master_host.rstrip('/')}/job/{job_id}/part/{idx}"
         logger.info(f"[{job_id}] GET part {idx} from {get_url}")
 
@@ -580,35 +624,42 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
             logger.warning(f"[{job_id}] encode {idx}: halted before downloading part")
             return {'status': 'ABORTED'}
 
-        with requests.get(get_url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(in_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                    if _is_job_halted(job_id):
-                        logger.warning(f"[{job_id}] encode {idx}: halted during download")
-                        try: os.remove(in_path)
-                        except Exception: pass
-                        return {'status': 'ABORTED'}
+        try:
+            with requests.get(get_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(in_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                        if _is_job_halted(job_id):
+                            logger.warning(f"[{job_id}] encode {idx}: halted during download")
+                            try: os.remove(in_path)
+                            except Exception: pass
+                            return {'status': 'ABORTED'}
+        except Exception as e:
+            return _fail(f"download failed: {e}", stage)
+
         logger.info(f"[{job_id}] Downloaded part {idx}")
 
+        # Build ffmpeg command
+        stage = "encode"
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
         if software_encode:
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
+                '-y',
                 '-progress','pipe:2',
                 '-i', in_path,
                 '-map','0:v:0',
                 '-c:v','libx264','-preset','veryfast','-crf','23',
                 '-map','0:a?', *AUDIO_ARGS.split(),
                 out_path
-            ]  
+            ]
         else:
-            # Fast VAAPI path (default)
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
-                '-progress','pipe:2',                # progress to stderr; we just watch for halts
+                '-y',
+                '-progress','pipe:2',
                 '-vaapi_device', VAAPI_DEVICE,
                 '-i', in_path,
                 '-map','0:v:0',
@@ -631,18 +682,27 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
             encode_started = int(_now())
             redis.hset(job_key, 'encode_started', encode_started)
 
-        pr = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        # capture last ~120 lines of ffmpeg stderr for diagnostics
+        stderr_tail = deque(maxlen=120)
+
+        try:
+            pr = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            return _fail(f"spawn ffmpeg failed: {e}", stage)
 
         try:
             # Read progress lines to keep ffmpeg responsive and check halts
             if pr.stderr is not None:
                 for _line in pr.stderr:
+                    line = _line.rstrip("\n")
+                    if line:
+                        stderr_tail.append(line)
                     if _is_job_halted(job_id):
                         logger.warning(f"[{job_id}] encode {idx}: halted — terminating ffmpeg")
                         pr.terminate()
@@ -663,12 +723,13 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
 
         rc = pr.wait()
         if rc != 0 or not os.path.exists(out_path):
-            logger.error(f"[{job_id}] encode {idx} failed (rc={rc})")
-            raise subprocess.CalledProcessError(rc, cmd)
+            tail = "\n".join(list(stderr_tail)[-40:])  # keep it short
+            return _fail(f"ffmpeg rc={rc}; tail:\n{tail}", stage)
 
         logger.info(f"[{job_id}] Encoded part {idx}")
 
         # Upload result to stitcher
+        stage = "upload"
         put_url = f"{stitch_host.rstrip('/')}/job/{job_id}/result/{idx}"
         logger.info(f"[{job_id}] PUT result {idx} to {put_url}")
 
@@ -678,11 +739,14 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
             except Exception: pass
             return {'status': 'ABORTED'}
 
-        with open(out_path, 'rb') as f:
-            headers = {'Content-Type':'video/mp4', 'Content-Length': str(os.path.getsize(out_path))}
-            r = requests.put(put_url, data=f, headers=headers, timeout=120)
-            if r.status_code // 100 != 2:
-                raise RuntimeError(f"PUT failed {r.status_code}: {r.text[:300]}")
+        try:
+            with open(out_path, 'rb') as f:
+                headers = {'Content-Type':'video/mp4', 'Content-Length': str(os.path.getsize(out_path))}
+                r = requests.put(put_url, data=f, headers=headers, timeout=120)
+                if r.status_code // 100 != 2:
+                    return _fail(f"PUT failed {r.status_code}: {r.text[:300]}", stage)
+        except Exception as e:
+            return _fail(f"upload failed: {e}", stage)
 
         logger.info(f"[{job_id}] Uploaded part {idx}")
 
@@ -723,12 +787,10 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
 
         return {'status':'COMPLETED','idx': idx}
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[{job_id}] encode {idx} failed: {getattr(e, 'stderr', '')}")
-        raise
-    except Exception:
-        logger.exception(f"[{job_id}] encode {idx} unexpected error")
-        raise
+    except Exception as e:
+        # Catch-all — fail job with a generic reason
+        return _fail(f"unexpected error: {e}", stage if 'stage' in locals() else 'unknown')
+
 
 
 @huey.task()
@@ -746,6 +808,10 @@ def stitch(job_id: str):
         redis.hset(job_key, mapping={'stitch_host': stitch_host})
         logger.info(f"[{job_id}] Stitcher ready at {stitch_host}")
 
+        if _is_job_halted(job_id):
+            logger.warning(f"[{job_id}] stitch: job already halted; exiting")
+            return {'status':'ABORTED'}
+
         # ---- Tunables (safe defaults; can be overriden via env) ----
         MAX_RETRIES                    = int(ENV("STITCH_MAX_RETRIES", "3"))
         RETRY_INTERVAL_SEC             = float(ENV("STITCH_RETRY_INTERVAL_SEC", "45"))
@@ -758,6 +824,10 @@ def stitch(job_id: str):
         deadline = _now() + 300
         P = 0
         while _now() < deadline:
+            if _is_job_halted(job_id):
+                logger.warning(f"[{job_id}] stitch aborted before parts_total")
+                return {'status':'ABORTED'}
+
             try:
                 P = int(redis.hget(job_key, 'parts_total') or 0)
                 if P > 0:
@@ -1139,3 +1209,296 @@ def stitch(job_id: str):
         logger.exception(f"[{job_id}] stitch failed")
         redis.hset(job_key, 'status', Status.FAILED.value)
         return {'status': 'FAILED', 'error': str(e)}
+
+@huey.task()
+def stamp(job_id: str):
+    """
+    Software re-encode with frame numbers burned-in for visual verification.
+
+    Behavior:
+      - Sets job status to STAMPING.
+      - Runs ffmpeg with drawtext(text=%{n}) to burn frame numbers.
+      - Streams -progress pipe:1 and mirrors to encode_progress / encode_elapsed.
+      - On STOPPED/FAILED, terminates cleanly.
+      - On success:
+          * Moves tmp -> final stamped file (same dir as source, with ".stamped" suffix).
+          * Updates THIS job to point to the stamped file (filename -> stamped path).
+          * Creates a NEW READY job that also points to the stamped file.
+    """
+
+    job_key = _job_key(job_id)
+    job = redis.hgetall(job_key) or {}
+
+    # --------- helpers ----------
+    def _fail(reason: str):
+        logger.error(f"[{job_id}] STAMP failed: {reason}")
+        try:
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'ended_at': _now(),
+            })
+        except Exception:
+            pass
+        return {'status': 'FAILED', 'reason': reason}
+
+    # --------- resolve paths ----------
+    # Prefer WATCH_ROOT + filename; fall back to input_path if set.
+    filename = job.get('filename') or ''
+    src_path = os.path.join(WATCH_ROOT, filename.lstrip('/')) if filename else ''
+    if not src_path or not os.path.exists(src_path):
+        alt = job.get('input_path') or ''
+        if alt and os.path.exists(alt):
+            src_path = alt
+            # If this was absolute to WATCH_ROOT, derive relative filename for stamped output
+            if src_path.startswith(WATCH_ROOT.rstrip('/') + '/'):
+                filename = src_path[len(WATCH_ROOT.rstrip('/') + '/'):]
+        else:
+            return _fail(f"source not found: {filename or src_path or '(empty)'}")
+
+    # stamped path: same dir, ".stamped" suffix before extension
+    base, ext = os.path.splitext(src_path)
+    out_ext = ext if ext.lower() in ('.mkv', '.mp4') else '.mkv'  # keep sane containers
+    stamped_path = base + '.stamped' + out_ext
+    tmp_path = stamped_path + '.tmp'
+
+    # output container format (fixes the '.tmp' autodetect failure)
+    if out_ext.lower() == '.mkv':
+        out_fmt = 'matroska'
+        out_tail = []  # matroska accepts almost anything
+    else:
+        out_fmt = 'mp4'
+        out_tail = ['-movflags', '+faststart']
+
+    # Drawtext: prefer a specific font if present, else monospace
+    # Drawtext: bigger and centered
+    fontsize = int(ENV('STAMP_FONTSIZE', '72'))  # override via env if desired
+    fontfile = ENV('STAMP_FONTFILE', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf')
+    if os.path.isfile(fontfile):
+        draw = (
+            f"drawtext=fontfile={fontfile}:"
+            f"fontsize={fontsize}:fontcolor=white:"
+            f"borderw=5:bordercolor=black:"
+            f"x=(w-tw)/2:y=(h-th)/2:text=%{{n}}"
+        )
+    else:
+        # fallback: fontconfig alias
+        draw = (
+            "drawtext=font=monospace:"
+            f"fontsize={fontsize}:fontcolor=white:"
+            "borderw=5:bordercolor=black:"
+            "x=(w-tw)/2:y=(h-th)/2:text=%{n}"
+        )
+
+    # Selected streams
+    try:
+        v_sel = int(job.get('selected_v_stream') or 0)
+    except Exception:
+        v_sel = 0
+    try:
+        a_sel = int(job.get('selected_a_stream') or 0)
+    except Exception:
+        a_sel = 0
+
+    # Duration for progress %
+    duration = _ffprobe_duration(src_path)
+    total_us = int(max(0.0, duration) * 1_000_000)
+
+    # Update job status -> STAMPING and zero bars
+    t0 = _now()
+    redis.hset(job_key, mapping={
+        'status': Status.STAMPING.value,
+        'encode_started': int(t0),
+        'encode_elapsed': 0,
+        'encode_progress': 0,
+        'stamp_source': filename or src_path,
+        'stamp_tmp': tmp_path,
+    })
+
+    # ffmpeg command
+    cmd = [
+        'ffmpeg', '-hide_banner', '-y',
+        '-nostats', '-loglevel', 'error',
+        '-progress', 'pipe:1',
+        '-i', src_path,
+        '-map', f'0:v:{v_sel}',
+        '-vf', draw,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+        '-map', f'0:a:{a_sel}?',
+        '-c:a', 'copy',
+        *out_tail,
+        '-f', out_fmt,
+        tmp_path
+    ]
+    logger.info(f"[{job_id}] STAMP cmd: {' '.join(cmd)}")
+
+    # Early stop?
+    if _is_job_halted(job_id):
+        logger.warning(f"[{job_id}] STAMP halted before start")
+        redis.hset(job_key, 'status', Status.STOPPED.value)
+        return {'status': 'ABORTED'}
+
+    err_tail = ''
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,   # -progress pipe:1
+            stderr=subprocess.PIPE,   # capture tail for diagnostics
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        return _fail(f"spawn ffmpeg failed: {e}")
+
+    try:
+        # progress loop
+        while True:
+            if _is_job_halted(job_id):
+                logger.warning(f"[{job_id}] STAMP halted — terminating ffmpeg")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                redis.hset(job_key, 'status', Status.STOPPED.value)
+                return {'status': 'ABORTED'}
+
+            line = proc.stdout.readline() if proc.stdout else ''
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith('out_time_ms='):
+                try:
+                    out_ms = int(line.split('=', 1)[1] or '0')
+                except Exception:
+                    out_ms = 0
+                if total_us > 0:
+                    pct = int(min(99, max(0, (out_ms / total_us) * 100)))
+                    redis.hset(job_key, mapping={
+                        'encode_progress': pct,
+                        'encode_elapsed': round(_now() - t0, 2),
+                    })
+            elif line.startswith('progress=') and line.split('=', 1)[1].strip() == 'end':
+                break
+    finally:
+        rc = proc.wait()
+        try:
+            # keep a short diagnostic tail
+            err = (proc.stderr.read() or '')
+            err_tail = err[-1000:]
+        except Exception:
+            err_tail = ''
+
+    if rc != 0 or not os.path.exists(tmp_path):
+        # common pitfall fixed: missing -f with .tmp; also bubble any other errors
+        reason = f"ffmpeg rc={rc}: {err_tail.strip() or 'no stderr'}"
+        return _fail(reason)
+
+    # Move tmp -> final stamped path (atomic replace)
+    try:
+        os.replace(tmp_path, stamped_path)
+    except Exception as e:
+        # clean tmp on error
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return _fail(f"finalize stamped file failed: {e}")
+
+    # Finalize progress
+    redis.hset(job_key, mapping={
+        'encode_progress': 100,
+        'encode_elapsed': round(_now() - t0, 2),
+    })
+
+    # Update THIS job to point at stamped file
+    rel_stamped = os.path.relpath(stamped_path, WATCH_ROOT).lstrip(os.sep)
+    now = str(_now())
+    redis.hset(job_key, mapping={
+        'filename': rel_stamped,
+        'stamp_output': rel_stamped,
+        'stamp_finished_at': now,
+        # Return to READY so user can run pipeline on the stamped source,
+        # but keep output metrics visible in the bars we just updated.
+        'status': Status.READY.value,
+    })
+
+    # Create a NEW job for the stamped video (READY / paused)
+    try:
+        new_job_id = str(uuid.uuid4())
+        new_job_key = _job_key(new_job_id)
+
+        # Probe quick metadata for UI
+        meta     = _ffprobe_stream0(stamped_path)
+        duration = _ffprobe_duration(stamped_path)
+        codec    = meta.get("codec") or ""
+        width    = meta.get("width") or 0
+        height   = meta.get("height") or 0
+        fps      = meta.get("fps") or 0.0
+        size_b   = meta.get("size") or 0
+        fmt_bps  = meta.get("bit_rate") or 0
+        kbps_calc = (fmt_bps/1000.0) if fmt_bps > 0 else (
+            ((size_b*8)/duration/1000.0) if (size_b and duration) else 0.0
+        )
+
+        # carry over some settings or fall back to globals
+        globals_map = redis.hgetall('settings:global') or {}
+        def _ival(v, d):
+            try: return int(v)
+            except Exception: return d
+        seg   = _ival(job.get('segment_duration', globals_map.get('segment_duration', 10)), 10)
+        parts = _ival(job.get('number_parts', globals_map.get('number_parts', 2)), 2)
+        serialize = '1' if (job.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0')) in ('1','true','True')) else '0'
+
+        new_mapping = {
+            'job_id': new_job_id,
+            'filename': rel_stamped,
+            'status': Status.READY.value,
+            'created_at': now,
+            'started_at': '0',
+            'total_chunks': 0,
+            'completed_chunks': 0,
+            'stitched_chunks': 0,
+            'segment_duration': seg,
+            'number_parts': parts,
+            'serialize_pipeline': serialize,
+            'software_encode': '0',  # regular pipeline, not stamping
+            'source_codec': codec,
+            'source_resolution': f"{width}x{height}" if (width and height) else '',
+            'source_duration': f"{duration:.2f}" if duration else '0',
+            'source_fps': f"{fps:.2f}" if fps else '0',
+            'source_file_size': size_b,
+            'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0',
+            # default stream selections
+            'selected_v_stream': 0,
+            'selected_a_stream': 0,
+        }
+        redis.hset(new_job_key, mapping=new_mapping)
+        # index for UI
+        try:
+            redis.sadd("jobs:all", new_job_key)
+        except Exception:
+            pass
+
+        # record link
+        redis.hset(job_key, 'stamp_new_job_id', new_job_id)
+
+    except Exception as e:
+        # non-fatal: stamping succeeded; just log job creation failure
+        logger.warning(f"[{job_id}] stamped OK, but new job creation failed: {e}")
+
+    logger.info(f"[{job_id}] STAMP completed → {stamped_path}")
+    return {'status': 'COMPLETED', 'output': stamped_path}

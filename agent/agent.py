@@ -333,7 +333,7 @@ def main():
         # Consider idle if CPU and GPU are both below thresholds (GPU may be absent)
         gpu_idle = (gpu is None) or (gpu_val <= IDLE_GPU_PCT_MAX)
         is_idle  = (cpu <= IDLE_CPU_PCT_MAX) and gpu_idle
-        is_idle  = all_jobs_are_idle()
+        is_idle  = all_jobs_are_idle() and is_idle
 
         now = time.time()
 

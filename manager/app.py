@@ -14,7 +14,7 @@ from typing import List
 import subprocess
 
 # import backend task planner
-from tasks import transcode
+from tasks import transcode, stamp
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -78,6 +78,24 @@ def get_active_nodes():
         if t >= cutoff:
             result.append({"hostname": h, "mac": mac_map[h]})
     return result
+
+
+def _ensure_one_worker_awake():
+    active = get_active_nodes()
+    if active:
+        return
+    # Wake just one known node if possible; else best-effort wake all
+    all_nodes = get_all_nodes()
+    if all_nodes:
+        try:
+            nodes_wake_one(all_nodes[0]["hostname"])  # best-effort
+        except Exception:
+            pass
+    else:
+        try:
+            nodes_wake_all()
+        except Exception:
+            pass
 
 # ---------- Warm-up & launch helpers (wait for heartbeats/metrics) ----------
 
@@ -1015,3 +1033,38 @@ def nodes_wake_all():
     except Exception as e:
         logger.exception("Wake All failed")
         return jsonify({'error': str(e)}), 500
+
+@app.post('/stamp_job/<job_id>')
+def stamp_job(job_id):
+    job_key = f"job:{job_id}"
+    if not redis_client.exists(job_key):
+        return jsonify({'status':'not found'}), 404
+
+    job = redis_client.hgetall(job_key) or {}
+    s = Status.parse(job.get('status'))
+    if s in [Status.STARTING, Status.WAITING, Status.RUNNING, Status.STAMPING]:
+        return jsonify({'status':'invalid', 'message':'Job is busy; stop it first.'}), 400
+
+    # verify source exists
+    filename = job.get('filename') or ''
+    full_path = os.path.join("/watch", filename.lstrip('/'))
+    if (not filename or not os.path.exists(full_path)) and job.get('input_path'):
+        full_path = job.get('input_path')
+    if not os.path.exists(full_path):
+        return jsonify({'status':'error','message':f'Input not found: {full_path}'}), 400
+
+    # mark STAMPING now (also done by task; this gives instant UI feedback)
+    now = time.time()
+    redis_client.hset(job_key, mapping={
+        'status': Status.STAMPING.value,
+        'started_at': str(now) if float(job.get('started_at',0) or 0)==0 else job.get('started_at'),
+        'encode_progress': 0,
+        'encode_elapsed': 0,
+    })
+
+    # ensure at least one worker is awake for the stamp job
+    _ensure_one_worker_awake()
+
+    # enqueue
+    stamp(job_id)
+    return jsonify({'status':'stamping'}), 202

@@ -29,6 +29,22 @@
 
     /* Slightly denser rows */
     #job-table th, #job-table td { padding-top: .25rem; padding-bottom: .25rem; }
+
+    /* Scrollable "Job Properties" modal */
+    #properties-modal .modal-panel {
+      max-height: 85vh;        /* fit within viewport */
+      max-width: 42rem;        /* ~max-w-2xl */
+      width: 100%;
+      overflow: hidden;        /* hide overflow on the container */
+      display: flex;           /* stack header + body */
+      flex-direction: column;
+    }
+
+    #properties-content {
+      overflow: auto;          /* scroll the body */
+      min-height: 0;           /* allow flex item to shrink */
+      overscroll-behavior: contain; /* prevent background scroll chaining */
+    }    
   </style>
 {% endblock %}
 
@@ -106,7 +122,7 @@
 
 <!-- Properties Modal -->
 <div id="properties-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
-  <div class="bg-white rounded shadow-lg w-full max-w-2xl p-6 relative">
+  <div class="modal-panel bg-white rounded shadow-lg w-full p-6 relative">
     <button onclick="closeModal('properties-modal')" class="absolute top-2 right-2 text-gray-600 hover:text-black">
       <span class="material-icons">close</span>
     </button>
@@ -214,6 +230,7 @@
     if (s==='READY') return 'text-gray-700';
     if (s==='STARTING'||s==='WAITING') return 'text-yellow-600';
     if (s==='RUNNING') return 'text-green-600';
+    if (s==='STAMPING') return 'text-purple-600'; // <— NEW
     if (s==='STOPPED') return 'text-orange-600';
     if (s==='FAILED') return 'text-red-600';
     if (s==='DONE'||s==='COMPLETED') return 'text-blue-600';
@@ -407,18 +424,39 @@
       </div>`;
   }
 
+  let jobsAbortController = null
   async function fetchJobs(){
     const reqId = ++lastJobsReqId;
+
+    // Cancel any previous /jobs request
+    try { jobsAbortController?.abort(); } catch {}
+    jobsAbortController = new AbortController();
+
     const params = new URLSearchParams({
       page: String(CURRENT_PAGE),
       page_size: String(PAGE_SIZE),
       sort_by: 'date',
       sort_dir: CURRENT_DIR
     });
-    const response = await fetch(`/jobs?${params.toString()}`);
-    if (!response.ok) return;
+
+    let response;
+    try {
+      response = await fetch(`/jobs?${params.toString()}`, { signal: jobsAbortController.signal });
+    } catch (err) {
+      // Swallow aborts; surface real errors if you want
+      if (err?.name !== 'AbortError') console.error(err);
+      return;
+    }
+    if (!response || !response.ok) return;
+
+    // If a newer request started after this one, bail out
+    if (reqId !== lastJobsReqId) return;
 
     const payload = await response.json();
+
+    // If a newer request started while parsing, bail out
+    if (reqId !== lastJobsReqId) return;
+
     const items = Array.isArray(payload) ? payload : (payload.items || []);
     const meta  = Array.isArray(payload)
       ? { page: CURRENT_PAGE, total_pages: 1, total: items.length, page_size: items.length }
@@ -438,8 +476,15 @@
       const nameColor = statusColorClass(job.status||'');
 
       const canStart   = job.status === 'READY';
-      const canStop    = (job.status === 'STARTING' || job.status === 'WAITING' || job.status === 'RUNNING');
+      const canStop = (job.status === 'STARTING' || job.status === 'WAITING' || job.status === 'RUNNING' || job.status === 'STAMPING');
       const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'DONE');
+
+      const busy = ['STARTING','WAITING','RUNNING','STAMPING'].includes(String(job.status||'').toUpperCase());
+      const canStamp = !!job.filename && !busy;
+
+      const stampBtnHtml = canStamp
+        ? `<button class="stamp-btn" title="Frame-stamp"><span class="material-icons text-purple-600 hover:text-purple-800">looks_one</span></button>`
+        : ''; 
 
       const vcrBtnHtml = canStart
         ? `<button class="vcr-start-btn" title="Start"><span class="material-icons text-green-600 hover:text-green-800">play_circle</span></button>`
@@ -452,14 +497,13 @@
       const isDone = String(job.status||'').toUpperCase()==='DONE';
       const nameInner = isDone
         ? `<button class="name-text font-bold underline ${nameColor} hover:opacity-80 name-preview"
-             title="Preview"
-             data-title="${displayName.replace(/"/g,'&quot;')}"
-             data-jobid="${job.job_id}"
-             data-fps="${Number(job.source_fps||0)}">${displayName}</button>`
+            title="Preview"
+            data-title="${displayName.replace(/"/g,'&quot;')}"
+            data-jobid="${job.job_id}"
+            data-fps="${Number(job.source_fps||0)}">${displayName}</button>`
         : `<span class="name-text font-bold ${nameColor}">${displayName}</span>`;
 
-      const nameCellHTML =
-        `<div class="name-clip" title="${displayName.replace(/"/g,'&quot;')}">${nameInner}</div>`;
+      const nameCellHTML = `<div class="name-clip" title="${displayName.replace(/"/g,'&quot;')}">${nameInner}</div>`;
 
       const srcKbps = (() => {
         const kbpsStored = parseFloat(job.source_bitrate_kbps);
@@ -487,12 +531,30 @@
             <button class="delete-btn" title="Delete"><span class="material-icons text-red-600 hover:text-red-800">delete</span></button>
             <button class="properties-btn" title="Properties"><span class="material-icons text-gray-700 hover:text-black">info</span></button>
             <button class="settings-btn" title="Settings"><span class="material-icons text-gray-700 hover:text-black">settings</span></button>
+            ${stampBtnHtml}
             ${vcrBtnHtml}
           </div>
+
         </td>
       `;
-      jobList.appendChild(row);
+      el('job-list').appendChild(row);
 
+      const stampBtn = row.querySelector('.stamp-btn');
+      if (stampBtn) stampBtn.addEventListener('click', async ()=>{
+        if (!confirm('Create a frame-stamped copy and retarget this job to it? This uses slow software encoding.')) return;
+        try{
+          const r = await fetch(`/stamp_job/${job.job_id}`, { method:'POST' });
+          if (!r.ok) {
+            const j = await r.json().catch(()=>({}));
+            throw new Error(j.message || 'Stamp failed');
+          }
+          toast('Stamping started…');
+          fetchJobs();
+        }catch(err){
+          toast(`Stamp failed: ${err.message}`, false);
+        }
+      });
+            
       const previewBtn = row.querySelector('.name-preview');
       if (previewBtn){
         previewBtn.addEventListener('click', (e)=>{
@@ -524,6 +586,8 @@
       row.querySelector('.vcr-restart-btn')?.addEventListener('click',async ()=>{ const r=await fetch(`/restart_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
     });
 
+    // Only the newest response is allowed to update pager UI
+    if (reqId !== lastJobsReqId) return;
     applyPagerState(meta);
   }
 
@@ -675,8 +739,16 @@
     fetchMetrics();
     fetchAndUpdateMiniNet();
 
+    let jobsPollTimer = null;
+    async function pollJobsLoop(){
+      try { await fetchJobs(); } finally {
+        jobsPollTimer = setTimeout(pollJobsLoop, 1000);
+      }
+    }
+    pollJobsLoop();
+
     // timers
-    setInterval(fetchJobs, 1000);
+    //setInterval(fetchJobs, 1000);
     setInterval(fetchMetrics, 1000);
     setInterval(fetchAndUpdateMiniNet, 1000);
   });
