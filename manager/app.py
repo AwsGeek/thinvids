@@ -105,6 +105,36 @@ MIN_WARMUP_WORKERS  = int(os.getenv("MIN_WARMUP_WORKERS", "3"))   # desired acti
 PARTS_PER_WORKER    = int(os.getenv("PARTS_PER_WORKER", "1"))     # hint only
 MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
+ALLOWED_TARGET_HEIGHTS = (720, 1080)
+DEFAULT_TARGET_HEIGHT = 1080
+
+def normalize_target_height(value, default: int = DEFAULT_TARGET_HEIGHT) -> int:
+    try:
+        h = int(value)
+    except Exception:
+        h = default
+    return h if h in ALLOWED_TARGET_HEIGHTS else default
+
+def get_default_target_height() -> int:
+    """
+    Read global default target height from controller settings,
+    with a legacy fallback key for older deployments.
+    """
+    settings = {}
+    legacy = {}
+    try:
+        settings = _get_settings() or {}
+    except Exception:
+        settings = {}
+    try:
+        legacy = redis_client.hgetall('settings:global') or {}
+    except Exception:
+        legacy = {}
+
+    return normalize_target_height(
+        settings.get("default_target_height", legacy.get("default_target_height")),
+        DEFAULT_TARGET_HEIGHT
+    )
 
 def _current_active_hostnames() -> List[str]:
     nodes = get_active_nodes()
@@ -274,7 +304,20 @@ GLOBAL_SETTINGS_KEY = "global:settings"
 
 @app.get("/settings")
 def get_settings():
-    return _get_settings()
+    settings = _get_settings() or {}
+    try:
+        idle_sec = max(30, int(settings.get("suspend_idle_sec", 300) or 300))
+    except Exception:
+        idle_sec = 300
+    out = dict(settings)
+    out["suspend_enabled"] = str(settings.get("suspend_enabled", "0")).strip().lower() in ("1", "true", "yes", "on")
+    out["suspend_idle_sec"] = idle_sec
+    out["suspend_gc_enabled"] = str(settings.get("suspend_gc_enabled", "0")).strip().lower() in ("1", "true", "yes", "on")
+    out["default_target_height"] = normalize_target_height(
+        settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
+        DEFAULT_TARGET_HEIGHT
+    )
+    return jsonify(out)
 
 @app.post("/settings")
 def post_global_settings():
@@ -283,16 +326,30 @@ def post_global_settings():
     {
         "suspend_enabled": bool,
         "suspend_idle_sec": int (>=30),
-        "suspend_gc_enabled": bool
+        "suspend_gc_enabled": bool,
+        "default_target_height": 720|1080
     }
     """
     payload = request.get_json(silent=True) or {}
     try:
-        suspend_enabled = bool(payload.get("suspend_enabled", False))
-        suspend_gc_enabled = bool(payload.get("suspend_gc_enabled", False))
+        def _as_bool(v, default=False):
+            if v is None:
+                return default
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return v != 0
+            return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+        suspend_enabled = _as_bool(payload.get("suspend_enabled", False), False)
+        suspend_gc_enabled = _as_bool(payload.get("suspend_gc_enabled", False), False)
         idle = int(payload.get("suspend_idle_sec", 300))
         if idle < 30:
             idle = 30  # sane floor
+        default_target_height = normalize_target_height(
+            payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
+            DEFAULT_TARGET_HEIGHT
+        )
     except Exception:
         return jsonify({"error": "invalid payload"}), 400
 
@@ -300,12 +357,18 @@ def post_global_settings():
         "suspend_enabled": "1" if suspend_enabled else "0",
         "suspend_idle_sec": str(idle),
         "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
+        "default_target_height": str(default_target_height),
+    })
+    # Backward-compatible mirror for legacy readers.
+    redis_client.hset("settings:global", mapping={
+        "default_target_height": str(default_target_height),
     })
 
     return jsonify({
         "suspend_enabled": suspend_enabled,
         "suspend_idle_sec": idle,
         "suspend_gc_enabled": suspend_gc_enabled,
+        "default_target_height": default_target_height,
     })
 
 # ------------------------ Jobs API -------------------------
@@ -551,6 +614,11 @@ def add_job():
 
     now = str(time.time())
     global_settings = redis_client.hgetall('settings:global') or {}
+    default_target_height = get_default_target_height()
+    target_height = normalize_target_height(
+        data.get('target_height', default_target_height),
+        default_target_height
+    )
 
     auto_start_global = global_settings.get('auto_start', '1') == '1'
     auto_start_effective = (auto_start_global and not force_paused)
@@ -573,6 +641,7 @@ def add_job():
         'number_parts': number_parts,
         'serialize_pipeline': '1' if serialize_global else '0',
         'software_encode': '0',  # per-job default: disabled
+        'target_height': target_height,
         # placeholders (worker fills in)
         'source_codec': '',
         'source_resolution': '',
@@ -631,6 +700,8 @@ def copy_job():
     )
     serialize_src = src.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
     frame_src = src.get('software_encode', '0')
+    default_target_height = get_default_target_height()
+    target_height = normalize_target_height(src.get('target_height', default_target_height), default_target_height)
 
     new_job_id = str(uuid.uuid4())
     now = time.time()
@@ -647,6 +718,7 @@ def copy_job():
         'number_parts': number_parts,
         'serialize_pipeline': '1' if str(serialize_src) in ('1','true','True') else '0',
         'software_encode': '1' if str(frame_src) in ('1','true','True') else '0',
+        'target_height': target_height,
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -730,6 +802,8 @@ def restart_job(job_id):
     number_parts     = _int(job.get('number_parts',     globals_map.get('number_parts', 2)), 2)
     serialize_val    = job.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0'))
     frame_val        = job.get('software_encode', '0')
+    default_target_height = get_default_target_height()
+    target_height    = normalize_target_height(job.get('target_height', default_target_height), default_target_height)
     selected_v_stream= job.get('selected_v_stream', 0)
     selected_a_stream= job.get('selected_a_stream', 0)
 
@@ -744,6 +818,7 @@ def restart_job(job_id):
         'number_parts': number_parts,
         'serialize_pipeline': '1' if str(serialize_val) in ('1', 'true', 'True') else '0',
         'software_encode': '1' if str(frame_val) in ('1', 'true', 'True') else '0',
+        'target_height': target_height,
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -852,6 +927,7 @@ def job_settings(job_id):
 
     if request.method == 'GET':
         job = redis_client.hgetall(job_key)
+        default_target_height = get_default_target_height()
         streams_json = job.get('streams_json') or '{"video":[],"audio":[]}'
         try:
             streams = json.loads(streams_json)
@@ -865,6 +941,7 @@ def job_settings(job_id):
             'number_parts': int(job.get('number_parts', '2')),
             'serialize_pipeline': job.get('serialize_pipeline', '0'),
             'software_encode': job.get('software_encode', '0'),
+            'target_height': normalize_target_height(job.get('target_height', default_target_height), default_target_height),
             'streams': streams_json,
             'selected_v_stream': job.get('selected_v_stream', '0'),
             'selected_a_stream': job.get('selected_a_stream', '0'),
@@ -877,12 +954,17 @@ def job_settings(job_id):
 
     data = request.get_json(silent=True) or {}
     try:
+        default_target_height = get_default_target_height()
         seg   = int(data.get('segment_duration', job.get('segment_duration', 10)))
         parts = int(data.get('number_parts', job.get('number_parts', 2)))
         serialize_pipeline = bool(data.get('serialize_pipeline',
                                    job.get('serialize_pipeline', '0') in ('1','true','True')))
         software_encode = bool(data.get('software_encode',
                               job.get('software_encode', '0') in ('1','true','True')))
+        target_height = normalize_target_height(
+            data.get('target_height', job.get('target_height', default_target_height)),
+            default_target_height
+        )
         v_sel = data.get('selected_v_stream', job.get('selected_v_stream', 0))
         a_sel = data.get('selected_a_stream', job.get('selected_a_stream', 0))
 
@@ -896,6 +978,7 @@ def job_settings(job_id):
             'selected_a_stream': a_sel,
             'serialize_pipeline': '1' if serialize_pipeline else '0',
             'software_encode': '1' if software_encode else '0',
+            'target_height': target_height,
         }
         redis_client.hset(job_key, mapping=mapping)
 

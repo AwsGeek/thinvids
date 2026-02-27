@@ -16,7 +16,7 @@
     config_dir: /config
 
     # Redis (manager uses same Redis as workers)
-    redis_host: swarm3
+    redis_host: swarm1
     redis_port: 6379
     redis_db_tasks: 0
     redis_db_data: 1
@@ -123,11 +123,12 @@
 
     # --- venv for manager ---
     - name: Create venv
-      ansible.builtin.command: "python3 -m venv {{ app_root }}/venv"
-      args: { creates: "{{ app_root }}/venv/bin/python" }
+      command: python3 -m venv {{ app_root }}/venv
+      args:
+        creates: "{{ app_root }}/venv/bin/python"
 
     - name: Upgrade pip
-      ansible.builtin.command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
+      command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
       changed_when: false
 
     - name: Install Python deps in venv
@@ -137,11 +138,12 @@
 
     # --- Deploy only what workers need: worker/ + agent.py ---
     - name: Sync manager code
-      ansible.posix.synchronize:
+      ansible.builtin.copy:
         src: "{{ code_src }}/manager/"
         dest: "{{ app_root }}/current/"
-        delete: yes
-        rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: preserve
       notify: restart thinvids_manager
       tags: build_app # Add a tag here
 
@@ -169,13 +171,13 @@
 
 
     - name: Purge old bytecode (avoid stale imports)
-      ansible.builtin.command: "find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +"
+      command: find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +
       changed_when: false
       tags: build_app # Add a tag here
 
     # --- Make "redis" resolvable (app.py uses host='redis') ---
     - name: Resolve redis_host IP
-      ansible.builtin.command: "getent hosts {{ redis_host }}"
+      command: getent hosts {{ redis_host }}
       register: redis_getent
       changed_when: false
       failed_when: redis_getent.rc != 0

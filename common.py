@@ -78,8 +78,12 @@ class Status(str, Enum):
         """
         if isinstance(value, Status):
             return value
+        raw = str(value).strip().upper()
+        # Backward compatibility for legacy status values that may still exist in Redis.
+        if raw == "REJECTED":
+            return Status.FAILED
         try:
-            return Status[str(value).strip().upper()]
+            return Status[raw]
         except (KeyError, AttributeError):
             raise ValueError(f"Unknown Status: {value!r}")
 
@@ -159,6 +163,7 @@ DEFAULT_SETTINGS = {
     "suspend_enabled": "0",
     "suspend_idle_sec": "300",
     "suspend_gc_enabled": "0",
+    "default_target_height": "1080",
 }
 
 # ---------------- Global settings fetch (with light caching) ----------------

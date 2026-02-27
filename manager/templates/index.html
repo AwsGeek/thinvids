@@ -155,6 +155,13 @@
           <input id="settings-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
         </div>
       </div>
+      <div>
+        <label class="block text-sm font-medium mb-1" for="settings-target-height">Target Resolution</label>
+        <select id="settings-target-height" class="border p-2 rounded w-full">
+          <option value="720">720p</option>
+          <option value="1080">1080p</option>
+        </select>
+      </div>
       <div class="grid grid-cols-2 gap-4">
         <div>
           <label class="block text-sm font-medium mb-1" for="settings-v-stream">Video Stream</label>
@@ -610,6 +617,8 @@
     el('settings-filename').value = data.filename || '';
     el('settings-segment-duration').value = data.segment_duration || 10;
     el('settings-number-parts').value = data.number_parts || 2;
+    const targetHeightSel = el('settings-target-height');
+    targetHeightSel.value = String(data.target_height || 1080);
     const vSel = el('settings-v-stream'), aSel = el('settings-a-stream');
     vSel.innerHTML = ''; aSel.innerHTML = '';
     const raw = data.streams;
@@ -627,6 +636,7 @@
     setSelectIndexByValue(aSel, data.selected_a_stream, 0);
     el('settings-segment-duration').disabled = !editable;
     el('settings-number-parts').disabled = !editable;
+    targetHeightSel.disabled = !editable;
     vSel.disabled = !editable; aSel.disabled = !editable;
     // frame stamps setting
     const fsBox = el('job-software-encode');
@@ -650,13 +660,14 @@
     const job_id = el('settings-job-id').value;
     const segment_duration = parseInt(el('settings-segment-duration').value,10);
     const number_parts     = parseInt(el('settings-number-parts').value,10);
+    const target_height    = parseInt(el('settings-target-height').value,10);
     const selected_v_stream= el('settings-v-stream').selectedIndex;
     const selected_a_stream= el('settings-a-stream').selectedIndex;
     const serialize_pipeline = el('job-serialize-pipeline').checked;
     const software_encode = el('job-software-encode').checked;
     const res = await fetch(`/job_settings/${job_id}`,{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ segment_duration, number_parts, selected_v_stream, selected_a_stream, serialize_pipeline, software_encode })
+      body: JSON.stringify({ segment_duration, number_parts, target_height, selected_v_stream, selected_a_stream, serialize_pipeline, software_encode })
     });
     if (res.ok){ closeModal('job-settings-modal'); fetchJobs(); }
     else { alert((await res.text())||'Failed to save settings'); }

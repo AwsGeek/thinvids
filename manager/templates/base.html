@@ -67,6 +67,15 @@
           <label for="gs-gc-enabled" class="text-sm">Garbage collect projects before suspend</label>
         </div>
 
+        <div>
+          <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
+          <select id="gs-default-target-height" class="border p-2 rounded w-full">
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+          </select>
+          <p class="text-xs text-gray-600 mt-1">Used for new jobs unless a per-job target is set.</p>
+        </div>
+
         <div class="flex gap-2 pt-2">
           <button id="gs-save" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
           <button id="gs-cancel" type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300">Close</button>
@@ -99,6 +108,18 @@
       const chkEnabled = document.getElementById('gs-suspend-enabled');
       const numIdle    = document.getElementById('gs-idle-seconds');
       const chkGC      = document.getElementById('gs-gc-enabled');
+      const selTarget  = document.getElementById('gs-default-target-height');
+
+      const asBool = (v) => {
+        if (v === true || v === false) return v;
+        if (v === 1 || v === '1') return true;
+        if (v === 0 || v === '0') return false;
+        return String(v ?? '').toLowerCase() === 'true';
+      };
+      const asTargetHeight = (v, fallback = 1080) => {
+        const n = parseInt(v, 10);
+        return n === 720 || n === 1080 ? n : fallback;
+      };
 
       function show(){ modal.classList.remove('hidden'); modal.classList.add('flex'); }
       function hide(){ modal.classList.add('hidden'); modal.classList.remove('flex'); }
@@ -108,9 +129,10 @@
           const r = await fetch('/settings');
           if (!r.ok) throw new Error('load failed');
           const d = await r.json();
-          chkEnabled.checked = !!d.suspend_enabled;
+          chkEnabled.checked = asBool(d.suspend_enabled);
           numIdle.value = Number(d.suspend_idle_sec ?? 300);
-          chkGC.checked = !!d.suspend_gc_enabled;
+          chkGC.checked = asBool(d.suspend_gc_enabled);
+          selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
         }catch{ toast('Failed to load global settings', false); }
       }
       async function save(){
@@ -118,7 +140,8 @@
           const payload = {
             suspend_enabled: !!chkEnabled.checked,
             suspend_idle_sec: Math.max(30, parseInt(numIdle.value || 300, 10)),
-            suspend_gc_enabled: !!chkGC.checked
+            suspend_gc_enabled: !!chkGC.checked,
+            default_target_height: asTargetHeight(selTarget.value, 1080)
           };
           const r = await fetch('/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},

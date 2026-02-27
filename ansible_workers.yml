@@ -15,7 +15,7 @@
     library_dir: /library
 
     # Redis / pipeline
-    redis_host: swarm3
+    redis_host: swarm1
     redis_port: 6379
     redis_db_tasks: 0
     redis_db_data: 1
@@ -117,11 +117,12 @@
 
     # --- venv for worker ---
     - name: Create venv
-      ansible.builtin.command: "python3 -m venv {{ app_root }}/venv"
-      args: { creates: "{{ app_root }}/venv/bin/python" }
+      command: python3 -m venv {{ app_root }}/venv
+      args:
+        creates: "{{ app_root }}/venv/bin/python"
 
     - name: Upgrade pip
-      ansible.builtin.command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
+      command: "{{ app_root }}/venv/bin/pip install --upgrade pip"
       changed_when: false
 
     - name: Install Python deps in venv
@@ -131,16 +132,17 @@
 
     # --- Deploy only what workers need: worker/ + agent.py ---
     - name: Sync worker code
-      ansible.posix.synchronize:
+      ansible.builtin.copy:
         src: "{{ code_src }}/worker/"
         dest: "{{ app_root }}/current/"
-        delete: yes
-        rsync_opts: ["--exclude=__pycache__", "--exclude=*.pyc", "--exclude=.DS_Store"]
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: preserve
       notify: restart thinman-worker
       tags: build_app # Add a tag here
 
     - name: Purge old bytecode (avoid stale imports)
-      ansible.builtin.command: "find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +"
+      command: find {{ app_root }}/current -name __pycache__ -type d -prune -exec rm -rf {} +
       changed_when: false
       tags: build_app # Add a tag here
 

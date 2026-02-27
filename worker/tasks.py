@@ -43,7 +43,13 @@ HTTP_PORT      = int(ENV("MASTER_HTTP_PORT", "8000"))
 
 # Encoding parameters
 VAAPI_DEVICE  = ENV("VAAPI_DEVICE", "/dev/dri/renderD128")
-SCALE_FILTER  = ENV("VEM_SCALE_FILTER", "scale=-1:720,format=nv12,hwupload")
+ALLOWED_TARGET_HEIGHTS = {720, 1080}
+try:
+    DEFAULT_TARGET_HEIGHT = int(ENV("VEM_DEFAULT_TARGET_HEIGHT", "1080"))
+except Exception:
+    DEFAULT_TARGET_HEIGHT = 1080
+SCALE_FILTER_720 = ENV("VEM_SCALE_FILTER_720", "scale=-2:720,format=nv12,hwupload")
+SCALE_FILTER_1080 = ENV("VEM_SCALE_FILTER_1080", "scale=-2:1080,format=nv12,hwupload")
 VAAPI_RC_MODE = ENV("VEM_RC_MODE", "CQP")
 VAAPI_QP      = ENV("VEM_QP", "27")
 AUDIO_ARGS    = ENV("VEM_AUDIO_ARGS", "-c:a aac -ac 2 -b:a 192k")  # space-separated
@@ -166,6 +172,19 @@ def _final_output_path(src_filename: str) -> str:
 def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
     return s in (Status.FAILED, Status.STOPPED)
+
+def _normalize_target_height(value) -> int:
+    try:
+        h = int(value)
+    except Exception:
+        h = DEFAULT_TARGET_HEIGHT
+    return h if h in ALLOWED_TARGET_HEIGHTS else DEFAULT_TARGET_HEIGHT
+
+def _target_height_for_job(job_key: str) -> int:
+    return _normalize_target_height(redis.hget(job_key, "target_height"))
+
+def _vaapi_scale_filter(target_height: int) -> str:
+    return SCALE_FILTER_1080 if target_height == 1080 else SCALE_FILTER_720
 
 
 # --------------- Built-in HTTP server (shared) ----------------
@@ -339,6 +358,8 @@ def split(job_id: str, file_path: str):
     try:
         _start_http_once()  # HTTP server for parts
 
+        target_height = _normalize_target_height(job.get("target_height"))
+
         # Resolve input path
         src_path = file_path
         if not os.path.exists(src_path):
@@ -352,7 +373,12 @@ def split(job_id: str, file_path: str):
 
         # Mark as RUNNING & remember input path
         now = _now()
-        redis.hset(job_key, mapping={'status': Status.RUNNING.value, 'started_at': now, 'input_path': src_path})
+        redis.hset(job_key, mapping={
+            'status': Status.RUNNING.value,
+            'started_at': now,
+            'input_path': src_path,
+            'target_height': target_height,
+        })
 
         # Probe essentials for UI (cheap)
         meta     = _ffprobe_stream0(src_path)
@@ -644,6 +670,7 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
         # Build ffmpeg command
         stage = "encode"
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
+        target_height = _target_height_for_job(job_key)
         if software_encode:
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
@@ -651,6 +678,7 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
                 '-progress','pipe:2',
                 '-i', in_path,
                 '-map','0:v:0',
+                '-vf', f"scale=-2:{target_height}",
                 '-c:v','libx264','-preset','veryfast','-crf','23',
                 '-map','0:a?', *AUDIO_ARGS.split(),
                 out_path
@@ -663,7 +691,7 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
                 '-vaapi_device', VAAPI_DEVICE,
                 '-i', in_path,
                 '-map','0:v:0',
-                '-vf', SCALE_FILTER,
+                '-vf', _vaapi_scale_filter(target_height),
                 '-c:v','h264_vaapi',
                 '-rc_mode', VAAPI_RC_MODE,
                 '-qp', VAAPI_QP,
@@ -1462,6 +1490,7 @@ def stamp(job_id: str):
         seg   = _ival(job.get('segment_duration', globals_map.get('segment_duration', 10)), 10)
         parts = _ival(job.get('number_parts', globals_map.get('number_parts', 2)), 2)
         serialize = '1' if (job.get('serialize_pipeline', globals_map.get('serialize_pipeline', '0')) in ('1','true','True')) else '0'
+        target_height = _normalize_target_height(job.get('target_height'))
 
         new_mapping = {
             'job_id': new_job_id,
@@ -1475,6 +1504,7 @@ def stamp(job_id: str):
             'segment_duration': seg,
             'number_parts': parts,
             'serialize_pipeline': serialize,
+            'target_height': target_height,
             'software_encode': '0',  # regular pipeline, not stamping
             'source_codec': codec,
             'source_resolution': f"{width}x{height}" if (width and height) else '',
