@@ -44,7 +44,11 @@
       overflow: auto;          /* scroll the body */
       min-height: 0;           /* allow flex item to shrink */
       overscroll-behavior: contain; /* prevent background scroll chaining */
-    }    
+    }
+
+    .bulk-actions-wrap { display: none; }
+    .bulk-actions-wrap.active { display: inline-flex; }
+    .row-action-btn[disabled] { opacity: 0.45; pointer-events: none; }
   </style>
 {% endblock %}
 
@@ -73,9 +77,41 @@
 
 <h2 class="text-xl font-semibold my-2">Current Jobs</h2>
 
+<div class="bg-white rounded shadow p-3 mb-2">
+  <div class="flex flex-wrap items-end gap-3">
+    <div class="flex-1" style="min-width: 14rem;">
+      <label for="jobs-search" class="block text-xs font-medium text-gray-700 mb-1">Search Name</label>
+      <input id="jobs-search" type="text" class="border p-2 rounded w-full text-sm" placeholder="Search job name...">
+    </div>
+    <div style="min-width: 10rem;">
+      <label for="status-filter" class="block text-xs font-medium text-gray-700 mb-1">Status</label>
+      <select id="status-filter" class="border p-2 rounded w-full text-sm">
+        <option value="ALL">All</option>
+        <option value="READY">READY</option>
+        <option value="STARTING">STARTING</option>
+        <option value="WAITING">WAITING</option>
+        <option value="RUNNING">RUNNING</option>
+        <option value="STAMPING">STAMPING</option>
+        <option value="STOPPED">STOPPED</option>
+        <option value="FAILED">FAILED</option>
+        <option value="DONE">DONE</option>
+      </select>
+    </div>
+    <div style="min-width: 10rem;">
+      <label for="sort-by" class="block text-xs font-medium text-gray-700 mb-1">Sort By</label>
+      <select id="sort-by" class="border p-2 rounded w-full text-sm">
+        <option value="date">Date</option>
+        <option value="filename">Name</option>
+        <option value="status">Status</option>
+      </select>
+    </div>
+  </div>
+</div>
+
 <table id="job-table" class="w-full border-collapse bg-white">
   <!-- Column sizing: most are tiny; Name grows; progress fixed -->
   <colgroup>
+    <col class="shrink"><!-- Select -->
     <col class="shrink"><!-- ID -->
     <col><!-- Name (flex) -->
     <col class="shrink"><!-- Size -->
@@ -93,6 +129,7 @@
 
   <thead>
     <tr class="bg-gray-200 text-xs">
+      <th class="px-2 py-1 text-center"><input id="select-all-jobs" type="checkbox" title="Select all jobs on this page"></th>
       <th class="px-2 py-1 text-left">ID</th>
       <th class="px-2 py-1 text-left">Name</th>
       <th class="px-2 py-1 text-left">Size</th>
@@ -103,7 +140,19 @@
       <th class="px-2 py-1 text-left">Started</th>
       <th class="px-2 py-1 text-left">Time</th>
       <th class="px-2 py-1 text-left">Status</th>
-      <th class="px-2 py-1 text-left">Actions</th>
+      <th class="px-2 py-1 text-left">
+        <span id="actions-header-label">Actions</span>
+        <span id="bulk-actions-wrap" class="bulk-actions-wrap items-center gap-2">
+          <select id="bulk-action-select" class="border rounded px-2 py-1 text-xs">
+            <option value="">Bulk action…</option>
+            <option value="stop">Stop</option>
+            <option value="copy">Copy</option>
+            <option value="delete">Delete</option>
+            <option value="restart">Restart</option>
+          </select>
+          <button id="bulk-action-apply" class="px-2 py-1 border rounded text-xs">Apply</button>
+        </span>
+      </th>
     </tr>
   </thead>
   <tbody id="job-list"></tbody>
@@ -364,9 +413,93 @@
   const PAGER_KEY = 'thinvids_pager_v1';
   let CURRENT_PAGE = 1;
   const PAGE_SIZE = 10;
-  let CURRENT_SORT = 'date';  // always date, per spec
+  let CURRENT_SORT = 'date';
   let CURRENT_DIR  = 'desc';
+  let CURRENT_STATUS = 'ALL';
+  let CURRENT_QUERY = '';
+  let CURRENT_VISIBLE_JOB_IDS = [];
+  let searchDebounceTimer = null;
   let lastJobsReqId = 0;
+  const SELECTED_JOB_IDS = new Set();
+
+  function selectedJobIds(){
+    return Array.from(SELECTED_JOB_IDS);
+  }
+
+  function selectedCount(){
+    return SELECTED_JOB_IDS.size;
+  }
+
+  function updateBulkUiState(){
+    const label = el('actions-header-label');
+    const wrap = el('bulk-actions-wrap');
+    const allCb = el('select-all-jobs');
+    const applyBtn = el('bulk-action-apply');
+    const count = selectedCount();
+    const visibleCount = CURRENT_VISIBLE_JOB_IDS.length;
+    const selectedVisible = CURRENT_VISIBLE_JOB_IDS.filter(id => SELECTED_JOB_IDS.has(id)).length;
+
+    if (label) label.classList.toggle('hidden', count > 0);
+    if (wrap) wrap.classList.toggle('active', count > 0);
+    if (applyBtn) applyBtn.disabled = count < 1;
+
+    if (allCb) {
+      allCb.checked = visibleCount > 0 && selectedVisible === visibleCount;
+      allCb.indeterminate = selectedVisible > 0 && selectedVisible < visibleCount;
+    }
+
+    document.querySelectorAll('#job-list .row-action-btn').forEach(btn => {
+      btn.disabled = count > 1;
+    });
+  }
+
+  async function bulkApplySelectedJobs(){
+    const actionSel = el('bulk-action-select');
+    if (!actionSel) return;
+
+    const action = (actionSel.value || '').toLowerCase();
+    const ids = selectedJobIds();
+    if (!action || ids.length === 0) return;
+
+    if (action === 'delete' && !confirm(`Delete ${ids.length} selected job(s)?`)) return;
+    if (action === 'stop' && !confirm(`Stop ${ids.length} selected job(s)?`)) return;
+
+    let ok = 0;
+    let fail = 0;
+    for (const jobId of ids) {
+      try {
+        let res;
+        if (action === 'stop') {
+          res = await fetch(`/stop_job/${jobId}`, { method: 'POST' });
+        } else if (action === 'copy') {
+          res = await fetch('/copy_job', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobId })
+          });
+        } else if (action === 'delete') {
+          res = await fetch(`/delete_job/${jobId}`, { method: 'DELETE' });
+        } else if (action === 'restart') {
+          res = await fetch(`/restart_job/${jobId}`, { method: 'POST' });
+        } else {
+          continue;
+        }
+
+        if (res.ok) ok += 1;
+        else fail += 1;
+      } catch {
+        fail += 1;
+      }
+    }
+
+    if (ok > 0) toast(`${action.toUpperCase()}: ${ok} job(s)`);
+    if (fail > 0) toast(`${action.toUpperCase()}: ${fail} failed`, false);
+
+    SELECTED_JOB_IDS.clear();
+    if (actionSel) actionSel.value = '';
+    updateBulkUiState();
+    fetchJobs();
+  }
 
   function loadPager(){
     try{
@@ -375,12 +508,23 @@
       const s = JSON.parse(raw);
       if (s && typeof s === 'object'){
         if (Number.isInteger(s.page) && s.page>0) CURRENT_PAGE = s.page;
+        if (typeof s.sort === 'string' && ['date', 'filename', 'status'].includes(s.sort)) CURRENT_SORT = s.sort;
         if (s.dir === 'asc' || s.dir === 'desc') CURRENT_DIR = s.dir;
+        if (typeof s.status === 'string') CURRENT_STATUS = s.status.toUpperCase() || 'ALL';
+        if (typeof s.q === 'string') CURRENT_QUERY = s.q;
       }
     }catch{}
   }
   function savePager(){
-    try{ localStorage.setItem(PAGER_KEY, JSON.stringify({ page: CURRENT_PAGE, dir: CURRENT_DIR })); }catch{}
+    try{
+      localStorage.setItem(PAGER_KEY, JSON.stringify({
+        page: CURRENT_PAGE,
+        sort: CURRENT_SORT,
+        dir: CURRENT_DIR,
+        status: CURRENT_STATUS,
+        q: CURRENT_QUERY
+      }));
+    }catch{}
   }
 
   function applyPagerState(meta){
@@ -442,9 +586,12 @@
     const params = new URLSearchParams({
       page: String(CURRENT_PAGE),
       page_size: String(PAGE_SIZE),
-      sort_by: 'date',
+      sort_by: CURRENT_SORT,
       sort_dir: CURRENT_DIR
     });
+    if (CURRENT_STATUS && CURRENT_STATUS !== 'ALL') params.set('status', CURRENT_STATUS);
+    const query = (CURRENT_QUERY || '').trim();
+    if (query) params.set('q', query);
 
     let response;
     try {
@@ -470,6 +617,10 @@
       : { page: payload.page, total_pages: payload.total_pages, total: payload.total, page_size: payload.page_size };
 
     window.__JOBS_CACHE__ = items;
+    CURRENT_VISIBLE_JOB_IDS = items.map(j => j.job_id).filter(Boolean);
+    for (const jobId of selectedJobIds()){
+      if (!CURRENT_VISIBLE_JOB_IDS.includes(jobId)) SELECTED_JOB_IDS.delete(jobId);
+    }
 
     const jobList = el('job-list');
     jobList.innerHTML = '';
@@ -490,15 +641,15 @@
       const canStamp = !!job.filename && !busy;
 
       const stampBtnHtml = canStamp
-        ? `<button class="stamp-btn" title="Frame-stamp"><span class="material-icons text-purple-600 hover:text-purple-800">looks_one</span></button>`
+        ? `<button class="stamp-btn row-action-btn" title="Frame-stamp"><span class="material-icons text-purple-600 hover:text-purple-800">looks_one</span></button>`
         : ''; 
 
       const vcrBtnHtml = canStart
-        ? `<button class="vcr-start-btn" title="Start"><span class="material-icons text-green-600 hover:text-green-800">play_circle</span></button>`
+        ? `<button class="vcr-start-btn row-action-btn" title="Start"><span class="material-icons text-green-600 hover:text-green-800">play_circle</span></button>`
         : (canStop
-            ? `<button class="vcr-stop-btn" title="Stop"><span class="material-icons text-orange-600 hover:text-orange-800">stop_circle</span></button>`
+            ? `<button class="vcr-stop-btn row-action-btn" title="Stop"><span class="material-icons text-orange-600 hover:text-orange-800">stop_circle</span></button>`
             : (canRestart
-                ? `<button class="vcr-restart-btn" title="Restart"><span class="material-icons text-orange-600 hover:text-orange-800">change_circle</span></button>`
+                ? `<button class="vcr-restart-btn row-action-btn" title="Restart"><span class="material-icons text-orange-600 hover:text-orange-800">change_circle</span></button>`
                 : ''));
 
       const isDone = String(job.status||'').toUpperCase()==='DONE';
@@ -521,6 +672,9 @@
       })();
 
       row.innerHTML = `
+        <td class="px-2 py-1 text-center">
+          <input class="job-select" type="checkbox" data-jobid="${job.job_id}" ${SELECTED_JOB_IDS.has(job.job_id) ? 'checked' : ''}>
+        </td>
         <td class="px-2 py-1">${idShort}</td>
         <td class="px-2 py-1 name-cell">${nameCellHTML}</td>
         <td class="px-2 py-1">${formatBytes(job.source_file_size)}</td>
@@ -534,10 +688,10 @@
         <td class="px-2 py-1">
           <div class="flex items-center justify-center gap-1">
             ${job.filename && job.filename !== 'undefined'
-              ? `<button class="copy-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>` : ''}
-            <button class="delete-btn" title="Delete"><span class="material-icons text-red-600 hover:text-red-800">delete</span></button>
-            <button class="properties-btn" title="Properties"><span class="material-icons text-gray-700 hover:text-black">info</span></button>
-            <button class="settings-btn" title="Settings"><span class="material-icons text-gray-700 hover:text-black">settings</span></button>
+              ? `<button class="copy-btn row-action-btn" title="Copy"><span class="material-icons text-blue-600 hover:text-blue-800">content_copy</span></button>` : ''}
+            <button class="delete-btn row-action-btn" title="Delete"><span class="material-icons text-red-600 hover:text-red-800">delete</span></button>
+            <button class="properties-btn row-action-btn" title="Properties"><span class="material-icons text-gray-700 hover:text-black">info</span></button>
+            <button class="settings-btn row-action-btn" title="Settings"><span class="material-icons text-gray-700 hover:text-black">settings</span></button>
             ${stampBtnHtml}
             ${vcrBtnHtml}
           </div>
@@ -545,6 +699,12 @@
         </td>
       `;
       el('job-list').appendChild(row);
+
+      row.querySelector('.job-select')?.addEventListener('change', (e) => {
+        if (e.target.checked) SELECTED_JOB_IDS.add(job.job_id);
+        else SELECTED_JOB_IDS.delete(job.job_id);
+        updateBulkUiState();
+      });
 
       const stampBtn = row.querySelector('.stamp-btn');
       if (stampBtn) stampBtn.addEventListener('click', async ()=>{
@@ -592,6 +752,8 @@
       row.querySelector('.vcr-stop-btn')?.addEventListener('click',  async ()=>{ if(!confirm('Stop this job?'))return; const r=await fetch(`/stop_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
       row.querySelector('.vcr-restart-btn')?.addEventListener('click',async ()=>{ const r=await fetch(`/restart_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
     });
+
+    updateBulkUiState();
 
     // Only the newest response is allowed to update pager UI
     if (reqId !== lastJobsReqId) return;
@@ -739,6 +901,68 @@
 
     // restore pager
     loadPager();
+    const sortSel = el('sort-by');
+    const statusSel = el('status-filter');
+    const searchInput = el('jobs-search');
+
+    if (sortSel) sortSel.value = ['date', 'filename', 'status'].includes(CURRENT_SORT) ? CURRENT_SORT : 'date';
+    if (statusSel) {
+      const allowedStatus = ['ALL', 'READY', 'STARTING', 'WAITING', 'RUNNING', 'STAMPING', 'STOPPED', 'FAILED', 'DONE'];
+      if (!allowedStatus.includes(CURRENT_STATUS)) CURRENT_STATUS = 'ALL';
+      statusSel.value = CURRENT_STATUS;
+    }
+    if (searchInput) searchInput.value = CURRENT_QUERY;
+
+    safeOn('sort-by', 'change', (e) => {
+      const nextSort = (e.target.value || 'date').toLowerCase();
+      if (!['date', 'filename', 'status'].includes(nextSort)) return;
+      CURRENT_SORT = nextSort;
+      CURRENT_DIR = (nextSort === 'date') ? 'desc' : 'asc';
+      CURRENT_PAGE = 1;
+      savePager();
+      fetchJobs();
+    });
+
+    safeOn('status-filter', 'change', (e) => {
+      CURRENT_STATUS = (e.target.value || 'ALL').toUpperCase();
+      CURRENT_PAGE = 1;
+      savePager();
+      fetchJobs();
+    });
+
+    safeOn('jobs-search', 'input', (e) => {
+      CURRENT_QUERY = e.target.value || '';
+      CURRENT_PAGE = 1;
+      savePager();
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => fetchJobs(), 250);
+    });
+
+    safeOn('jobs-search', 'keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+      fetchJobs();
+    });
+
+    safeOn('select-all-jobs', 'change', (e) => {
+      const checked = !!e.target.checked;
+      document.querySelectorAll('#job-list .job-select').forEach(cb => {
+        cb.checked = checked;
+        const jobId = cb.dataset.jobid;
+        if (!jobId) return;
+        if (checked) SELECTED_JOB_IDS.add(jobId);
+        else SELECTED_JOB_IDS.delete(jobId);
+      });
+      updateBulkUiState();
+    });
+
+    safeOn('bulk-action-apply', 'click', bulkApplySelectedJobs);
+    safeOn('bulk-action-select', 'keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      bulkApplySelectedJobs();
+    });
 
     safeOn('pg-first','click',()=>{ CURRENT_PAGE = 1; savePager(); fetchJobs(); });
     safeOn('pg-prev','click', ()=>{ CURRENT_PAGE = Math.max(1, CURRENT_PAGE-1); savePager(); fetchJobs(); });
@@ -746,6 +970,7 @@
     safeOn('pg-last','click', ()=>{ const meta = window.__PAGER_META__ || { total_pages: CURRENT_PAGE }; CURRENT_PAGE = meta.total_pages; savePager(); fetchJobs(); });
 
     // initial pulls
+    updateBulkUiState();
     fetchJobs();
     fetchMetrics();
     fetchAndUpdateMiniNet();

@@ -12,6 +12,7 @@ import re
 import struct
 from typing import List
 import subprocess
+import threading
 
 # import backend task planner
 from tasks import transcode, stamp
@@ -107,6 +108,14 @@ MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
 ALLOWED_TARGET_HEIGHTS = (720, 1080)
 DEFAULT_TARGET_HEIGHT = 1080
+PIPELINE_QUEUE_ACTION_TRANSCODE = "TRANSCODE"
+PIPELINE_QUEUE_ACTION_STAMP = "STAMP"
+PIPELINE_ACTIVE_JOB_KEY = "pipeline:active_job"
+PIPELINE_SCHED_LOCK_KEY = "pipeline:scheduler:lock"
+PIPELINE_SCHED_LOCK_TTL_SEC = max(5, int(os.getenv("PIPELINE_SCHED_LOCK_TTL_SEC", "30")))
+PIPELINE_SCHED_POLL_SEC = max(0.5, float(os.getenv("PIPELINE_SCHED_POLL_SEC", "2")))
+_PIPELINE_SCHED_STARTED = False
+_PIPELINE_SCHED_GUARD = threading.Lock()
 
 def normalize_target_height(value, default: int = DEFAULT_TARGET_HEIGHT) -> int:
     try:
@@ -194,6 +203,201 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
             redis_client.hset(job_key, mapping={'status': Status.FAILED.value, 'error': str(e)})
         except Exception:
             pass
+
+def _float_or(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def _job_index_keys() -> List[str]:
+    keys = list(redis_client.smembers("jobs:all") or [])
+    if keys:
+        return keys
+
+    keys = [k for k in redis_client.scan_iter("job:*", count=1000)]
+    if keys:
+        try:
+            redis_client.sadd("jobs:all", *keys)
+        except Exception:
+            pass
+    return keys
+
+def _is_terminal_pipeline_status(status_raw: str) -> bool:
+    raw = (status_raw or "").strip().upper()
+    if raw == "COMPLETED":
+        return True
+    try:
+        status = Status.parse(raw)
+    except Exception:
+        return False
+    return status in {Status.READY, Status.STOPPED, Status.FAILED, Status.DONE}
+
+def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
+    redis_client.hset(job_key, mapping={
+        'status': Status.WAITING.value,
+        'queue_action': action,
+        'waiting_at': str(time.time()),
+        'started_at': str(started_at),
+    })
+
+def _acquire_pipeline_sched_lock():
+    token = f"{uuid.uuid4().hex}:{time.time()}"
+    ok = redis_client.set(PIPELINE_SCHED_LOCK_KEY, token, nx=True, ex=PIPELINE_SCHED_LOCK_TTL_SEC)
+    return token if ok else None
+
+def _release_pipeline_sched_lock(token: str):
+    try:
+        current = redis_client.get(PIPELINE_SCHED_LOCK_KEY)
+        if current == token:
+            redis_client.delete(PIPELINE_SCHED_LOCK_KEY)
+    except Exception:
+        pass
+
+def _reserve_next_waiting_job_locked():
+    active_job_id = (redis_client.get(PIPELINE_ACTIVE_JOB_KEY) or "").strip()
+    if active_job_id:
+        active_key = f"job:{active_job_id}"
+        if (not redis_client.exists(active_key)) or _is_terminal_pipeline_status(redis_client.hget(active_key, "status") or ""):
+            redis_client.delete(PIPELINE_ACTIVE_JOB_KEY)
+        else:
+            return None
+
+    keys = _job_index_keys()
+    if not keys:
+        return None
+
+    pipe = redis_client.pipeline()
+    for k in keys:
+        pipe.hgetall(k)
+    raw_jobs = pipe.execute()
+
+    candidates = []
+    active_candidates = []
+    for job_key, job in zip(keys, raw_jobs):
+        if not job:
+            continue
+
+        try:
+            status = Status.parse(job.get('status'))
+        except Exception:
+            if (job.get('status') or '').strip().upper() == "COMPLETED":
+                status = Status.DONE
+            else:
+                continue
+
+        filename = (job.get('filename') or '').strip()
+        job_id = (job.get('job_id') or (job_key.split(':', 1)[1] if ':' in job_key else '')).strip()
+        if not filename or not job_id:
+            continue
+
+        if status in {Status.STARTING, Status.RUNNING, Status.STAMPING}:
+            started_at = _float_or(job.get('started_at'), _float_or(job.get('created_at'), 0.0))
+            created_at = _float_or(job.get('created_at'), 0.0)
+            active_candidates.append((started_at, created_at, job_id))
+            continue
+
+        if status != Status.WAITING:
+            continue
+
+        action = (job.get('queue_action') or PIPELINE_QUEUE_ACTION_TRANSCODE).strip().upper()
+        if action not in {PIPELINE_QUEUE_ACTION_TRANSCODE, PIPELINE_QUEUE_ACTION_STAMP}:
+            action = PIPELINE_QUEUE_ACTION_TRANSCODE
+
+        waiting_at = _float_or(job.get('waiting_at'), _float_or(job.get('started_at'), _float_or(job.get('created_at'), 0.0)))
+        created_at = _float_or(job.get('created_at'), 0.0)
+        candidates.append((waiting_at, created_at, job_id, job_key, filename, action, job))
+
+    if active_candidates:
+        active_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        redis_client.set(PIPELINE_ACTIVE_JOB_KEY, active_candidates[0][2])
+        return None
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+    _, _, job_id, job_key, filename, action, job = candidates[0]
+
+    started_at = _float_or(job.get('started_at'), 0.0)
+    mapping = {
+        'status': Status.STAMPING.value if action == PIPELINE_QUEUE_ACTION_STAMP else Status.STARTING.value,
+    }
+    if started_at <= 0:
+        mapping['started_at'] = str(time.time())
+    redis_client.hset(job_key, mapping=mapping)
+    redis_client.set(PIPELINE_ACTIVE_JOB_KEY, job_id)
+
+    return {
+        'job_id': job_id,
+        'job_key': job_key,
+        'filename': filename,
+        'action': action,
+    }
+
+def _launch_reserved_job(reserved):
+    if not reserved:
+        return
+
+    job_id = reserved['job_id']
+    job_key = reserved['job_key']
+    filename = reserved['filename']
+    action = reserved['action']
+
+    try:
+        if action == PIPELINE_QUEUE_ACTION_STAMP:
+            _ensure_one_worker_awake()
+            stamp(job_id)
+        else:
+            _launch_after_warmup(job_key, job_id, filename)
+    except Exception as e:
+        logger.exception("[%s] reserved launch failed", job_id)
+        try:
+            redis_client.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': str(e),
+                'ended_at': time.time(),
+            })
+        except Exception:
+            pass
+
+def dispatch_next_waiting_job() -> bool:
+    token = _acquire_pipeline_sched_lock()
+    if not token:
+        return False
+
+    try:
+        reserved = _reserve_next_waiting_job_locked()
+    finally:
+        _release_pipeline_sched_lock(token)
+
+    if not reserved:
+        return False
+
+    _launch_reserved_job(reserved)
+    return True
+
+def _pipeline_scheduler_loop():
+    while True:
+        try:
+            dispatch_next_waiting_job()
+        except Exception:
+            logger.exception("pipeline scheduler tick failed")
+        time.sleep(PIPELINE_SCHED_POLL_SEC)
+
+def _start_pipeline_scheduler():
+    global _PIPELINE_SCHED_STARTED
+    with _PIPELINE_SCHED_GUARD:
+        if _PIPELINE_SCHED_STARTED:
+            return
+        thread = threading.Thread(
+            target=_pipeline_scheduler_loop,
+            name="pipeline-scheduler",
+            daemon=True
+        )
+        thread.start()
+        _PIPELINE_SCHED_STARTED = True
+        logger.info("Pipeline scheduler started (poll=%.1fs)", PIPELINE_SCHED_POLL_SEC)
 
 
 # -------------------------- Views --------------------------
@@ -460,13 +664,50 @@ def list_jobs():
 
     sort_by = (request.args.get('sort_by') or 'date').lower()
     sort_dir = (request.args.get('sort_dir') or 'desc').lower()
+    status_filter = (request.args.get('status') or '').strip().upper()
+    name_query = (request.args.get('q') or '').strip().lower()
     reverse = (sort_dir != 'asc')
 
-    status_order = {'READY': 0, 'RUNNING': 1, 'STOPPED': 2, 'FAILED': 3, 'DONE': 4}
+    status_order = {
+        'READY': 0,
+        'STARTING': 1,
+        'WAITING': 2,
+        'RUNNING': 3,
+        'STAMPING': 4,
+        'STOPPED': 5,
+        'FAILED': 6,
+        'DONE': 7,
+        'COMPLETED': 7,
+    }
+
+    filtered_jobs = jobs_list
+    if status_filter and status_filter != 'ALL':
+        if status_filter == 'DONE':
+            filtered_jobs = [
+                j for j in filtered_jobs
+                if (j.get('status') or '').upper() in {'DONE', 'COMPLETED'}
+            ]
+        else:
+            filtered_jobs = [
+                j for j in filtered_jobs
+                if (j.get('status') or '').upper() == status_filter
+            ]
+
+    if name_query:
+        def _matches_name(job):
+            filename = (job.get('filename') or '')
+            base_name = os.path.basename(filename).lower()
+            display_name = os.path.splitext(base_name)[0]
+            return (
+                name_query in display_name
+                or name_query in base_name
+                or name_query in filename.lower()
+            )
+        filtered_jobs = [j for j in filtered_jobs if _matches_name(j)]
 
     def sort_key(job):
         s = (job.get('status') or '').upper()
-        filename = (job.get('filename') or '').lower()
+        filename = os.path.basename(job.get('filename') or '').lower()
         started = float(job.get('started') or 0)
         created = float(job.get('created') or 0)
         encode = int(job.get('encode_progress') or 0)
@@ -480,7 +721,7 @@ def list_jobs():
         else:  # 'date'
             return max(started, created)
 
-    jobs_sorted = sorted(jobs_list, key=sort_key, reverse=reverse)
+    jobs_sorted = sorted(filtered_jobs, key=sort_key, reverse=reverse)
 
     total = len(jobs_sorted)
     total_pages = max(1, ceil(total / page_size))
@@ -627,7 +868,7 @@ def add_job():
     segment_duration = int(global_settings.get('segment_duration', 10))
     number_parts = int(global_settings.get('number_parts', 2))
 
-    status = Status.STARTING if auto_start_effective else Status.READY
+    status = Status.WAITING if auto_start_effective else Status.READY
     job_settings = {
         'job_id': job_id,
         'filename': filename,
@@ -642,6 +883,8 @@ def add_job():
         'serialize_pipeline': '1' if serialize_global else '0',
         'software_encode': '0',  # per-job default: disabled
         'target_height': target_height,
+        'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE if auto_start_effective else '',
+        'waiting_at': now if auto_start_effective else '0',
         # placeholders (worker fills in)
         'source_codec': '',
         'source_resolution': '',
@@ -660,9 +903,8 @@ def add_job():
     redis_client.sadd("jobs:all", job_key)
 
     if auto_start_effective:
-        # Confirm STARTING + warm-up launch
-        redis_client.hset(job_key, mapping={'status': Status.STARTING.value, 'started_at': now})
-        _launch_after_warmup(job_key, job_id, filename)
+        _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, _float_or(now, time.time()))
+        dispatch_next_waiting_job()
 
     return jsonify({'status': 'success', 'job_id': job_id}), 201
 
@@ -753,12 +995,10 @@ def start_job(job_id):
     if not filename:
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
-    now = str(time.time())
-    redis_client.hset(job_key, mapping={'status': Status.STARTING.value, 'started_at': now})
-
-    # Wake, wait for heartbeats, set hint, then launch
-    _launch_after_warmup(job_key, job_id, filename)
-    return jsonify({'status': 'started'}), 200
+    now = time.time()
+    _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, now)
+    dispatch_next_waiting_job()
+    return jsonify({'status': 'queued'}), 200
 
 @app.post('/restart_job/<job_id>')
 def restart_job(job_id):
@@ -811,7 +1051,7 @@ def restart_job(job_id):
     new_fields = {
         'job_id': job_id,
         'filename': filename,
-        'status': Status.STARTING.value,
+        'status': Status.WAITING.value,
         'started_at': str(now),
         'ended_at': 0,
         'segment_duration': segment_duration,
@@ -834,7 +1074,9 @@ def restart_job(job_id):
         'combine_elapsed': 0,
         'combine_progress': 0,
         'elapsed': 0,
-        'streams_json': job.get('streams_json')
+        'streams_json': job.get('streams_json'),
+        'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE,
+        'waiting_at': str(now),
 
     }
 
@@ -847,9 +1089,8 @@ def restart_job(job_id):
     except Exception:
         pass
 
-    # Wake, wait for heartbeats, set hint, then launch
-    _launch_after_warmup(job_key, job_id, filename)
-    return jsonify({'status': 'started'}), 200
+    dispatch_next_waiting_job()
+    return jsonify({'status': 'queued'}), 200
 
 
 @app.get('/dashboard')
@@ -862,8 +1103,11 @@ def stop_job(job_id):
     if not redis_client.exists(job_key):
         return jsonify({'status': 'not found'}), 404
 
-    redis_client.hset(job_key, 'status', Status.STOPPED.value)
+    redis_client.hset(job_key, mapping={'status': Status.STOPPED.value, 'ended_at': time.time()})
     huey.revoke_by_id(job_id)
+    if (redis_client.get(PIPELINE_ACTIVE_JOB_KEY) or '').strip() == job_id:
+        redis_client.delete(PIPELINE_ACTIVE_JOB_KEY)
+    dispatch_next_waiting_job()
     return jsonify({'status': 'stopped'}), 200
 
 @app.delete('/delete_job/<job_id>')
@@ -885,6 +1129,10 @@ def delete_job(job_id):
         redis_client.srem("jobs:all", job_key)
     except Exception:
         pass
+
+    if (redis_client.get(PIPELINE_ACTIVE_JOB_KEY) or '').strip() == job_id:
+        redis_client.delete(PIPELINE_ACTIVE_JOB_KEY)
+    dispatch_next_waiting_job()
 
     if job_dir and os.path.exists(job_dir):
         try:
@@ -1136,18 +1384,18 @@ def stamp_job(job_id):
     if not os.path.exists(full_path):
         return jsonify({'status':'error','message':f'Input not found: {full_path}'}), 400
 
-    # mark STAMPING now (also done by task; this gives instant UI feedback)
     now = time.time()
+    started_at = _float_or(job.get('started_at'), 0.0)
+    if started_at <= 0:
+        started_at = now
+
+    _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_STAMP, started_at)
     redis_client.hset(job_key, mapping={
-        'status': Status.STAMPING.value,
-        'started_at': str(now) if float(job.get('started_at',0) or 0)==0 else job.get('started_at'),
         'encode_progress': 0,
         'encode_elapsed': 0,
     })
+    dispatch_next_waiting_job()
+    return jsonify({'status':'queued'}), 202
 
-    # ensure at least one worker is awake for the stamp job
-    _ensure_one_worker_awake()
 
-    # enqueue
-    stamp(job_id)
-    return jsonify({'status':'stamping'}), 202
+_start_pipeline_scheduler()
