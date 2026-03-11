@@ -66,6 +66,7 @@ class Status(str, Enum):
     STAMPING  = "STAMPING"   # <— NEW
     STOPPED   = "STOPPED"
     FAILED    = "FAILED"
+    REJECTED  = "REJECTED"
     DONE      = "DONE"
 
     # --- helpers -----------------------------------------------------------
@@ -159,6 +160,8 @@ DEFAULT_SETTINGS = {
     "suspend_enabled": "0",
     "suspend_idle_sec": "300",
     "suspend_gc_enabled": "0",
+    "max_source_file_size_gb": "15",
+    "av1_check_enabled": "1",
 }
 
 # ---------------- Global settings fetch (with light caching) ----------------

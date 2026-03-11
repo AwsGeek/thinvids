@@ -272,6 +272,47 @@ def metrics_snapshot():
 
 GLOBAL_SETTINGS_KEY = "global:settings"
 
+def _settings_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+def _settings_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+def _settings_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _safe_status(value, default=Status.READY):
+    try:
+        return Status.parse(value)
+    except Exception:
+        return default
+
+def _load_global_settings():
+    """
+    Merge legacy and canonical settings keys.
+    Canonical `global:settings` wins on overlap.
+    """
+    settings = {}
+    try:
+        settings.update(redis_client.hgetall("settings:global") or {})
+    except Exception:
+        pass
+    try:
+        settings.update(redis_client.hgetall(GLOBAL_SETTINGS_KEY) or {})
+    except Exception:
+        pass
+    settings.setdefault("max_source_file_size_gb", "15")
+    settings.setdefault("av1_check_enabled", "1")
+    return settings
+
 @app.get("/settings")
 def get_settings():
     return _get_settings()
@@ -283,16 +324,22 @@ def post_global_settings():
     {
         "suspend_enabled": bool,
         "suspend_idle_sec": int (>=30),
-        "suspend_gc_enabled": bool
+        "suspend_gc_enabled": bool,
+        "max_source_file_size_gb": number (>0),
+        "av1_check_enabled": bool
     }
     """
     payload = request.get_json(silent=True) or {}
     try:
-        suspend_enabled = bool(payload.get("suspend_enabled", False))
-        suspend_gc_enabled = bool(payload.get("suspend_gc_enabled", False))
+        suspend_enabled = _settings_bool(payload.get("suspend_enabled", False), False)
+        suspend_gc_enabled = _settings_bool(payload.get("suspend_gc_enabled", False), False)
         idle = int(payload.get("suspend_idle_sec", 300))
         if idle < 30:
             idle = 30  # sane floor
+        max_size_gb = float(payload.get("max_source_file_size_gb", 15))
+        if max_size_gb <= 0:
+            max_size_gb = 15.0
+        av1_check_enabled = _settings_bool(payload.get("av1_check_enabled", True), True)
     except Exception:
         return jsonify({"error": "invalid payload"}), 400
 
@@ -300,12 +347,16 @@ def post_global_settings():
         "suspend_enabled": "1" if suspend_enabled else "0",
         "suspend_idle_sec": str(idle),
         "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
+        "max_source_file_size_gb": str(max_size_gb),
+        "av1_check_enabled": "1" if av1_check_enabled else "0",
     })
 
     return jsonify({
         "suspend_enabled": suspend_enabled,
         "suspend_idle_sec": idle,
         "suspend_gc_enabled": suspend_gc_enabled,
+        "max_source_file_size_gb": max_size_gb,
+        "av1_check_enabled": av1_check_enabled,
     })
 
 # ------------------------ Jobs API -------------------------
@@ -326,11 +377,21 @@ def list_jobs():
     if cached_list is None or (now - ts) >= 0.5:
         keys = list(redis_client.smembers("jobs:all") or [])
 
-        # Fallback seeding if index missing (first run / migration)
-        if not keys:
-            # One-time SCAN (kept off hot path by cache + subsequent index usage)
-            keys = [k for k in redis_client.scan_iter("job:*", count=1000)]
+        # Always reconcile jobs index from canonical keys.
+        # This keeps older jobs visible after index/schema/code changes.
+        scanned = [k for k in redis_client.scan_iter("job:*", count=1000)]
+        if scanned:
             if keys:
+                indexed = set(keys)
+                missing = [k for k in scanned if k not in indexed]
+                if missing:
+                    try:
+                        redis_client.sadd("jobs:all", *missing)
+                    except Exception:
+                        pass
+                    keys.extend(missing)
+            else:
+                keys = scanned
                 try:
                     redis_client.sadd("jobs:all", *keys)
                 except Exception:
@@ -359,7 +420,7 @@ def list_jobs():
             nowf    = time.time()
             elapsed = 0
 
-            status =  Status.parse(job_data.get('status'))
+            status = _safe_status(job_data.get('status'))
             if status in [Status.RUNNING, Status.WAITING, Status.STARTING]:
                 elapsed = nowf - started
             elif ended:
@@ -370,6 +431,7 @@ def list_jobs():
             jobs.append({
                 'job_id': job_id,
                 **job_data,
+                'status': status.value,
                 'segment_progress': int(job_data.get('segment_progress', '0') or 0),
                 'encode_progress':  int(job_data.get('encode_progress',  '0') or 0),
                 'combine_progress': int(job_data.get('combine_progress', '0') or 0),
@@ -398,8 +460,12 @@ def list_jobs():
     sort_by = (request.args.get('sort_by') or 'date').lower()
     sort_dir = (request.args.get('sort_dir') or 'desc').lower()
     reverse = (sort_dir != 'asc')
+    status_filter = (request.args.get('status') or 'all').strip().upper()
 
-    status_order = {'READY': 0, 'RUNNING': 1, 'STOPPED': 2, 'FAILED': 3, 'DONE': 4}
+    if status_filter and status_filter != 'ALL':
+        jobs_list = [j for j in jobs_list if str(j.get('status', '')).upper() == status_filter]
+
+    status_order = {'READY': 0, 'STARTING': 1, 'WAITING': 2, 'RUNNING': 3, 'STAMPING': 4, 'STOPPED': 5, 'FAILED': 6, 'REJECTED': 7, 'DONE': 8}
 
     def sort_key(job):
         s = (job.get('status') or '').upper()
@@ -407,11 +473,14 @@ def list_jobs():
         started = float(job.get('started') or 0)
         created = float(job.get('created') or 0)
         encode = int(job.get('encode_progress') or 0)
+        size = int(job.get('source_file_size') or 0)
 
-        if sort_by == 'filename':
+        if sort_by in ('name', 'filename'):
             return (filename,)
         elif sort_by == 'status':
             return (status_order.get(s, 99), filename)
+        elif sort_by == 'size':
+            return (size, filename)
         elif sort_by == 'encode':
             return (encode, started, filename)
         else:  # 'date'
@@ -550,14 +619,16 @@ def add_job():
     job_key = f"job:{job_id}"
 
     now = str(time.time())
-    global_settings = redis_client.hgetall('settings:global') or {}
+    global_settings = _load_global_settings()
 
-    auto_start_global = global_settings.get('auto_start', '1') == '1'
+    auto_start_global = _settings_bool(global_settings.get('auto_start', '1'), True)
     auto_start_effective = (auto_start_global and not force_paused)
-    serialize_global  = global_settings.get('serialize_pipeline', '0') == '1'
+    serialize_global  = _settings_bool(global_settings.get('serialize_pipeline', '0'), False)
 
-    segment_duration = int(global_settings.get('segment_duration', 10))
-    number_parts = int(global_settings.get('number_parts', 2))
+    segment_duration = _settings_int(global_settings.get('segment_duration', 10), 10)
+    number_parts = _settings_int(global_settings.get('number_parts', 2), 2)
+    max_source_file_size_gb = _settings_float(global_settings.get('max_source_file_size_gb', 15), 15.0)
+    av1_check_enabled = _settings_bool(global_settings.get('av1_check_enabled', '1'), True)
 
     status = Status.STARTING if auto_start_effective else Status.READY
     job_settings = {
@@ -581,9 +652,42 @@ def add_job():
         'source_file_size': 0,
         'total_frames': 0
     }
-    # Kick off async probe on a worker
+    # Probe source up front so we can reject unsupported inputs early.
     video_details = get_video_details(job_id, full_path)
+    source_size = _settings_int(video_details.get('source_file_size', 0), 0)
+    source_codec = str(video_details.get('source_codec') or '').strip().lower()
+
+    max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
+    rejection_message = None
+    rejection_reason = None
+    if max_source_bytes > 0 and source_size > max_source_bytes:
+        rejection_reason = 'size_limit'
+        rejection_message = (
+            f"Source file too large: {humanize.naturalsize(source_size, binary=True)} "
+            f"> {max_source_file_size_gb:g} GiB limit"
+        )
+    elif av1_check_enabled and source_codec in ('av1', 'av01'):
+        rejection_reason = 'av1_rejected'
+        rejection_message = 'AV1 source rejected by global setting (av1_check_enabled).'
+
     job_settings = {**job_settings, **video_details}
+    if rejection_message:
+        job_settings.update({
+            'status': Status.REJECTED.value,
+            'started_at': '0',
+            'error': rejection_message,
+            'rejected_reason': rejection_reason,
+            'rejected_at': now,
+        })
+        redis_client.hset(job_key, mapping=job_settings)
+        redis_client.sadd("jobs:all", job_key)
+        logger.info(f"[{job_id}] Rejected source '{filename}': {rejection_message}")
+        return jsonify({
+            'status': 'rejected',
+            'job_id': job_id,
+            'message': rejection_message,
+            'reason': rejection_reason,
+        }), 201
 
     redis_client.hset(job_key, mapping=job_settings)
 
@@ -610,7 +714,7 @@ def copy_job():
 
     src = redis_client.hgetall(source_key)
 
-    globals_map = redis_client.hgetall('settings:global')
+    globals_map = _load_global_settings()
     def _int(v, default):
         try:
             return int(v)
@@ -695,8 +799,8 @@ def restart_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if Status.parse(job.get('status')) not in [Status.STOPPED, Status.FAILED, Status.DONE]:
-        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/DONE state.'}), 400
+    if Status.parse(job.get('status')) not in [Status.STOPPED, Status.FAILED, Status.REJECTED, Status.DONE]:
+        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/REJECTED/DONE state.'}), 400
 
     filename = job.get('filename')
     if not filename:
@@ -719,7 +823,7 @@ def restart_job(job_id):
             pass
 
     # Carry over settings (with sane fallbacks)
-    globals_map = redis_client.hgetall('settings:global')
+    globals_map = _load_global_settings()
     def _int(v, default):
         try:
             return int(v)

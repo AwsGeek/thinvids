@@ -67,6 +67,17 @@
           <label for="gs-gc-enabled" class="text-sm">Garbage collect projects before suspend</label>
         </div>
 
+        <div>
+          <label for="gs-max-source-size-gb" class="block text-sm font-medium mb-1">Max source file size (GiB)</label>
+          <input id="gs-max-source-size-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+          <p class="text-xs text-gray-600 mt-1">Files larger than this are rejected before job creation.</p>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-av1-check-enabled" type="checkbox" class="h-4 w-4">
+          <label for="gs-av1-check-enabled" class="text-sm">Reject AV1 source files</label>
+        </div>
+
         <div class="flex gap-2 pt-2">
           <button id="gs-save" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
           <button id="gs-cancel" type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300">Close</button>
@@ -99,6 +110,15 @@
       const chkEnabled = document.getElementById('gs-suspend-enabled');
       const numIdle    = document.getElementById('gs-idle-seconds');
       const chkGC      = document.getElementById('gs-gc-enabled');
+      const numMaxSize = document.getElementById('gs-max-source-size-gb');
+      const chkAv1     = document.getElementById('gs-av1-check-enabled');
+
+      const asBool = (v, d=false) => {
+        if (v === null || v === undefined) return d;
+        if (typeof v === 'boolean') return v;
+        const s = String(v).trim().toLowerCase();
+        return ['1','true','yes','on','y','t'].includes(s);
+      };
 
       function show(){ modal.classList.remove('hidden'); modal.classList.add('flex'); }
       function hide(){ modal.classList.add('hidden'); modal.classList.remove('flex'); }
@@ -108,9 +128,11 @@
           const r = await fetch('/settings');
           if (!r.ok) throw new Error('load failed');
           const d = await r.json();
-          chkEnabled.checked = !!d.suspend_enabled;
+          chkEnabled.checked = asBool(d.suspend_enabled, false);
           numIdle.value = Number(d.suspend_idle_sec ?? 300);
-          chkGC.checked = !!d.suspend_gc_enabled;
+          chkGC.checked = asBool(d.suspend_gc_enabled, false);
+          numMaxSize.value = Number(d.max_source_file_size_gb ?? 15);
+          chkAv1.checked = asBool(d.av1_check_enabled, true);
         }catch{ toast('Failed to load global settings', false); }
       }
       async function save(){
@@ -118,7 +140,9 @@
           const payload = {
             suspend_enabled: !!chkEnabled.checked,
             suspend_idle_sec: Math.max(30, parseInt(numIdle.value || 300, 10)),
-            suspend_gc_enabled: !!chkGC.checked
+            suspend_gc_enabled: !!chkGC.checked,
+            max_source_file_size_gb: Math.max(1, Number(numMaxSize.value || 15)),
+            av1_check_enabled: !!chkAv1.checked
           };
           const r = await fetch('/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},

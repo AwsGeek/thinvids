@@ -1,0 +1,120 @@
+services:
+  manager:
+    image: ${THINVIDS_MANAGER_IMAGE:-127.0.0.1:5000/thinvids-manager:latest}
+    command: gunicorn -w 2 -t 120 -b 0.0.0.0:5005 app:app
+    user: "${THINVIDS_UID:-1000}:${THINVIDS_GID:-1000}"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB_TASKS: "0"
+      REDIS_DB_DATA: "1"
+      WATCH_ROOT: /watch
+      LIBRARY_ROOT: /library
+      MASTER_HTTP_PORT: "8000"
+      LOG_LEVEL: INFO
+    ports:
+      - target: 5005
+        published: 5005
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - watch_nfs:/watch
+      - library_nfs:/library
+      - config_nfs:/config
+    networks:
+      - thinvids_ctrl
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.purpose == general
+      restart_policy:
+        condition: on-failure
+      update_config:
+        order: start-first
+        failure_action: rollback
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5005/metrics_snapshot', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  watcher:
+    image: ${THINVIDS_MANAGER_IMAGE:-127.0.0.1:5000/thinvids-manager:latest}
+    command: python watcher.py
+    user: "${THINVIDS_UID:-1000}:${THINVIDS_GID:-1000}"
+    environment:
+      WATCH_ROOT: /watch
+      PROCESSED_FILE: /config/processed.log
+      SUBMIT_URL: http://manager:5005/add_job
+      USE_WATCHDOG: "1"
+      USE_SCANNER: "1"
+      SCAN_INTERVAL_SEC: "60"
+      STABLE_CHECKS: "5"
+      STABLE_DELAY_SEC: "10"
+      WORKERS: "4"
+    volumes:
+      - watch_nfs:/watch
+      - config_nfs:/config
+    networks:
+      - thinvids_ctrl
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.purpose == general
+      restart_policy:
+        condition: on-failure
+      update_config:
+        order: stop-first
+
+  redis:
+    image: redis:7
+    command: redis-server --save 60 1 --save 300 10
+    ports:
+      - target: 6379
+        published: 6379
+        protocol: tcp
+        mode: host
+    volumes:
+      - redis_data_nfs:/data
+    networks:
+      - thinvids_ctrl
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.purpose == light
+      restart_policy:
+        condition: on-failure
+
+networks:
+  thinvids_ctrl:
+    driver: overlay
+
+volumes:
+  watch_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/media/archive
+  library_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/media/library
+  config_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/transcoder/config
+  redis_data_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nolock,soft
+      device: :/volume1/shared/projects/transcoder/redis

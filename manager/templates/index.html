@@ -73,6 +73,33 @@
 
 <h2 class="text-xl font-semibold my-2">Current Jobs</h2>
 
+<div class="flex items-center justify-end gap-2 mb-2 text-sm">
+  <label for="jobs-sort-by" class="text-gray-700">Sort</label>
+  <select id="jobs-sort-by" class="border rounded px-2 py-1">
+    <option value="date">Date</option>
+    <option value="name">Name</option>
+    <option value="size">Size</option>
+    <option value="status">Status</option>
+  </select>
+  <select id="jobs-sort-dir" class="border rounded px-2 py-1">
+    <option value="desc">Desc</option>
+    <option value="asc">Asc</option>
+  </select>
+  <label for="jobs-status-filter" class="text-gray-700 ml-2">Status</label>
+  <select id="jobs-status-filter" class="border rounded px-2 py-1">
+    <option value="all">All</option>
+    <option value="READY">READY</option>
+    <option value="STARTING">STARTING</option>
+    <option value="WAITING">WAITING</option>
+    <option value="RUNNING">RUNNING</option>
+    <option value="STAMPING">STAMPING</option>
+    <option value="STOPPED">STOPPED</option>
+    <option value="FAILED">FAILED</option>
+    <option value="REJECTED">REJECTED</option>
+    <option value="DONE">DONE</option>
+  </select>
+</div>
+
 <table id="job-table" class="w-full border-collapse bg-white">
   <!-- Column sizing: most are tiny; Name grows; progress fixed -->
   <colgroup>
@@ -232,7 +259,7 @@
     if (s==='RUNNING') return 'text-green-600';
     if (s==='STAMPING') return 'text-purple-600'; // <— NEW
     if (s==='STOPPED') return 'text-orange-600';
-    if (s==='FAILED') return 'text-red-600';
+    if (s==='FAILED'||s==='REJECTED') return 'text-red-600';
     if (s==='DONE'||s==='COMPLETED') return 'text-blue-600';
     return 'text-gray-700';
   };
@@ -357,23 +384,33 @@
   const PAGER_KEY = 'thinvids_pager_v1';
   let CURRENT_PAGE = 1;
   const PAGE_SIZE = 10;
-  let CURRENT_SORT = 'date';  // always date, per spec
+  let CURRENT_SORT = 'date';
   let CURRENT_DIR  = 'desc';
+  let CURRENT_STATUS_FILTER = 'all';
   let lastJobsReqId = 0;
 
   function loadPager(){
     try{
       const raw = localStorage.getItem(PAGER_KEY);
       if (!raw) return;
-      const s = JSON.parse(raw);
+        const s = JSON.parse(raw);
       if (s && typeof s === 'object'){
         if (Number.isInteger(s.page) && s.page>0) CURRENT_PAGE = s.page;
+        if (['date','name','size','status'].includes(s.sort)) CURRENT_SORT = s.sort;
         if (s.dir === 'asc' || s.dir === 'desc') CURRENT_DIR = s.dir;
+        if (typeof s.status === 'string' && s.status) CURRENT_STATUS_FILTER = s.status;
       }
     }catch{}
   }
   function savePager(){
-    try{ localStorage.setItem(PAGER_KEY, JSON.stringify({ page: CURRENT_PAGE, dir: CURRENT_DIR })); }catch{}
+    try{
+      localStorage.setItem(PAGER_KEY, JSON.stringify({
+        page: CURRENT_PAGE,
+        sort: CURRENT_SORT,
+        dir: CURRENT_DIR,
+        status: CURRENT_STATUS_FILTER
+      }));
+    }catch{}
   }
 
   function applyPagerState(meta){
@@ -435,9 +472,12 @@
     const params = new URLSearchParams({
       page: String(CURRENT_PAGE),
       page_size: String(PAGE_SIZE),
-      sort_by: 'date',
+      sort_by: CURRENT_SORT,
       sort_dir: CURRENT_DIR
     });
+    if (CURRENT_STATUS_FILTER && CURRENT_STATUS_FILTER.toLowerCase() !== 'all') {
+      params.set('status', CURRENT_STATUS_FILTER);
+    }
 
     let response;
     try {
@@ -477,7 +517,7 @@
 
       const canStart   = job.status === 'READY';
       const canStop = (job.status === 'STARTING' || job.status === 'WAITING' || job.status === 'RUNNING' || job.status === 'STAMPING');
-      const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'DONE');
+      const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'REJECTED' || job.status === 'DONE');
 
       const busy = ['STARTING','WAITING','RUNNING','STAMPING'].includes(String(job.status||'').toUpperCase());
       const canStamp = !!job.filename && !busy;
@@ -605,7 +645,7 @@
     const res = await fetch(`/job_settings/${job_id}`);
     if (!res.ok) return alert('Failed to load settings');
     const data = await res.json();
-    const editable = ['READY','STOPPED','FAILED'].includes(String(data.status||'').toUpperCase());
+    const editable = ['READY','STOPPED','FAILED','REJECTED'].includes(String(data.status||'').toUpperCase());
     el('settings-job-id').value = job_id;
     el('settings-filename').value = data.filename || '';
     el('settings-segment-duration').value = data.segment_duration || 10;
@@ -639,7 +679,7 @@
     el('save-job-settings-btn').classList.toggle('hidden', !editable);
     el('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase()==='READY'));
     el('job-settings-help').innerHTML = editable
-      ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED).'
+      ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED/REJECTED).'
       : 'This job is active or finished. Settings are read-only.';
     el('save-job-settings-btn').onclick = saveJobSettings;
     el('start-job-btn').onclick = ()=>startJob(job_id);
@@ -728,6 +768,31 @@
 
     // restore pager
     loadPager();
+    const sortBySel = el('jobs-sort-by');
+    const sortDirSel = el('jobs-sort-dir');
+    const statusSel = el('jobs-status-filter');
+    if (sortBySel) sortBySel.value = CURRENT_SORT;
+    if (sortDirSel) sortDirSel.value = CURRENT_DIR;
+    if (statusSel) statusSel.value = CURRENT_STATUS_FILTER;
+
+    safeOn('jobs-sort-by','change', (e)=>{
+      CURRENT_SORT = e.target.value || 'date';
+      CURRENT_PAGE = 1;
+      savePager();
+      fetchJobs();
+    });
+    safeOn('jobs-sort-dir','change', (e)=>{
+      CURRENT_DIR = e.target.value || 'desc';
+      CURRENT_PAGE = 1;
+      savePager();
+      fetchJobs();
+    });
+    safeOn('jobs-status-filter','change', (e)=>{
+      CURRENT_STATUS_FILTER = e.target.value || 'all';
+      CURRENT_PAGE = 1;
+      savePager();
+      fetchJobs();
+    });
 
     safeOn('pg-first','click',()=>{ CURRENT_PAGE = 1; savePager(); fetchJobs(); });
     safeOn('pg-prev','click', ()=>{ CURRENT_PAGE = Math.max(1, CURRENT_PAGE-1); savePager(); fetchJobs(); });

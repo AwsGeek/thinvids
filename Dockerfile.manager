@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY manager/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY manager/app.py /app/app.py
+COPY manager/watcher.py /app/watcher.py
+COPY manager/templates /app/templates
+COPY worker/tasks.py /app/tasks.py
+COPY common.py /app/common.py
+
+EXPOSE 5005
+

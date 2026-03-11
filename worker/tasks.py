@@ -66,6 +66,33 @@ def _ensure_dirs(*paths: str):
     for p in paths:
         os.makedirs(p, exist_ok=True)
 
+def _settings_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+def _settings_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _load_global_settings():
+    """
+    Merge legacy and canonical settings keys.
+    Canonical `global:settings` wins on overlap.
+    """
+    settings = {}
+    try:
+        settings.update(redis.hgetall("settings:global") or {})
+    except Exception:
+        pass
+    try:
+        settings.update(redis.hgetall("global:settings") or {})
+    except Exception:
+        pass
+    return settings
+
 def _active_nodes() -> List[str]:
     """
     Fast active host detection without SCAN:
@@ -165,7 +192,7 @@ def _final_output_path(src_filename: str) -> str:
 
 def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
-    return s in (Status.FAILED, Status.STOPPED)
+    return s in (Status.FAILED, Status.REJECTED, Status.STOPPED)
 
 
 # --------------- Built-in HTTP server (shared) ----------------
@@ -375,17 +402,34 @@ def split(job_id: str, file_path: str):
             'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0'
         })
 
-        # --- FAIL FAST: GPU doesn't support AV1 decode ---
-        # Normalize codec name (ffprobe reports "av1")
-        if (codec or "").strip().lower() in {"av1", "av01"}:
-            msg = "Unsupported input codec: AV1. GPU decode not available; failing fast."
+        global_settings = _load_global_settings()
+        max_source_file_size_gb = _settings_float(global_settings.get("max_source_file_size_gb", 15), 15.0)
+        av1_check_enabled = _settings_bool(global_settings.get("av1_check_enabled", "1"), True)
+
+        # --- FAIL FAST: size guard ---
+        max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
+        if max_source_bytes > 0 and int(size_b or 0) > max_source_bytes:
+            msg = f"Input too large ({int(size_b or 0)} bytes > {max_source_bytes} bytes limit)."
             logger.error(f"[{job_id}] {msg}")
-            # Mark job failed and store a human-friendly reason
             redis.hset(job_key, mapping={
-                'status': Status.FAILED.value,
+                'status': Status.REJECTED.value,
                 'error': msg,
+                'rejected_reason': 'size_limit',
+                'rejected_at': str(_now()),
             })
-            return {'status': 'FAILED', 'reason': msg}
+            return {'status': 'REJECTED', 'reason': msg}
+
+        # --- FAIL FAST: AV1 guard (configurable) ---
+        if av1_check_enabled and (codec or "").strip().lower() in {"av1", "av01"}:
+            msg = "Unsupported input codec: AV1. Rejected by av1_check_enabled."
+            logger.error(f"[{job_id}] {msg}")
+            redis.hset(job_key, mapping={
+                'status': Status.REJECTED.value,
+                'error': msg,
+                'rejected_reason': 'av1_rejected',
+                'rejected_at': str(_now()),
+            })
+            return {'status': 'REJECTED', 'reason': msg}
 
 
         # Advertise master URL
@@ -1455,7 +1499,7 @@ def stamp(job_id: str):
         )
 
         # carry over some settings or fall back to globals
-        globals_map = redis.hgetall('settings:global') or {}
+        globals_map = _load_global_settings()
         def _ival(v, d):
             try: return int(v)
             except Exception: return d
