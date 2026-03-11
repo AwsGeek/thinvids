@@ -20,7 +20,16 @@ from tasks import transcode, stamp
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
 
-from common import Status, get_huey, get_redis, get_logging, get_settings as _get_settings
+from common import (
+    Status,
+    get_huey,
+    get_redis,
+    get_logging,
+    get_settings as _get_settings,
+    emit_activity,
+    fetch_activity,
+    fetch_job_activity,
+)
 huey = get_huey()
 redis_client = get_redis()
 logger = get_logging("manager")
@@ -108,6 +117,8 @@ MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
 ALLOWED_TARGET_HEIGHTS = (720, 1080)
 DEFAULT_TARGET_HEIGHT = 1080
+LOCAL_PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/projects")
+NFS_PROJECT_ROOT = os.getenv("NFS_PROJECT_ROOT", "/library/.thinvids-projects")
 PIPELINE_QUEUE_ACTION_TRANSCODE = "TRANSCODE"
 PIPELINE_QUEUE_ACTION_STAMP = "STAMP"
 PIPELINE_ACTIVE_JOB_KEY = "pipeline:active_job"
@@ -243,29 +254,51 @@ def _load_global_settings():
         pass
     settings.setdefault("max_source_file_size_gb", "15")
     settings.setdefault("av1_check_enabled", "1")
+    settings.setdefault("use_nfs_for_all_files", "0")
+    settings.setdefault("large_file_behavior", "reject")
     return settings
 
-def _evaluate_rejection(video_details, settings):
+def _display_title(filename):
+    base = os.path.basename((filename or "").strip())
+    if not base:
+        return "Unknown"
+    return os.path.splitext(base)[0] or base
+
+def _evaluate_job_policy(video_details, settings):
     max_source_file_size_gb = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
     av1_check_enabled = _as_bool(settings.get("av1_check_enabled", "1"), True)
+    use_nfs_for_all_files = _as_bool(settings.get("use_nfs_for_all_files", "0"), False)
+    large_file_behavior = str(settings.get("large_file_behavior", "reject") or "reject").strip().lower()
+    if large_file_behavior not in ("reject", "nfs"):
+        large_file_behavior = "reject"
 
     source_size = _as_int(video_details.get("source_file_size", 0), 0)
     source_codec = str(video_details.get("source_codec") or "").strip().lower()
-
-    max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
-    if max_source_bytes > 0 and source_size > max_source_bytes:
-        return (
-            "size_limit",
-            f"Source file too large: {humanize.naturalsize(source_size, binary=True)} > {max_source_file_size_gb:g} GiB limit",
-        )
 
     if av1_check_enabled and source_codec in ("av1", "av01"):
         return (
             "av1_rejected",
             "AV1 source rejected by global setting (av1_check_enabled).",
+            "local",
+            LOCAL_PROJECT_ROOT,
         )
 
-    return (None, None)
+    if use_nfs_for_all_files:
+        return (None, None, "nfs", NFS_PROJECT_ROOT)
+
+    max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
+    is_large = max_source_bytes > 0 and source_size > max_source_bytes
+    if is_large:
+        if large_file_behavior == "nfs":
+            return (None, None, "nfs", NFS_PROJECT_ROOT)
+        return (
+            "size_limit",
+            f"Source file too large: {humanize.naturalsize(source_size, binary=True)} > {max_source_file_size_gb:g} GiB limit",
+            "local",
+            LOCAL_PROJECT_ROOT,
+        )
+
+    return (None, None, "local", LOCAL_PROJECT_ROOT)
 
 def _job_index_keys() -> List[str]:
     keys = list(redis_client.smembers("jobs:all") or [])
@@ -297,6 +330,19 @@ def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
         'waiting_at': str(time.time()),
         'started_at': str(started_at),
     })
+    try:
+        job = redis_client.hgetall(job_key) or {}
+        job_id = (job.get('job_id') or (job_key.split(':', 1)[1] if ':' in job_key else '')).strip()
+        filename = job.get('filename') or ''
+        emit_activity(
+            f'Queued "{_display_title(filename)}"',
+            job_id=job_id,
+            filename=filename,
+            stage='queue',
+            source='manager',
+        )
+    except Exception:
+        pass
 
 def _acquire_pipeline_sched_lock():
     token = f"{uuid.uuid4().hex}:{time.time()}"
@@ -406,6 +452,13 @@ def _launch_reserved_job(reserved):
             _ensure_one_worker_awake()
             stamp(job_id)
         else:
+            emit_activity(
+                f'Started "{_display_title(filename)}"',
+                job_id=job_id,
+                filename=filename,
+                stage='start',
+                source='manager',
+            )
             _launch_after_warmup(job_key, job_id, filename)
     except Exception as e:
         logger.exception("[%s] reserved launch failed", job_id)
@@ -576,6 +629,8 @@ def get_settings():
     out["suspend_gc_enabled"] = str(settings.get("suspend_gc_enabled", "0")).strip().lower() in ("1", "true", "yes", "on")
     out["max_source_file_size_gb"] = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
     out["av1_check_enabled"] = _as_bool(settings.get("av1_check_enabled", "1"), True)
+    out["use_nfs_for_all_files"] = _as_bool(settings.get("use_nfs_for_all_files", "0"), False)
+    out["large_file_behavior"] = str(settings.get("large_file_behavior", "reject") or "reject").strip().lower()
     out["default_target_height"] = normalize_target_height(
         settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
         DEFAULT_TARGET_HEIGHT
@@ -592,6 +647,8 @@ def post_global_settings():
         "suspend_gc_enabled": bool,
         "max_source_file_size_gb": number (>0),
         "av1_check_enabled": bool,
+        "use_nfs_for_all_files": bool,
+        "large_file_behavior": "reject"|"nfs",
         "default_target_height": 720|1080
     }
     """
@@ -606,6 +663,10 @@ def post_global_settings():
         if max_size_gb <= 0:
             max_size_gb = 15.0
         av1_check_enabled = _as_bool(payload.get("av1_check_enabled", True), True)
+        use_nfs_for_all_files = _as_bool(payload.get("use_nfs_for_all_files", False), False)
+        large_file_behavior = str(payload.get("large_file_behavior", "reject") or "reject").strip().lower()
+        if large_file_behavior not in ("reject", "nfs"):
+            large_file_behavior = "reject"
         default_target_height = normalize_target_height(
             payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
             DEFAULT_TARGET_HEIGHT
@@ -619,6 +680,8 @@ def post_global_settings():
         "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
         "max_source_file_size_gb": str(max_size_gb),
         "av1_check_enabled": "1" if av1_check_enabled else "0",
+        "use_nfs_for_all_files": "1" if use_nfs_for_all_files else "0",
+        "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
     })
     # Backward-compatible mirror for legacy readers.
@@ -628,6 +691,8 @@ def post_global_settings():
         "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
         "max_source_file_size_gb": str(max_size_gb),
         "av1_check_enabled": "1" if av1_check_enabled else "0",
+        "use_nfs_for_all_files": "1" if use_nfs_for_all_files else "0",
+        "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
     })
 
@@ -637,6 +702,8 @@ def post_global_settings():
         "suspend_gc_enabled": suspend_gc_enabled,
         "max_source_file_size_gb": max_size_gb,
         "av1_check_enabled": av1_check_enabled,
+        "use_nfs_for_all_files": use_nfs_for_all_files,
+        "large_file_behavior": large_file_behavior,
         "default_target_height": default_target_height,
     })
 
@@ -811,6 +878,27 @@ def list_jobs():
         'items': items
     })
 
+@app.get('/activity')
+def list_activity():
+    try:
+        limit = int(request.args.get('limit', 120))
+    except Exception:
+        limit = 120
+    return jsonify(fetch_activity(limit))
+
+@app.get('/job_activity/<job_id>')
+def list_job_activity(job_id):
+    key = f"job:{job_id}"
+    if not redis_client.exists(key):
+        return jsonify({'error': 'Job not found'}), 404
+    try:
+        limit = request.args.get('limit')
+        if limit is None:
+            return jsonify(fetch_job_activity(job_id))
+        return jsonify(fetch_job_activity(job_id, limit=int(limit)))
+    except Exception:
+        return jsonify(fetch_job_activity(job_id))
+
 
 def get_video_details(job_id: str, file_path: str):
     job_key = f"job:{job_id}"
@@ -943,6 +1031,8 @@ def add_job():
     number_parts = _as_int(global_settings.get('number_parts', 2), 2)
 
     status = Status.WAITING if auto_start_effective else Status.READY
+    scratch_mode = 'local'
+    scratch_root = LOCAL_PROJECT_ROOT
     job_settings = {
         'job_id': job_id,
         'filename': filename,
@@ -965,13 +1055,26 @@ def add_job():
         'source_duration': '0',
         'source_fps': '0',
         'source_file_size': 0,
-        'total_frames': 0
+        'total_frames': 0,
+        'scratch_mode': scratch_mode,
+        'scratch_root': scratch_root,
     }
+    emit_activity(
+        f'Received "{_display_title(filename)}"',
+        job_id=job_id,
+        filename=filename,
+        stage='received',
+        source='manager',
+    )
     # Kick off async probe on a worker
     video_details = get_video_details(job_id, full_path)
     job_settings = {**job_settings, **video_details}
 
-    rejection_reason, rejection_message = _evaluate_rejection(video_details, global_settings)
+    rejection_reason, rejection_message, scratch_mode, scratch_root = _evaluate_job_policy(video_details, global_settings)
+    job_settings.update({
+        'scratch_mode': scratch_mode,
+        'scratch_root': scratch_root,
+    })
     if rejection_reason:
         job_settings.update({
             'status': Status.REJECTED.value,
@@ -982,6 +1085,13 @@ def add_job():
             'rejected_reason': rejection_reason,
             'rejected_at': now,
         })
+        emit_activity(
+            f'Rejected "{_display_title(filename)}": {rejection_message}',
+            job_id=job_id,
+            filename=filename,
+            stage='rejected',
+            source='manager',
+        )
 
     redis_client.hset(job_key, mapping=job_settings)
 
@@ -1057,6 +1167,8 @@ def copy_job():
         'target_height': target_height,
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
+        'scratch_mode': src.get('scratch_mode', 'local'),
+        'scratch_root': src.get('scratch_root', LOCAL_PROJECT_ROOT),
         'total_chunks': 0,
         'completed_chunks': 0,
         'stitched_chunks': 0,
@@ -1125,7 +1237,7 @@ def restart_job(job_id):
             pass
 
     # Carry over settings (with sane fallbacks)
-    globals_map = redis_client.hgetall('settings:global')
+    globals_map = _load_global_settings()
     def _int(v, default):
         try:
             return int(v)
@@ -1166,7 +1278,7 @@ def restart_job(job_id):
             'total_frames': job.get('total_frames', 0),
         }
 
-    rejection_reason, rejection_message = _evaluate_rejection(source_updates, global_settings)
+    rejection_reason, rejection_message, scratch_mode, scratch_root = _evaluate_job_policy(source_updates, global_settings)
 
     now = time.time()
     new_fields = {
@@ -1196,6 +1308,8 @@ def restart_job(job_id):
         'combine_progress': 0,
         'elapsed': 0,
         'streams_json': job.get('streams_json'),
+        'scratch_mode': scratch_mode,
+        'scratch_root': scratch_root,
         'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE,
         'waiting_at': str(now),
 
@@ -1211,6 +1325,13 @@ def restart_job(job_id):
             'rejected_reason': rejection_reason,
             'rejected_at': str(now),
         })
+        emit_activity(
+            f'Rejected "{_display_title(filename)}": {rejection_message}',
+            job_id=job_id,
+            filename=filename,
+            stage='rejected',
+            source='manager',
+        )
 
     # Overwrite base hash in one go (no delete -> no set race)
     redis_client.hset(job_key, mapping=new_fields)
@@ -1258,6 +1379,10 @@ def delete_job(job_id):
 
     for key in redis_client.scan_iter(f"{job_key}*"):
         redis_client.delete(key)
+    try:
+        redis_client.delete(f"joblog:{job_id}")
+    except Exception:
+        pass
 
     # remove from the jobs index
     try:
@@ -1299,6 +1424,7 @@ def job_properties(job_id):
     if not redis_client.exists(key):
         return jsonify({'error': 'Job not found'}), 404
     job_data = {k: v for k, v in redis_client.hgetall(key).items()}
+    job_data["activity_log"] = fetch_job_activity(job_id)
     return jsonify(job_data)
 
 # ---------------- Per-job settings (PAUSED only) ------------

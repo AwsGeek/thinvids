@@ -23,7 +23,7 @@ import threading
 from typing import List, Tuple, Optional
 from collections import deque
 
-from common import ENV, Status, get_huey, get_redis, get_logging
+from common import ENV, Status, get_huey, get_redis, get_logging, emit_activity
 huey = get_huey()
 redis = get_redis()
 logger = get_logging("worker")
@@ -65,8 +65,21 @@ MAX_PARTS        = int(ENV("MAX_PARTS", "200"))
 def _job_key(job_id: str) -> str:
     return f"job:{job_id}"
 
+def _job_title(job):
+    filename = (job.get("filename") or "").strip()
+    base = os.path.basename(filename)
+    if not base:
+        return "Unknown"
+    return os.path.splitext(base)[0] or base
+
 def _now() -> float:
     return time.time()
+
+def _elapsed_ms(started_at):
+    try:
+        return max(0, int(round((_now() - float(started_at)) * 1000)))
+    except Exception:
+        return 0
 
 def _ensure_dirs(*paths: str):
     for p in paths:
@@ -157,8 +170,47 @@ def _ffprobe_stream0(input_path: str):
     except Exception:
         return {"codec":"","width":0,"height":0,"fps":0.0,"nb_frames":0,"size":0,"bit_rate":0}
 
+def _job_project_root(job_id: str, job=None) -> str:
+    if job is None:
+        job = redis.hgetall(_job_key(job_id)) or {}
+    root = (job.get("scratch_root") or "").strip()
+    return root or PROJECT_ROOT
+
+def _job_base_dir(job_id: str, job=None) -> str:
+    preferred_root = _job_project_root(job_id, job)
+    preferred_base = os.path.join(preferred_root, job_id)
+    try:
+        os.makedirs(preferred_base, exist_ok=True)
+        try:
+            redis.hset(_job_key(job_id), mapping={
+                "scratch_root_effective": preferred_root,
+            })
+        except Exception:
+            pass
+        return preferred_base
+    except Exception as e:
+        fallback_root = PROJECT_ROOT
+        fallback_base = os.path.join(fallback_root, job_id)
+        os.makedirs(fallback_base, exist_ok=True)
+        if preferred_root != fallback_root:
+            logger.warning(
+                "[%s] scratch root '%s' unavailable (%s); falling back to '%s'",
+                job_id,
+                preferred_root,
+                e,
+                fallback_root,
+            )
+            try:
+                redis.hset(_job_key(job_id), mapping={
+                    "scratch_root_effective": fallback_root,
+                    "scratch_root_fallback_error": str(e),
+                })
+            except Exception:
+                pass
+        return fallback_base
+
 def _part_paths(job_id: str, idx: int) -> Tuple[str, str]:
-    base_dir  = os.path.join(PROJECT_ROOT, job_id)
+    base_dir  = _job_base_dir(job_id)
     parts_dir = os.path.join(base_dir, "parts")
     enc_dir   = os.path.join(base_dir, "encoded")
     _ensure_dirs(base_dir, parts_dir, enc_dir)
@@ -265,6 +317,10 @@ def _start_http_once():
                         self.send_error(404, "Not found")
                         return
 
+                    job_data = redis.hgetall(_job_key(job_id)) or {}
+                    title = _job_title(job_data)
+                    filename = job_data.get("filename") or ""
+                    put_t0 = _now()
                     _, enc_path = _part_paths(job_id, idx)
                     tmp_path = enc_path + ".uploading"
 
@@ -297,6 +353,13 @@ def _start_http_once():
                         return
 
                     os.replace(tmp_path, enc_path)
+                    emit_activity(
+                        f'Stitching "{title}" part {idx} completed in {_elapsed_ms(put_t0)}ms',
+                        job_id=job_id,
+                        filename=filename,
+                        stage='stitch',
+                        source='worker',
+                    )
                     self.send_response(200)
                     self.end_headers()
                 except Exception as e:
@@ -352,6 +415,7 @@ def split(job_id: str, file_path: str):
     """
     job_key = _job_key(job_id)
     job = redis.hgetall(job_key)
+    title = _job_title(job)
 
     logger.info(f"[{job_id}] Starting transcode job")
 
@@ -425,8 +489,22 @@ def split(job_id: str, file_path: str):
         actives = _active_nodes()
         P = 100 # Make progress updates easy
         logger.info(f"[{job_id}] Target parts (estimate): {P}")
+        emit_activity(
+            f'Splitting "{title}" into {P} parts',
+            job_id=job_id,
+            filename=job.get('filename'),
+            stage='split',
+            source='worker',
+        )
 
         seg_t0 = _now()
+        emit_activity(
+            f'Segmenting "{title}" started',
+            job_id=job_id,
+            filename=job.get('filename'),
+            stage='segment_start',
+            source='worker',
+        )
         redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0})
 
         logger.info(f"[{job_id}] {job}")
@@ -436,7 +514,7 @@ def split(job_id: str, file_path: str):
         logger.info(f"[{job_id}] Audio stream: {a_sel}")
 
         # Prepare parts dir + naming
-        parts_dir = os.path.join(PROJECT_ROOT, job_id, "parts")
+        parts_dir = os.path.join(_job_base_dir(job_id, job), "parts")
         _ensure_dirs(parts_dir)
         temp_pattern = os.path.join(parts_dir, "chunk_%03d.ts")
 
@@ -470,6 +548,7 @@ def split(job_id: str, file_path: str):
 
         previous_chunk_path = None
         previous_chunk_index = None
+        chunk_opened_at = None
         estimated_chunks = max(1, P)
         queued_count = 0
 
@@ -486,9 +565,9 @@ def split(job_id: str, file_path: str):
 
             m = segment_re.search(line)
             if m:
+                chunk_detected_at = _now()
                 chunk_path = m.group(1)
                 chunk_index = int(m.group(2))  # 0-based
-
                 # update progress on opening next chunk
                 try:
                     prog = int(((min(chunk_index + 1, estimated_chunks)) / max(1, estimated_chunks)) * 100)
@@ -525,10 +604,19 @@ def split(job_id: str, file_path: str):
 
                     if not _is_job_halted(job_id):
                         logger.info(f"[{job_id}] Split part {part_idx}")
+                        part_elapsed_ms = max(0, int(round((chunk_detected_at - (chunk_opened_at or chunk_detected_at)) * 1000)))
+                        emit_activity(
+                            f'Segmenting "{title}" part {part_idx} completed in {part_elapsed_ms}ms',
+                            job_id=job_id,
+                            filename=job.get('filename'),
+                            stage='segment',
+                            source='worker',
+                        )
                         encode(job_id, part_idx, master_url, v_sel, a_sel)
 
                 previous_chunk_path = chunk_path
                 previous_chunk_index = chunk_index
+                chunk_opened_at = chunk_detected_at
 
         process.wait()
         if process.returncode != 0:
@@ -551,6 +639,14 @@ def split(job_id: str, file_path: str):
 
             if not _is_job_halted(job_id):
                 logger.info(f"[{job_id}] Split last part {part_idx}")
+                part_elapsed_ms = _elapsed_ms(chunk_opened_at or _now())
+                emit_activity(
+                    f'Segmenting "{title}" part {part_idx} completed in {part_elapsed_ms}ms',
+                    job_id=job_id,
+                    filename=job.get('filename'),
+                    stage='segment',
+                    source='worker',
+                )
                 encode(job_id, part_idx, master_url, v_sel, a_sel)
                 total_chunks = part_idx
 
@@ -568,6 +664,13 @@ def split(job_id: str, file_path: str):
 
         # Master exits — stitcher will finish the job
         logger.info(f"[{job_id}] Segmentation complete; {total_chunks} parts queued for encoding")
+        emit_activity(
+            f'Segmenting "{title}" completed in {_elapsed_ms(seg_t0)}ms',
+            job_id=job_id,
+            filename=job.get('filename'),
+            stage='segment_complete',
+            source='worker',
+        )
         return {'status': 'QUEUED', 'parts': total_chunks}
 
     except Exception as e:
@@ -590,7 +693,9 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
 
     worker_name = ENV("HOSTNAME") or socket.gethostname()
     job_key = _job_key(job_id)
-
+    filename = redis.hget(job_key, "filename") or ""
+    title = _job_title({"filename": filename})
+    part_t0 = _now()
     def _fail(reason: str, stage: str):
         # Mark whole job failed and save a useful reason
         mapping = {
@@ -638,7 +743,7 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
                 stitch_host = master_host  # fallback keeps pipeline moving
 
         # Paths in local tmpfs (worker)
-        wtmp = os.path.join(PROJECT_ROOT, job_id)
+        wtmp = _job_base_dir(job_id)
         _ensure_dirs(wtmp)
         in_path  = os.path.join(wtmp, f"in_{idx:03d}.ts")
         out_path = os.path.join(wtmp, f"out_{idx:03d}.mp4")
@@ -711,6 +816,14 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
         if encode_started == 0:
             encode_started = int(_now())
             redis.hset(job_key, 'encode_started', encode_started)
+            if redis.set(f"{job_key}:encode_stage_started", "1", nx=True, ex=7 * 24 * 3600):
+                emit_activity(
+                    f'Encoding "{title}" started',
+                    job_id=job_id,
+                    filename=filename,
+                    stage='encode_start',
+                    source='worker',
+                )
 
         # capture last ~120 lines of ffmpeg stderr for diagnostics
         stderr_tail = deque(maxlen=120)
@@ -779,6 +892,13 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
             return _fail(f"upload failed: {e}", stage)
 
         logger.info(f"[{job_id}] Uploaded part {idx}")
+        emit_activity(
+            f'Encoding "{title}" part {idx} completed in {_elapsed_ms(part_t0)}ms',
+            job_id=job_id,
+            filename=filename,
+            stage='encode',
+            source='worker',
+        )
 
         # Cleanup local tmpfs
         for p in (in_path, out_path):
@@ -811,6 +931,15 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
                 cur = int(redis.hget(job_key, 'encode_progress') or 0)
                 if prog > cur:
                     redis.hset(job_key, 'encode_progress', prog)
+                if done >= total and redis.set(f"{job_key}:encode_stage_complete", "1", nx=True, ex=7 * 24 * 3600):
+                    stage_elapsed_ms = _elapsed_ms(encode_started or part_t0)
+                    emit_activity(
+                        f'Encoding "{title}" completed in {stage_elapsed_ms}ms',
+                        job_id=job_id,
+                        filename=filename,
+                        stage='encode_complete',
+                        source='worker',
+                    )
 
         except Exception as e:
             logger.error(f"[{job_id}] encode {idx} progress update error: {e}")
@@ -832,6 +961,16 @@ def stitch(job_id: str):
       - On persistent misses/timeouts -> fail. On success -> concat-copy to final.
     """
     job_key = _job_key(job_id)
+    stitch_stage_t0 = _now()
+    initial_job = redis.hgetall(job_key) or {}
+    title = _job_title(initial_job)
+    emit_activity(
+        f'Stitching "{title}" started',
+        job_id=job_id,
+        filename=initial_job.get('filename'),
+        stage='stitch_start',
+        source='worker',
+    )
     try:
         _start_http_once()
         stitch_host = f"http://{ENV('HOSTNAME') or socket.gethostname()}:{HTTP_PORT}"
@@ -869,7 +1008,7 @@ def stitch(job_id: str):
             logger.error(f"[{job_id}] stitch: parts_total not set")
             return {'status':'FAILED','reason':'parts_total not set'}
 
-        enc_dir = os.path.join(PROJECT_ROOT, job_id, "encoded")
+        enc_dir = os.path.join(_job_base_dir(job_id), "encoded")
         _ensure_dirs(enc_dir)
 
         def _ready_set():
@@ -1079,7 +1218,7 @@ def stitch(job_id: str):
             return {'status':'FAILED','reason':'missing encoded parts after conservative retries'}
 
         # ---- Stitch (concat copy) ----
-        base_dir = os.path.join(PROJECT_ROOT, job_id)
+        base_dir = _job_base_dir(job_id)
         concat_path = os.path.join(base_dir, "concat.txt")
         enc_paths = [os.path.join(enc_dir, f"enc_{i:03d}.mp4") for i in range(1, P + 1)]
         with open(concat_path, 'w') as f:
@@ -1158,6 +1297,13 @@ def stitch(job_id: str):
         # Move final to library + set metadata
         job = redis.hgetall(job_key) or {}
         src_filename = job.get('filename') or os.path.basename(job.get('input_path','') or '')
+        emit_activity(
+            f'Writing "{_job_title(job)}"',
+            job_id=job_id,
+            filename=src_filename,
+            stage='write',
+            source='worker',
+        )
         final_path = _final_output_path(src_filename)
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(local_out, final_path)
@@ -1211,7 +1357,7 @@ def stitch(job_id: str):
 
         # Cleanup project temp dir
         try:
-            shutil.rmtree(os.path.join(PROJECT_ROOT, job_id))
+            shutil.rmtree(_job_base_dir(job_id))
         except Exception:
             pass
 
@@ -1223,6 +1369,13 @@ def stitch(job_id: str):
             'combine_progress': 100,
             'combine_elapsed': round(_now() - combine_t0, 2),
         })
+        emit_activity(
+            f'Stitching "{_job_title(job)}" completed in {_elapsed_ms(stitch_stage_t0)}ms',
+            job_id=job_id,
+            filename=src_filename,
+            stage='stitch_complete',
+            source='worker',
+        )
         try:
             redis.delete(f"job_done_parts:{job_id}")
             redis.delete(retry_cnt_key)

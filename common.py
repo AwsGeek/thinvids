@@ -4,6 +4,7 @@ Shared types/utilities for manager/worker/agent.
 
 # repo/common.py
 import os, re
+import json
 from functools import lru_cache
 
 
@@ -157,12 +158,17 @@ def natural_key(host: str):
 
 # ----- Global settings -----
 SETTINGS_KEY = "global:settings"
+ACTIVITY_LOG_KEY = "activity:log"
+ACTIVITY_LOG_MAX = int(ENV("ACTIVITY_LOG_MAX", "2000"))
+ACTIVITY_JOB_LOG_MAX = int(ENV("ACTIVITY_JOB_LOG_MAX", "50000"))
 DEFAULT_SETTINGS = {
     "suspend_enabled": "0",
     "suspend_idle_sec": "300",
     "suspend_gc_enabled": "0",
     "max_source_file_size_gb": "15",
     "av1_check_enabled": "1",
+    "use_nfs_for_all_files": "0",
+    "large_file_behavior": "reject",
     "default_target_height": "1080",
 }
 
@@ -233,3 +239,76 @@ def all_jobs_are_idle() -> bool:
             return False
 
     return True
+
+def emit_activity(message, job_id=None, filename=None, stage=None, source=None):
+    redis_client = get_redis()
+    payload = {
+        "ts": time_now(),
+        "message": str(message or "").strip(),
+    }
+    if job_id:
+        payload["job_id"] = str(job_id)
+    if filename:
+        payload["filename"] = str(filename)
+    if stage:
+        payload["stage"] = str(stage)
+    if source:
+        payload["source"] = str(source)
+
+    try:
+        encoded = json.dumps(payload, separators=(",", ":"))
+        pipe = redis_client.pipeline()
+        pipe.lpush(ACTIVITY_LOG_KEY, encoded)
+        pipe.ltrim(ACTIVITY_LOG_KEY, 0, max(1, ACTIVITY_LOG_MAX) - 1)
+        if job_id:
+            job_key = f"joblog:{job_id}"
+            pipe.rpush(job_key, encoded)
+            pipe.ltrim(job_key, -max(1, ACTIVITY_JOB_LOG_MAX), -1)
+        pipe.execute()
+    except Exception:
+        pass
+
+def fetch_activity(limit=120):
+    redis_client = get_redis()
+    try:
+        limit_n = max(1, min(int(limit), 500))
+    except Exception:
+        limit_n = 120
+
+    out = []
+    try:
+        rows = redis_client.lrange(ACTIVITY_LOG_KEY, 0, limit_n - 1) or []
+        for row in rows:
+            try:
+                data = json.loads(row)
+                if isinstance(data, dict):
+                    out.append(data)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return out
+
+def fetch_job_activity(job_id, limit=None):
+    redis_client = get_redis()
+    key = f"joblog:{job_id}"
+    out = []
+    try:
+        if limit is None:
+            rows = redis_client.lrange(key, 0, -1) or []
+        else:
+            try:
+                limit_n = max(1, int(limit))
+            except Exception:
+                limit_n = 500
+            rows = redis_client.lrange(key, -limit_n, -1) or []
+        for row in rows:
+            try:
+                data = json.loads(row)
+                if isinstance(data, dict):
+                    out.append(data)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return out

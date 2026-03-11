@@ -14,6 +14,7 @@
     watch_dir: /watch
     library_dir: /library
     config_dir: /config
+    nfs_project_root: /library/.thinvids-projects
 
     # Redis (manager uses same Redis as workers)
     redis_host: swarm1
@@ -112,6 +113,14 @@
         fstype: "{{ nfs_fstype }}"
         opts: "{{ nfs_opts }}"
         state: mounted
+
+    - name: Ensure NFS project scratch root exists
+      ansible.builtin.file:
+        path: "{{ nfs_project_root }}"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0775"
 
     - name: Mount /config (NFS)
       ansible.builtin.mount:
@@ -219,6 +228,7 @@
           Environment=REDIS_DB_DATA={{ redis_db_data }}
           Environment=WATCH_ROOT={{ watch_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           ExecStart={{ app_root }}/venv/bin/gunicorn -w 2 -t 120 -b 0.0.0.0:{{ manager_http_port }} app:app
           Restart=always

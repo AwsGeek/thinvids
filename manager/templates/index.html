@@ -49,6 +49,41 @@
     .bulk-actions-wrap { display: none; }
     .bulk-actions-wrap.active { display: inline-flex; }
     .row-action-btn[disabled] { opacity: 0.45; pointer-events: none; }
+
+    .jobs-activity-layout { display: block; }
+    .jobs-main { min-width: 0; }
+    #activity-panel {
+      width: 100%;
+      transition: width 160ms ease;
+      overflow: hidden;
+      border-radius: 0.5rem;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      background: #ffffff;
+      margin-top: 0.75rem;
+    }
+    #activity-panel.collapsed { width: 100%; }
+    #activity-panel.collapsed #activity-body { display: none; }
+    #activity-log-text {
+      width: 100%;
+      min-height: 14rem;
+      max-height: calc(100vh - 18rem);
+      border: 0;
+      border-top: 1px solid #e5e7eb;
+      outline: none;
+      resize: vertical;
+      padding: 0.5rem 0.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.82rem;
+      line-height: 1.2rem;
+      color: #111827;
+      background: #ffffff;
+      white-space: pre;
+      overflow: auto;
+    }
+
+    @media (max-width: 1280px) {
+      #activity-panel { width: 100%; }
+    }
   </style>
 {% endblock %}
 
@@ -76,95 +111,118 @@
 </div>
 
 <h2 class="text-xl font-semibold my-2">Current Jobs</h2>
-
-<div class="bg-white rounded shadow p-3 mb-2">
-  <div class="flex flex-wrap items-end gap-3">
-    <div class="flex-1" style="min-width: 14rem;">
-      <label for="jobs-search" class="block text-xs font-medium text-gray-700 mb-1">Search Name</label>
-      <input id="jobs-search" type="text" class="border p-2 rounded w-full text-sm" placeholder="Search job name...">
-    </div>
-    <div style="min-width: 10rem;">
-      <label for="status-filter" class="block text-xs font-medium text-gray-700 mb-1">Status</label>
-      <select id="status-filter" class="border p-2 rounded w-full text-sm">
-        <option value="ALL">All</option>
-        <option value="READY">READY</option>
-        <option value="STARTING">STARTING</option>
-        <option value="WAITING">WAITING</option>
-        <option value="RUNNING">RUNNING</option>
-        <option value="STAMPING">STAMPING</option>
-        <option value="STOPPED">STOPPED</option>
-        <option value="FAILED">FAILED</option>
-        <option value="REJECTED">REJECTED</option>
-        <option value="DONE">DONE</option>
-      </select>
-    </div>
-    <div style="min-width: 10rem;">
-      <label for="sort-by" class="block text-xs font-medium text-gray-700 mb-1">Sort By</label>
-      <select id="sort-by" class="border p-2 rounded w-full text-sm">
-        <option value="date">Date</option>
-        <option value="filename">Name</option>
-        <option value="status">Status</option>
-      </select>
-    </div>
-  </div>
-</div>
-
-<table id="job-table" class="w-full border-collapse bg-white">
-  <!-- Column sizing: most are tiny; Name grows; progress fixed -->
-  <colgroup>
-    <col class="shrink"><!-- Select -->
-    <col class="shrink"><!-- ID -->
-    <col><!-- Name (flex) -->
-    <col class="shrink"><!-- Size -->
-    <col class="shrink"><!-- Dim -->
-    <col class="shrink"><!-- Codec -->
-    <col class="shrink"><!-- Bitrate -->
-    <col class="progress-col"><!-- Split -->
-    <col class="progress-col"><!-- Encode -->
-    <col class="progress-col"><!-- Stitch -->
-    <col class="shrink"><!-- Started -->
-    <col class="shrink"><!-- Elapsed -->
-    <col class="shrink"><!-- Status -->
-    <col class="shrink"><!-- Actions -->
-  </colgroup>
-
-  <thead>
-    <tr class="bg-gray-200 text-xs">
-      <th class="px-2 py-1 text-center"><input id="select-all-jobs" type="checkbox" title="Select all jobs on this page"></th>
-      <th class="px-2 py-1 text-left">ID</th>
-      <th class="px-2 py-1 text-left">Name</th>
-      <th class="px-2 py-1 text-left">Size</th>
-      <th class="px-2 py-1 text-left">Codec</th>
-      <th class="px-2 py-1 text-center">Split</th>
-      <th class="px-2 py-1 text-center">Encode</th>
-      <th class="px-2 py-1 text-center">Stitch</th>
-      <th class="px-2 py-1 text-left">Started</th>
-      <th class="px-2 py-1 text-left">Time</th>
-      <th class="px-2 py-1 text-left">Status</th>
-      <th class="px-2 py-1 text-left">
-        <span id="actions-header-label">Actions</span>
-        <span id="bulk-actions-wrap" class="bulk-actions-wrap items-center gap-2">
-          <select id="bulk-action-select" class="border rounded px-2 py-1 text-xs">
-            <option value="">Bulk action…</option>
-            <option value="stop">Stop</option>
-            <option value="copy">Copy</option>
-            <option value="delete">Delete</option>
-            <option value="restart">Restart</option>
+<div class="jobs-activity-layout">
+  <div class="jobs-main">
+    <div class="bg-white rounded shadow p-3 mb-2">
+      <div class="flex flex-wrap items-end gap-3">
+        <div class="flex-1" style="min-width: 14rem;">
+          <label for="jobs-search" class="block text-xs font-medium text-gray-700 mb-1">Search Name</label>
+          <input id="jobs-search" type="text" class="border p-2 rounded w-full text-sm" placeholder="Search job name...">
+        </div>
+        <div style="min-width: 10rem;">
+          <label for="status-filter" class="block text-xs font-medium text-gray-700 mb-1">Status</label>
+          <select id="status-filter" class="border p-2 rounded w-full text-sm">
+            <option value="ALL">All</option>
+            <option value="READY">READY</option>
+            <option value="STARTING">STARTING</option>
+            <option value="WAITING">WAITING</option>
+            <option value="RUNNING">RUNNING</option>
+            <option value="STAMPING">STAMPING</option>
+            <option value="STOPPED">STOPPED</option>
+            <option value="FAILED">FAILED</option>
+            <option value="REJECTED">REJECTED</option>
+            <option value="DONE">DONE</option>
           </select>
-          <button id="bulk-action-apply" class="px-2 py-1 border rounded text-xs">Apply</button>
-        </span>
-      </th>
-    </tr>
-  </thead>
-  <tbody id="job-list"></tbody>
-</table>
+        </div>
+        <div style="min-width: 10rem;">
+          <label for="sort-by" class="block text-xs font-medium text-gray-700 mb-1">Sort By</label>
+          <select id="sort-by" class="border p-2 rounded w-full text-sm">
+            <option value="date">Date</option>
+            <option value="filename">Name</option>
+            <option value="status">Status</option>
+          </select>
+        </div>
+      </div>
+    </div>
 
-<div id="pagination" class="flex items-center justify-end gap-2 mt-3">
-  <button id="pg-first" class="px-2 py-1 border rounded text-sm">« First</button>
-  <button id="pg-prev"  class="px-2 py-1 border rounded text-sm">‹ Prev</button>
-  <span id="pg-status"  class="text-sm text-gray-700 mx-2">Page 1 / 1</span>
-  <button id="pg-next"  class="px-2 py-1 border rounded text-sm">Next ›</button>
-  <button id="pg-last"  class="px-2 py-1 border rounded text-sm">Last »</button>
+    <table id="job-table" class="w-full border-collapse bg-white">
+      <!-- Column sizing: most are tiny; Name grows; progress fixed -->
+      <colgroup>
+        <col class="shrink"><!-- Select -->
+        <col class="shrink"><!-- ID -->
+        <col><!-- Name (flex) -->
+        <col class="shrink"><!-- Size -->
+        <col class="shrink"><!-- Dim -->
+        <col class="shrink"><!-- Codec -->
+        <col class="shrink"><!-- Bitrate -->
+        <col class="progress-col"><!-- Split -->
+        <col class="progress-col"><!-- Encode -->
+        <col class="progress-col"><!-- Stitch -->
+        <col class="shrink"><!-- Started -->
+        <col class="shrink"><!-- Elapsed -->
+        <col class="shrink"><!-- Status -->
+        <col class="shrink"><!-- Actions -->
+      </colgroup>
+
+      <thead>
+        <tr class="bg-gray-200 text-xs">
+          <th class="px-2 py-1 text-center"><input id="select-all-jobs" type="checkbox" title="Select all jobs on this page"></th>
+          <th class="px-2 py-1 text-left">ID</th>
+          <th class="px-2 py-1 text-left">Name</th>
+          <th class="px-2 py-1 text-left">Size</th>
+          <th class="px-2 py-1 text-left">Codec</th>
+          <th class="px-2 py-1 text-center">Split</th>
+          <th class="px-2 py-1 text-center">Encode</th>
+          <th class="px-2 py-1 text-center">Stitch</th>
+          <th class="px-2 py-1 text-left">Started</th>
+          <th class="px-2 py-1 text-left">Time</th>
+          <th class="px-2 py-1 text-left">Status</th>
+          <th class="px-2 py-1 text-left">
+            <span id="actions-header-label">Actions</span>
+            <span id="bulk-actions-wrap" class="bulk-actions-wrap items-center gap-2">
+              <select id="bulk-action-select" class="border rounded px-2 py-1 text-xs">
+                <option value="">Bulk action…</option>
+                <option value="stop">Stop</option>
+                <option value="copy">Copy</option>
+                <option value="delete">Delete</option>
+                <option value="restart">Restart</option>
+              </select>
+              <button id="bulk-action-apply" class="px-2 py-1 border rounded text-xs">Apply</button>
+            </span>
+          </th>
+        </tr>
+      </thead>
+      <tbody id="job-list"></tbody>
+    </table>
+
+    <div id="pagination" class="flex items-center justify-end gap-2 mt-3">
+      <button id="pg-first" class="px-2 py-1 border rounded text-sm">« First</button>
+      <button id="pg-prev"  class="px-2 py-1 border rounded text-sm">‹ Prev</button>
+      <span id="pg-status"  class="text-sm text-gray-700 mx-2">Page 1 / 1</span>
+      <button id="pg-next"  class="px-2 py-1 border rounded text-sm">Next ›</button>
+      <button id="pg-last"  class="px-2 py-1 border rounded text-sm">Last »</button>
+    </div>
+
+    <aside id="activity-panel" class="border border-gray-200">
+      <div class="px-2 py-2 bg-gray-50 flex items-center gap-1 border-b border-gray-200">
+        <button id="activity-toggle" class="text-gray-700 hover:text-black" title="Collapse/Expand Activity">
+          <span id="activity-toggle-icon" class="material-icons text-base">expand_less</span>
+        </button>
+        <div class="activity-title text-sm font-semibold text-gray-800">Activity</div>
+        <div class="activity-tools ml-auto">
+          <button id="activity-clear" class="text-gray-600 hover:text-black" title="Clear display">
+            <span class="material-icons text-base">clear_all</span>
+          </button>
+          <button id="activity-refresh" class="text-gray-600 hover:text-black" title="Refresh">
+            <span class="material-icons text-base">refresh</span>
+          </button>
+        </div>
+      </div>
+      <div id="activity-body">
+        <textarea id="activity-log-text" readonly spellcheck="false"></textarea>
+      </div>
+    </aside>
+  </div>
 </div>
 
 <!-- Toasts -->
@@ -422,6 +480,101 @@
   let searchDebounceTimer = null;
   let lastJobsReqId = 0;
   const SELECTED_JOB_IDS = new Set();
+  const ACTIVITY_PANEL_KEY = 'thinvids_activity_panel_v1';
+  const ACTIVITY_CLEAR_TS_KEY = 'thinvids_activity_clear_ts_v1';
+  let ACTIVITY_PANEL_COLLAPSED = false;
+
+  function getActivityClearTs(){
+    try { return Number(sessionStorage.getItem(ACTIVITY_CLEAR_TS_KEY) || '0') || 0; } catch { return 0; }
+  }
+  function setActivityClearTs(ts){
+    try { sessionStorage.setItem(ACTIVITY_CLEAR_TS_KEY, String(Number(ts || 0))); } catch {}
+  }
+
+  function setActivityPanelState(collapsed){
+    const panel = el('activity-panel');
+    const icon = el('activity-toggle-icon');
+    if (!panel) return;
+    ACTIVITY_PANEL_COLLAPSED = !!collapsed;
+    panel.classList.toggle('collapsed', ACTIVITY_PANEL_COLLAPSED);
+    if (icon) icon.textContent = ACTIVITY_PANEL_COLLAPSED ? 'expand_more' : 'expand_less';
+    try { localStorage.setItem(ACTIVITY_PANEL_KEY, ACTIVITY_PANEL_COLLAPSED ? '1' : '0'); } catch {}
+  }
+
+  function renderActivity(entries){
+    const host = el('activity-log-text');
+    if (!host) return;
+    const prevTop = host.scrollTop || 0;
+    const wasAtTop = prevTop <= 2;
+    const items = Array.isArray(entries) ? entries : [];
+    let nextText = '';
+    if (!items.length){
+      nextText = 'No activity yet.';
+      if (host.value !== nextText) host.value = nextText;
+      if (wasAtTop) host.scrollTop = 0;
+      return;
+    }
+    const classifyActivity = (entry, msg) => {
+      const stage = String(entry.stage || '').trim().toLowerCase();
+      const lower = String(msg || '').toLowerCase();
+      if (stage === 'rejected' || stage.includes('error') || lower.includes(' failed') || lower.includes('error') || lower.includes('rejected')) return 'ERROR';
+      if (stage === 'stitch_complete' || stage === 'write' || lower.startsWith('writing "')) return 'FINISH';
+      if (stage.startsWith('stitch') || stage === 'stitch') return 'STITCH';
+      if (stage.startsWith('encode') || stage === 'encode') return 'ENCODE';
+      if (stage.startsWith('segment') || stage === 'segment' || stage === 'split') return 'SEGMENT';
+      return 'START';
+    };
+    const extractName = (msg) => {
+      const m = String(msg || '').match(/"([^"]+)"/);
+      return m ? m[1] : '';
+    };
+    const extractPart = (msg) => {
+      const m = String(msg || '').match(/\bpart\s+(\d+)\b/i);
+      return m ? m[1] : '';
+    };
+    const extractElapsedMs = (msg) => {
+      const m = String(msg || '').match(/\b(\d+)ms\b/i);
+      return m ? m[1] : '';
+    };
+    const lines = [];
+    items.forEach((entry) => {
+      const ts = Number(entry.ts || 0);
+      const stamp = (ts > 0) ? new Date(ts * 1000).toLocaleTimeString([], { hour12: false }) : '--:--:--';
+      const msg = String(entry.message || '');
+      const activity = classifyActivity(entry, msg);
+      const jobIdShort = String(entry.job_id || '').slice(0, 8) || '--------';
+      const name = extractName(msg);
+      const part = extractPart(msg);
+      const elapsedMs = extractElapsedMs(msg);
+
+      const parts = [`${stamp}`, `[${activity}]`, jobIdShort];
+      if (activity === 'START' && name) parts.push(name);
+      if (part) parts.push(`part ${part}`);
+      if (elapsedMs) parts.push(`${elapsedMs}ms`);
+      lines.push(parts.join(' '));
+    });
+    nextText = lines.join('\n');
+    if (host.value === nextText) return;
+    host.value = nextText;
+
+    if (wasAtTop){
+      host.scrollTop = 0;
+      return;
+    }
+
+    host.scrollTop = prevTop;
+  }
+
+  async function fetchActivity(){
+    try{
+      const res = await fetch('/activity?limit=160');
+      if (!res.ok) return;
+      const data = await res.json();
+      const clearedAt = getActivityClearTs();
+      const filtered = (Array.isArray(data) ? data : []).filter((entry) => Number(entry?.ts || 0) >= clearedAt);
+      renderActivity(filtered);
+    } catch {}
+  }
 
   function selectedJobIds(){
     return Array.from(SELECTED_JOB_IDS);
@@ -900,6 +1053,17 @@
     safeOn('btn-back-frame','click',()=>stepFrame(-1));
     safeOn('btn-fwd-frame','click', ()=>stepFrame(1));
 
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(ACTIVITY_PANEL_KEY) === '1'; } catch {}
+    setActivityPanelState(collapsed);
+    safeOn('activity-toggle', 'click', () => setActivityPanelState(!ACTIVITY_PANEL_COLLAPSED));
+    safeOn('activity-refresh', 'click', fetchActivity);
+    safeOn('activity-clear', 'click', () => {
+      setActivityClearTs(Date.now() / 1000);
+      const host = el('activity-log-text');
+      if (host) host.value = '';
+    });
+
     // restore pager
     loadPager();
     const sortSel = el('sort-by');
@@ -975,6 +1139,7 @@
     fetchJobs();
     fetchMetrics();
     fetchAndUpdateMiniNet();
+    fetchActivity();
 
     let jobsPollTimer = null;
     async function pollJobsLoop(){
@@ -988,6 +1153,7 @@
     //setInterval(fetchJobs, 1000);
     setInterval(fetchMetrics, 1000);
     setInterval(fetchAndUpdateMiniNet, 1000);
+    setInterval(fetchActivity, 1000);
   });
 
 

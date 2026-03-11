@@ -79,6 +79,19 @@
         </div>
 
         <div>
+          <label for="gs-large-file-behavior" class="block text-sm font-medium mb-1">Large file policy</label>
+          <select id="gs-large-file-behavior" class="border p-2 rounded w-full">
+            <option value="reject">Reject large files</option>
+            <option value="nfs">Use NFS scratch for large files</option>
+          </select>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-use-nfs-for-all-files" type="checkbox" class="h-4 w-4">
+          <label for="gs-use-nfs-for-all-files" class="text-sm">Use NFS scratch for all files</label>
+        </div>
+
+        <div>
           <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
           <select id="gs-default-target-height" class="border p-2 rounded w-full">
             <option value="1080">1080p</option>
@@ -121,6 +134,8 @@
       const chkGC      = document.getElementById('gs-gc-enabled');
       const numMaxSize = document.getElementById('gs-max-source-size-gb');
       const chkAv1     = document.getElementById('gs-av1-check-enabled');
+      const selLargeBehavior = document.getElementById('gs-large-file-behavior');
+      const chkNfsAll  = document.getElementById('gs-use-nfs-for-all-files');
       const selTarget  = document.getElementById('gs-default-target-height');
 
       const asBool = (v) => {
@@ -147,6 +162,8 @@
           chkGC.checked = asBool(d.suspend_gc_enabled);
           numMaxSize.value = Number(d.max_source_file_size_gb ?? 15);
           chkAv1.checked = asBool(d.av1_check_enabled ?? true);
+          selLargeBehavior.value = (d.large_file_behavior === 'nfs') ? 'nfs' : 'reject';
+          chkNfsAll.checked = asBool(d.use_nfs_for_all_files ?? false);
           selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
         }catch{ toast('Failed to load global settings', false); }
       }
@@ -158,6 +175,8 @@
             suspend_gc_enabled: !!chkGC.checked,
             max_source_file_size_gb: Math.max(1, Number(numMaxSize.value || 15)),
             av1_check_enabled: !!chkAv1.checked,
+            large_file_behavior: selLargeBehavior.value === 'nfs' ? 'nfs' : 'reject',
+            use_nfs_for_all_files: !!chkNfsAll.checked,
             default_target_height: asTargetHeight(selTarget.value, 1080)
           };
           const r = await fetch('/settings', {

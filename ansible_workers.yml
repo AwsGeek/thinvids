@@ -13,6 +13,7 @@
     projects_dir: /projects
     watch_dir: /watch
     library_dir: /library
+    nfs_project_root: /library/.thinvids-projects
 
     # Redis / pipeline
     redis_host: swarm1
@@ -114,6 +115,14 @@
         fstype: "{{ nfs_fstype }}"
         opts: "{{ nfs_opts }}"
         state: mounted
+
+    - name: Ensure NFS project scratch root exists
+      ansible.builtin.file:
+        path: "{{ nfs_project_root }}"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0775"
 
     # --- venv for worker ---
     - name: Create venv
@@ -231,6 +240,7 @@
           Environment=PROJECT_ROOT={{ app_root }}/current
           Environment=WATCH_ROOT={{ watch_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           Environment=VAAPI_DEVICE={{ vaapi_device }}
           ExecStart={{ app_root }}/venv/bin/huey_consumer tasks.huey -k thread -w {{ huey_workers }} --flush-locks
