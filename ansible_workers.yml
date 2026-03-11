@@ -4,7 +4,7 @@
 
   vars:
     # Path on your control machine to repo root
-    code_src: "/home/jerry/thinvids"
+    code_src: "/home/jerry/apps/thinvids"
 
     # Runtime user/paths on workers
     thinman_user: jerry

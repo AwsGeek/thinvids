@@ -66,6 +66,7 @@ class Status(str, Enum):
     STAMPING  = "STAMPING"   # <— NEW
     STOPPED   = "STOPPED"
     FAILED    = "FAILED"
+    REJECTED  = "REJECTED"
     DONE      = "DONE"
 
     # --- helpers -----------------------------------------------------------
@@ -79,9 +80,6 @@ class Status(str, Enum):
         if isinstance(value, Status):
             return value
         raw = str(value).strip().upper()
-        # Backward compatibility for legacy status values that may still exist in Redis.
-        if raw == "REJECTED":
-            return Status.FAILED
         try:
             return Status[raw]
         except (KeyError, AttributeError):
@@ -163,6 +161,8 @@ DEFAULT_SETTINGS = {
     "suspend_enabled": "0",
     "suspend_idle_sec": "300",
     "suspend_gc_enabled": "0",
+    "max_source_file_size_gb": "15",
+    "av1_check_enabled": "1",
     "default_target_height": "1080",
 }
 

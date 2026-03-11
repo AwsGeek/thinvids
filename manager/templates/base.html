@@ -68,6 +68,17 @@
         </div>
 
         <div>
+          <label for="gs-max-source-size-gb" class="block text-sm font-medium mb-1">Max source file size (GiB)</label>
+          <input id="gs-max-source-size-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+          <p class="text-xs text-gray-600 mt-1">Files larger than this are rejected before processing.</p>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-av1-check-enabled" type="checkbox" class="h-4 w-4">
+          <label for="gs-av1-check-enabled" class="text-sm">Reject AV1 files</label>
+        </div>
+
+        <div>
           <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
           <select id="gs-default-target-height" class="border p-2 rounded w-full">
             <option value="1080">1080p</option>
@@ -108,6 +119,8 @@
       const chkEnabled = document.getElementById('gs-suspend-enabled');
       const numIdle    = document.getElementById('gs-idle-seconds');
       const chkGC      = document.getElementById('gs-gc-enabled');
+      const numMaxSize = document.getElementById('gs-max-source-size-gb');
+      const chkAv1     = document.getElementById('gs-av1-check-enabled');
       const selTarget  = document.getElementById('gs-default-target-height');
 
       const asBool = (v) => {
@@ -132,6 +145,8 @@
           chkEnabled.checked = asBool(d.suspend_enabled);
           numIdle.value = Number(d.suspend_idle_sec ?? 300);
           chkGC.checked = asBool(d.suspend_gc_enabled);
+          numMaxSize.value = Number(d.max_source_file_size_gb ?? 15);
+          chkAv1.checked = asBool(d.av1_check_enabled ?? true);
           selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
         }catch{ toast('Failed to load global settings', false); }
       }
@@ -141,6 +156,8 @@
             suspend_enabled: !!chkEnabled.checked,
             suspend_idle_sec: Math.max(30, parseInt(numIdle.value || 300, 10)),
             suspend_gc_enabled: !!chkGC.checked,
+            max_source_file_size_gb: Math.max(1, Number(numMaxSize.value || 15)),
+            av1_check_enabled: !!chkAv1.checked,
             default_target_height: asTargetHeight(selTarget.value, 1080)
           };
           const r = await fetch('/settings', {

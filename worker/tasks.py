@@ -171,7 +171,7 @@ def _final_output_path(src_filename: str) -> str:
 
 def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
-    return s in (Status.FAILED, Status.STOPPED)
+    return s in (Status.FAILED, Status.REJECTED, Status.STOPPED)
 
 def _normalize_target_height(value) -> int:
     try:
@@ -401,17 +401,19 @@ def split(job_id: str, file_path: str):
             'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0'
         })
 
-        # --- FAIL FAST: GPU doesn't support AV1 decode ---
+        # --- FAIL FAST: reject AV1 sources ---
         # Normalize codec name (ffprobe reports "av1")
         if (codec or "").strip().lower() in {"av1", "av01"}:
-            msg = "Unsupported input codec: AV1. GPU decode not available; failing fast."
+            msg = "Unsupported input codec: AV1. Rejected."
             logger.error(f"[{job_id}] {msg}")
-            # Mark job failed and store a human-friendly reason
+            # Mark job rejected and store a human-friendly reason
             redis.hset(job_key, mapping={
-                'status': Status.FAILED.value,
+                'status': Status.REJECTED.value,
                 'error': msg,
+                'rejected_reason': 'av1_rejected',
+                'rejected_at': str(_now()),
             })
-            return {'status': 'FAILED', 'reason': msg}
+            return {'status': 'REJECTED', 'reason': msg}
 
 
         # Advertise master URL

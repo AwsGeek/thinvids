@@ -210,6 +210,63 @@ def _float_or(value, default=0.0) -> float:
     except Exception:
         return default
 
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+def _as_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def _load_global_settings():
+    settings = {}
+    try:
+        settings.update(redis_client.hgetall("settings:global") or {})
+    except Exception:
+        pass
+    try:
+        settings.update(_get_settings() or {})
+    except Exception:
+        pass
+    settings.setdefault("max_source_file_size_gb", "15")
+    settings.setdefault("av1_check_enabled", "1")
+    return settings
+
+def _evaluate_rejection(video_details, settings):
+    max_source_file_size_gb = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
+    av1_check_enabled = _as_bool(settings.get("av1_check_enabled", "1"), True)
+
+    source_size = _as_int(video_details.get("source_file_size", 0), 0)
+    source_codec = str(video_details.get("source_codec") or "").strip().lower()
+
+    max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
+    if max_source_bytes > 0 and source_size > max_source_bytes:
+        return (
+            "size_limit",
+            f"Source file too large: {humanize.naturalsize(source_size, binary=True)} > {max_source_file_size_gb:g} GiB limit",
+        )
+
+    if av1_check_enabled and source_codec in ("av1", "av01"):
+        return (
+            "av1_rejected",
+            "AV1 source rejected by global setting (av1_check_enabled).",
+        )
+
+    return (None, None)
+
 def _job_index_keys() -> List[str]:
     keys = list(redis_client.smembers("jobs:all") or [])
     if keys:
@@ -231,7 +288,7 @@ def _is_terminal_pipeline_status(status_raw: str) -> bool:
         status = Status.parse(raw)
     except Exception:
         return False
-    return status in {Status.READY, Status.STOPPED, Status.FAILED, Status.DONE}
+    return status in {Status.READY, Status.STOPPED, Status.FAILED, Status.REJECTED, Status.DONE}
 
 def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
     redis_client.hset(job_key, mapping={
@@ -517,6 +574,8 @@ def get_settings():
     out["suspend_enabled"] = str(settings.get("suspend_enabled", "0")).strip().lower() in ("1", "true", "yes", "on")
     out["suspend_idle_sec"] = idle_sec
     out["suspend_gc_enabled"] = str(settings.get("suspend_gc_enabled", "0")).strip().lower() in ("1", "true", "yes", "on")
+    out["max_source_file_size_gb"] = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
+    out["av1_check_enabled"] = _as_bool(settings.get("av1_check_enabled", "1"), True)
     out["default_target_height"] = normalize_target_height(
         settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
         DEFAULT_TARGET_HEIGHT
@@ -531,25 +590,22 @@ def post_global_settings():
         "suspend_enabled": bool,
         "suspend_idle_sec": int (>=30),
         "suspend_gc_enabled": bool,
+        "max_source_file_size_gb": number (>0),
+        "av1_check_enabled": bool,
         "default_target_height": 720|1080
     }
     """
     payload = request.get_json(silent=True) or {}
     try:
-        def _as_bool(v, default=False):
-            if v is None:
-                return default
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, (int, float)):
-                return v != 0
-            return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
-
         suspend_enabled = _as_bool(payload.get("suspend_enabled", False), False)
         suspend_gc_enabled = _as_bool(payload.get("suspend_gc_enabled", False), False)
         idle = int(payload.get("suspend_idle_sec", 300))
         if idle < 30:
             idle = 30  # sane floor
+        max_size_gb = _as_float(payload.get("max_source_file_size_gb", 15), 15.0)
+        if max_size_gb <= 0:
+            max_size_gb = 15.0
+        av1_check_enabled = _as_bool(payload.get("av1_check_enabled", True), True)
         default_target_height = normalize_target_height(
             payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
             DEFAULT_TARGET_HEIGHT
@@ -561,10 +617,17 @@ def post_global_settings():
         "suspend_enabled": "1" if suspend_enabled else "0",
         "suspend_idle_sec": str(idle),
         "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
+        "max_source_file_size_gb": str(max_size_gb),
+        "av1_check_enabled": "1" if av1_check_enabled else "0",
         "default_target_height": str(default_target_height),
     })
     # Backward-compatible mirror for legacy readers.
     redis_client.hset("settings:global", mapping={
+        "suspend_enabled": "1" if suspend_enabled else "0",
+        "suspend_idle_sec": str(idle),
+        "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
+        "max_source_file_size_gb": str(max_size_gb),
+        "av1_check_enabled": "1" if av1_check_enabled else "0",
         "default_target_height": str(default_target_height),
     })
 
@@ -572,6 +635,8 @@ def post_global_settings():
         "suspend_enabled": suspend_enabled,
         "suspend_idle_sec": idle,
         "suspend_gc_enabled": suspend_gc_enabled,
+        "max_source_file_size_gb": max_size_gb,
+        "av1_check_enabled": av1_check_enabled,
         "default_target_height": default_target_height,
     })
 
@@ -626,7 +691,15 @@ def list_jobs():
             nowf    = time.time()
             elapsed = 0
 
-            status =  Status.parse(job_data.get('status'))
+            raw_status = str(job_data.get('status') or '').strip().upper()
+            if raw_status == 'COMPLETED':
+                status = Status.DONE
+            else:
+                try:
+                    status = Status.parse(raw_status)
+                except Exception:
+                    status = None
+
             if status in [Status.RUNNING, Status.WAITING, Status.STARTING]:
                 elapsed = nowf - started
             elif ended:
@@ -676,8 +749,9 @@ def list_jobs():
         'STAMPING': 4,
         'STOPPED': 5,
         'FAILED': 6,
-        'DONE': 7,
-        'COMPLETED': 7,
+        'REJECTED': 7,
+        'DONE': 8,
+        'COMPLETED': 8,
     }
 
     filtered_jobs = jobs_list
@@ -743,7 +817,7 @@ def get_video_details(job_id: str, file_path: str):
 
     real_input = file_path
     if not os.path.exists(real_input):
-        job = redis.hgetall(job_key) or {}
+        job = redis_client.hgetall(job_key) or {}
         filename = job.get('filename') or ''
         alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
         if os.path.exists(alt):
@@ -854,19 +928,19 @@ def add_job():
     job_key = f"job:{job_id}"
 
     now = str(time.time())
-    global_settings = redis_client.hgetall('settings:global') or {}
+    global_settings = _load_global_settings()
     default_target_height = get_default_target_height()
     target_height = normalize_target_height(
         data.get('target_height', default_target_height),
         default_target_height
     )
 
-    auto_start_global = global_settings.get('auto_start', '1') == '1'
+    auto_start_global = _as_bool(global_settings.get('auto_start', '1'), True)
     auto_start_effective = (auto_start_global and not force_paused)
-    serialize_global  = global_settings.get('serialize_pipeline', '0') == '1'
+    serialize_global  = _as_bool(global_settings.get('serialize_pipeline', '0'), False)
 
-    segment_duration = int(global_settings.get('segment_duration', 10))
-    number_parts = int(global_settings.get('number_parts', 2))
+    segment_duration = _as_int(global_settings.get('segment_duration', 10), 10)
+    number_parts = _as_int(global_settings.get('number_parts', 2), 2)
 
     status = Status.WAITING if auto_start_effective else Status.READY
     job_settings = {
@@ -897,14 +971,34 @@ def add_job():
     video_details = get_video_details(job_id, full_path)
     job_settings = {**job_settings, **video_details}
 
+    rejection_reason, rejection_message = _evaluate_rejection(video_details, global_settings)
+    if rejection_reason:
+        job_settings.update({
+            'status': Status.REJECTED.value,
+            'started_at': '0',
+            'queue_action': '',
+            'waiting_at': '0',
+            'error': rejection_message,
+            'rejected_reason': rejection_reason,
+            'rejected_at': now,
+        })
+
     redis_client.hset(job_key, mapping=job_settings)
 
     # index the job for fast listing
     redis_client.sadd("jobs:all", job_key)
 
-    if auto_start_effective:
+    if auto_start_effective and not rejection_reason:
         _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, _float_or(now, time.time()))
         dispatch_next_waiting_job()
+
+    if rejection_reason:
+        return jsonify({
+            'status': 'rejected',
+            'job_id': job_id,
+            'message': rejection_message,
+            'reason': rejection_reason,
+        }), 201
 
     return jsonify({'status': 'success', 'job_id': job_id}), 201
 
@@ -1007,8 +1101,8 @@ def restart_job(job_id):
         return jsonify({'status': 'not found'}), 404
 
     job = redis_client.hgetall(job_key)
-    if Status.parse(job.get('status')) not in [Status.STOPPED, Status.FAILED, Status.DONE]:
-        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/DONE state.'}), 400
+    if Status.parse(job.get('status')) not in [Status.STOPPED, Status.FAILED, Status.REJECTED, Status.DONE]:
+        return jsonify({'status': 'invalid', 'message': 'Job is not in STOPPED/FAILED/REJECTED/DONE state.'}), 400
 
     filename = job.get('filename')
     if not filename:
@@ -1046,6 +1140,33 @@ def restart_job(job_id):
     target_height    = normalize_target_height(job.get('target_height', default_target_height), default_target_height)
     selected_v_stream= job.get('selected_v_stream', 0)
     selected_a_stream= job.get('selected_a_stream', 0)
+    source_updates = {}
+    global_settings = _load_global_settings()
+    full_path = os.path.join("/watch", filename.lstrip('/'))
+    try:
+        video_details = get_video_details(job_id, full_path)
+        source_updates = {
+            'source_file_size': video_details.get('source_file_size', 0),
+            'source_duration': video_details.get('source_duration', '0'),
+            'source_codec': video_details.get('source_codec', ''),
+            'source_resolution': video_details.get('source_resolution', ''),
+            'source_fps': video_details.get('source_fps', '0'),
+            'source_bitrate_kbps': video_details.get('source_bitrate_kbps', '0'),
+            'total_frames': video_details.get('total_frames', 0),
+        }
+    except Exception as e:
+        logger.warning(f"[{job_id}] Probe failed during restart validation: {e}")
+        source_updates = {
+            'source_file_size': job.get('source_file_size', 0),
+            'source_duration': job.get('source_duration', '0'),
+            'source_codec': job.get('source_codec', ''),
+            'source_resolution': job.get('source_resolution', ''),
+            'source_fps': job.get('source_fps', '0'),
+            'source_bitrate_kbps': job.get('source_bitrate_kbps', '0'),
+            'total_frames': job.get('total_frames', 0),
+        }
+
+    rejection_reason, rejection_message = _evaluate_rejection(source_updates, global_settings)
 
     now = time.time()
     new_fields = {
@@ -1079,6 +1200,17 @@ def restart_job(job_id):
         'waiting_at': str(now),
 
     }
+    new_fields.update(source_updates)
+    if rejection_reason:
+        new_fields.update({
+            'status': Status.REJECTED.value,
+            'started_at': '0',
+            'queue_action': '',
+            'waiting_at': '0',
+            'error': rejection_message,
+            'rejected_reason': rejection_reason,
+            'rejected_at': str(now),
+        })
 
     # Overwrite base hash in one go (no delete -> no set race)
     redis_client.hset(job_key, mapping=new_fields)
@@ -1088,6 +1220,9 @@ def restart_job(job_id):
         redis_client.sadd("jobs:all", job_key)
     except Exception:
         pass
+
+    if rejection_reason:
+        return jsonify({'status': 'rejected', 'reason': rejection_reason, 'message': rejection_message}), 200
 
     dispatch_next_waiting_job()
     return jsonify({'status': 'queued'}), 200

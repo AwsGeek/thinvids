@@ -94,6 +94,7 @@
         <option value="STAMPING">STAMPING</option>
         <option value="STOPPED">STOPPED</option>
         <option value="FAILED">FAILED</option>
+        <option value="REJECTED">REJECTED</option>
         <option value="DONE">DONE</option>
       </select>
     </div>
@@ -288,7 +289,7 @@
     if (s==='RUNNING') return 'text-green-600';
     if (s==='STAMPING') return 'text-purple-600'; // <— NEW
     if (s==='STOPPED') return 'text-orange-600';
-    if (s==='FAILED') return 'text-red-600';
+    if (s==='FAILED'||s==='REJECTED') return 'text-red-600';
     if (s==='DONE'||s==='COMPLETED') return 'text-blue-600';
     return 'text-gray-700';
   };
@@ -635,7 +636,7 @@
 
       const canStart   = job.status === 'READY';
       const canStop = (job.status === 'STARTING' || job.status === 'WAITING' || job.status === 'RUNNING' || job.status === 'STAMPING');
-      const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'DONE');
+      const canRestart = (job.status === 'STOPPED' || job.status === 'FAILED' || job.status === 'REJECTED' || job.status === 'DONE');
 
       const busy = ['STARTING','WAITING','RUNNING','STAMPING'].includes(String(job.status||'').toUpperCase());
       const canStamp = !!job.filename && !busy;
@@ -774,7 +775,7 @@
     const res = await fetch(`/job_settings/${job_id}`);
     if (!res.ok) return alert('Failed to load settings');
     const data = await res.json();
-    const editable = ['READY','STOPPED','FAILED'].includes(String(data.status||'').toUpperCase());
+    const editable = ['READY','STOPPED','FAILED','REJECTED'].includes(String(data.status||'').toUpperCase());
     el('settings-job-id').value = job_id;
     el('settings-filename').value = data.filename || '';
     el('settings-segment-duration').value = data.segment_duration || 10;
@@ -811,7 +812,7 @@
     el('save-job-settings-btn').classList.toggle('hidden', !editable);
     el('start-job-btn').classList.toggle('hidden', !(String(data.status).toUpperCase()==='READY'));
     el('job-settings-help').innerHTML = editable
-      ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED).'
+      ? 'You can adjust settings before starting (READY) or before restarting (STOPPED/FAILED/REJECTED).'
       : 'This job is active or finished. Settings are read-only.';
     el('save-job-settings-btn').onclick = saveJobSettings;
     el('start-job-btn').onclick = ()=>startJob(job_id);
@@ -907,7 +908,7 @@
 
     if (sortSel) sortSel.value = ['date', 'filename', 'status'].includes(CURRENT_SORT) ? CURRENT_SORT : 'date';
     if (statusSel) {
-      const allowedStatus = ['ALL', 'READY', 'STARTING', 'WAITING', 'RUNNING', 'STAMPING', 'STOPPED', 'FAILED', 'DONE'];
+      const allowedStatus = ['ALL', 'READY', 'STARTING', 'WAITING', 'RUNNING', 'STAMPING', 'STOPPED', 'FAILED', 'REJECTED', 'DONE'];
       if (!allowedStatus.includes(CURRENT_STATUS)) CURRENT_STATUS = 'ALL';
       statusSel.value = CURRENT_STATUS;
     }
