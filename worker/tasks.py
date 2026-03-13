@@ -217,6 +217,62 @@ def _part_paths(job_id: str, idx: int) -> Tuple[str, str]:
     return (os.path.join(parts_dir, f"part_{idx:03d}.ts"),
             os.path.join(enc_dir,   f"enc_{idx:03d}.mp4"))
 
+
+def _reset_job_run_state(job_id: str, job=None):
+    """
+    Clear stale per-run files/counters so retries/restarts don't reuse old parts.
+    """
+    job_key = _job_key(job_id)
+    base_dir = _job_base_dir(job_id, job)
+    parts_dir = os.path.join(base_dir, "parts")
+    enc_dir = os.path.join(base_dir, "encoded")
+
+    for path in (parts_dir, enc_dir):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        _ensure_dirs(path)
+
+    for path in (
+        os.path.join(base_dir, "concat.txt"),
+        os.path.join(base_dir, f"job_{job_id}_output.mp4"),
+    ):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    try:
+        redis.hset(job_key, mapping={
+            'parts_total': 0,
+            'parts_done': 0,
+            'segmented_chunks': 0,
+            'completed_chunks': 0,
+            'stitched_chunks': 0,
+            'segment_progress': 0,
+            'segment_elapsed': 0,
+            'encode_progress': 0,
+            'encode_elapsed': 0,
+            'combine_progress': 0,
+            'combine_elapsed': 0,
+            'error': '',
+            'failed_part': 0,
+            'failed_stage': '',
+            'failed_worker': '',
+            'ended_at': 0,
+        })
+        redis.delete(f"job_done_parts:{job_id}")
+        redis.delete(f"job_retry_counts:{job_id}")
+        redis.delete(f"job_retry_ts:{job_id}")
+        redis.delete(f"job_missing_first_seen:{job_id}")
+        redis.delete(f"job_retry_inflight:{job_id}")
+    except Exception:
+        pass
+
 def _final_output_path(src_filename: str) -> str:
     base, _ = os.path.splitext(src_filename)
     return os.path.join(LIBRARY_ROOT, base.lstrip('/') + '.mp4')
@@ -398,6 +454,7 @@ def transcode(job_id: str, file_path: str):
       - Kick off stitch(job_id) so the stitcher publishes stitch_host.
       - Run split(job_id, file_path) to segment and dispatch encodes.
     """
+    _reset_job_run_state(job_id)
     # Start stitcher first so encoders have a destination
     stitch(job_id)
     # Perform split/dispatch on this node (master)
@@ -1132,6 +1189,13 @@ def stitch(job_id: str):
 
             # Only consider a small window beyond the frontier
             horizon = min(P, frontier + RETRY_WINDOW_AHEAD)
+            try:
+                max_segmented = int(redis.hget(job_key, 'segmented_chunks') or 0)
+            except Exception:
+                max_segmented = 0
+            # Never retry a part that has not been segmented yet, or we'll trigger 404 on master.
+            if max_segmented > 0:
+                horizon = min(horizon, max_segmented)
             window_missing = [i for i in range(frontier + 1, horizon + 1) if i not in ready]
 
             # Record first-seen-missing timestamps
