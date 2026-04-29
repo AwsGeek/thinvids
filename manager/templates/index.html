@@ -3,25 +3,33 @@
 {% block head_extra %}
   <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
   <style>
+    #job-table { width: 100%; table-layout: fixed; }
+
     /* Single-line everywhere by default */
     #job-table th, #job-table td { white-space: nowrap; vertical-align: middle; }
 
+    #job-table col.select-col { width: 2.5rem; }
+    #job-table col.size-col { width: 5rem; }
+    #job-table col.codec-col { width: 7rem; }
     /* Fixed widths for progress columns (match w-28 / 7rem) */
-    #job-table col.progress-col { width: 7rem; }
-
-    /* Keep other, non-Name columns as tight as possible */
-    #job-table col.shrink { width: 1%; }
+    #job-table col.progress-col { width: 7.5rem; }
+    #job-table col.started-col { width: 5rem; }
+    #job-table col.elapsed-col { width: 3rem; }
+    #job-table col.status-col { width: 7rem; }
+    #job-table col.actions-col { width: 9rem; }
 
     /* Name column: takes remaining space; inner element ellipsizes */
-    #job-table td.name-cell { width: auto; }
-    #job-table .name-clip { display: block; max-width: 100%; }
+    #job-table th.name-header, #job-table td.name-cell { min-width: 0; }
+    #job-table .name-clip { display: block; width: 100%; max-width: 100%; overflow: hidden; text-align: left; }
     #job-table .name-text {
-      display: inline-block;
+      display: block;
+      width: 100%;
       max-width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       vertical-align: bottom;
+      text-align: left;
     }
 
     /* Progress bar container uses full cell width (7rem via colgroup) */
@@ -110,8 +118,7 @@
   </div>
 </div>
 
-<h2 class="text-xl font-semibold my-2">Current Jobs</h2>
-<div class="jobs-activity-layout">
+<div class="jobs-activity-layout  my-2">
   <div class="jobs-main">
     <div class="bg-white rounded shadow p-3 mb-2">
       <div class="flex flex-wrap items-end gap-3">
@@ -146,29 +153,25 @@
     </div>
 
     <table id="job-table" class="w-full border-collapse bg-white">
-      <!-- Column sizing: most are tiny; Name grows; progress fixed -->
+      <!-- Column sizing: Name grows; every other column is fixed -->
       <colgroup>
-        <col class="shrink"><!-- Select -->
-        <col class="shrink"><!-- ID -->
+        <col class="select-col"><!-- Select -->
         <col><!-- Name (flex) -->
-        <col class="shrink"><!-- Size -->
-        <col class="shrink"><!-- Dim -->
-        <col class="shrink"><!-- Codec -->
-        <col class="shrink"><!-- Bitrate -->
+        <col class="size-col"><!-- Size -->
+        <col class="codec-col"><!-- Codec -->
         <col class="progress-col"><!-- Split -->
         <col class="progress-col"><!-- Encode -->
         <col class="progress-col"><!-- Stitch -->
-        <col class="shrink"><!-- Started -->
-        <col class="shrink"><!-- Elapsed -->
-        <col class="shrink"><!-- Status -->
-        <col class="shrink"><!-- Actions -->
+        <col class="started-col"><!-- Started -->
+        <col class="elapsed-col"><!-- Elapsed -->
+        <col class="status-col"><!-- Status -->
+        <col class="actions-col"><!-- Actions -->
       </colgroup>
 
       <thead>
         <tr class="bg-gray-200 text-xs">
           <th class="px-2 py-1 text-center"><input id="select-all-jobs" type="checkbox" title="Select all jobs on this page"></th>
-          <th class="px-2 py-1 text-left">ID</th>
-          <th class="px-2 py-1 text-left">Name</th>
+          <th class="px-2 py-1 text-left name-header">Name</th>
           <th class="px-2 py-1 text-left">Size</th>
           <th class="px-2 py-1 text-left">Codec</th>
           <th class="px-2 py-1 text-center">Split</th>
@@ -360,6 +363,70 @@
     setTimeout(()=>node.remove(), 2200);
   }
   const BLUE_FILL='rgba(37,99,235,0.85)', BLUE_STROKE='rgb(37,99,235)';
+  const AXIS_COLOR='#374151';
+  const GREEN_STROKE='rgb(22,163,74)';
+  const ORANGE_STROKE='rgb(249,115,22)';
+  const AVG_BAR_FILL='rgba(249,115,22,0.9)', AVG_BAR_STROKE='rgb(249,115,22)';
+  const avgBarValuePlugin = {
+    id: 'avgBarValuePlugin',
+    afterDatasetsDraw(chart) {
+      const ds = chart?.data?.datasets?.[0];
+      const avgIdx = Number(ds?.avgBarIndex);
+      const labelText = ds?.avgBarLabelText;
+      if (!Number.isInteger(avgIdx) || avgIdx < 0 || labelText === undefined || labelText === null || labelText === '') return;
+      const meta = chart.getDatasetMeta(0);
+      if (!meta || meta.hidden || !meta.data || !meta.data[avgIdx]) return;
+      const bar = meta.data[avgIdx];
+      const x = bar?.x;
+      const y = bar?.y;
+      if (!isFinite(x) || !isFinite(y)) return;
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.font = '600 10px sans-serif';
+      ctx.fillStyle = AXIS_COLOR;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      const yText = Math.max(chart.chartArea.top + 10, y - 2);
+      ctx.fillText(String(labelText), x, yText);
+      ctx.restore();
+    },
+  };
+  Chart.register(avgBarValuePlugin);
+  const hostFromEndpoint = (value) => {
+    if (!value) return '';
+    try {
+      if (/^https?:\/\//i.test(String(value))) return new URL(String(value)).hostname;
+    } catch {}
+    const raw = String(value).replace(/^https?:\/\//i, '');
+    return raw.split('/')[0].split(':')[0];
+  };
+  function getActiveRoleHosts() {
+    const activeJobs = Array.isArray(window.__JOBS_CACHE__) ? window.__JOBS_CACHE__ : [];
+    const activeStatuses = new Set(['STARTING', 'WAITING', 'RUNNING', 'STAMPING']);
+    const masterHosts = new Set();
+    const stitchHosts = new Set();
+    activeJobs.forEach((job) => {
+      const status = String(job?.status || '').toUpperCase();
+      if (!activeStatuses.has(status)) return;
+      const master = hostFromEndpoint(job?.master_host || '').toLowerCase();
+      const stitch = hostFromEndpoint(job?.stitch_host || '').toLowerCase();
+      if (master) masterHosts.add(master);
+      if (stitch) stitchHosts.add(stitch);
+    });
+    return { masterHosts, stitchHosts };
+  }
+  function buildRoleLabelColorMap(nodes) {
+    const roleColors = new Map();
+    const { masterHosts, stitchHosts } = getActiveRoleHosts();
+    (nodes || []).forEach((n) => {
+      const host = String(n?.hostname || '').toLowerCase();
+      const label = shortHost(n?.hostname || '');
+      if (!label) return;
+      if (masterHosts.has(host)) roleColors.set(label, GREEN_STROKE);
+      if (stitchHosts.has(host)) roleColors.set(label, ORANGE_STROKE);
+    });
+    return roleColors;
+  }
   const tinyBarOpts = (maxY=100)=>({
     type:'bar',
     data:{labels:[],datasets:[{data:[],backgroundColor:BLUE_FILL,borderColor:BLUE_STROKE,borderWidth:1}]},
@@ -374,96 +441,124 @@
   });
   const gpuChart = new Chart(el('gpuChart').getContext('2d'), tinyBarOpts(100));
   const cpuChart = new Chart(el('cpuChart').getContext('2d'), tinyBarOpts(100));
-  function updateBars(chart, labels, values, suggestedMax) {
-    chart.data.labels = labels;
-    chart.data.datasets[0].data = values;
+  function updateBars(chart, labels, values, suggestedMax, backgroundColors, borderColors, avgBarValue, roleLabelColors) {
+    if ((chart.data.datasets || []).length > 1) chart.data.datasets = [chart.data.datasets[0]];
+    const baseLabels = Array.isArray(labels) ? labels.slice() : [];
+    const baseValues = Array.isArray(values) ? values.slice() : [];
+    let avgIdx = null;
+    if (Number.isFinite(avgBarValue) && baseLabels.length) {
+      baseLabels.push('Avg');
+      baseValues.push(Number(avgBarValue));
+      avgIdx = baseValues.length - 1;
+    }
+
+    chart.data.labels = baseLabels;
+    chart.data.datasets[0].data = baseValues;
+
+    if (Array.isArray(backgroundColors) || avgIdx !== null) {
+      const baseCount = baseValues.length - (avgIdx !== null ? 1 : 0);
+      const bg = Array.isArray(backgroundColors) ? backgroundColors.slice(0, baseCount) : Array(baseCount).fill(BLUE_FILL);
+      const bd = Array.isArray(borderColors) ? borderColors.slice(0, baseCount) : Array(baseCount).fill(BLUE_STROKE);
+      if (avgIdx !== null) {
+        bg.push(AVG_BAR_FILL);
+        bd.push(AVG_BAR_STROKE);
+      }
+      chart.data.datasets[0].backgroundColor = bg;
+      chart.data.datasets[0].borderColor = bd;
+    } else {
+      chart.data.datasets[0].backgroundColor = backgroundColors || BLUE_FILL;
+      chart.data.datasets[0].borderColor = borderColors || BLUE_STROKE;
+    }
+
+    if (avgIdx !== null) {
+      chart.data.datasets[0].avgBarIndex = avgIdx;
+      chart.data.datasets[0].avgBarLabelText = String(Math.round(Number(avgBarValue)));
+    } else {
+      delete chart.data.datasets[0].avgBarIndex;
+      delete chart.data.datasets[0].avgBarLabelText;
+    }
+
+    const ticks = chart.options?.scales?.x?.ticks;
+    if (ticks) {
+      if (roleLabelColors && roleLabelColors.size) {
+        ticks.color = (ctx) => {
+          const label = String(ctx?.tick?.label ?? chart.data.labels?.[ctx.index] ?? '');
+          return roleLabelColors.get(label) || AXIS_COLOR;
+        };
+        ticks.font = (ctx) => {
+          const label = String(ctx?.tick?.label ?? chart.data.labels?.[ctx.index] ?? '');
+          return { size: 10, weight: roleLabelColors.has(label) ? '700' : '400' };
+        };
+      } else {
+        ticks.color = AXIS_COLOR;
+        ticks.font = { size: 10, weight: '400' };
+      }
+    }
     if (suggestedMax !== undefined) chart.options.scales.y.suggestedMax = suggestedMax;
     chart.update('none');
   }
 </script>
 
-<!-- MINI NETWORK (shared cache) -->
+<!-- MINI NETWORK (stacked per-node) -->
 <script>
-  const MINI_WINDOW = 60;    // last 60 seconds
-  const nowSec = ()=>Math.floor(Date.now()/1000);
   const mbps = bps => (Number(bps||0)*8/1e6);
-
-  const PALETTE = [
-    '#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
-    '#8c564b','#e377c2','#17becf','#7f7f7f','#bcbd22',
-    '#000000','#ff1493','#00ced1','#ffa500','#4169e1',
-  ];
-  const lighten = (hex,amt=0.38) => {
-    const m = hex.match(/^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i); if (!m) return hex;
-    let [r,g,b]=[parseInt(m[1],16),parseInt(m[2],16),parseInt(m[3],16)];
-    r=Math.round(r+(255-r)*amt); g=Math.round(g+(255-g)*amt); b=Math.round(b+(255-b)*amt);
-    return '#' + [r,g,b].map(v=>v.toString(16).padStart(2,'0')).join('');
-  };
+  let netRoleLabelColors = new Map();
 
   const netMiniChart = new Chart(el('netMiniChart').getContext('2d'), {
-    type:'line',
-    data:{ labels:[], datasets:[] },
+    type:'bar',
+    data:{
+      labels:[],
+      datasets:[
+        { label:'RX', data:[], backgroundColor:'rgba(37,99,235,0.85)', borderColor:'rgb(37,99,235)', borderWidth:1, stack:'net' },
+        { label:'TX', data:[], backgroundColor:'rgba(56,189,248,0.85)', borderColor:'rgb(56,189,248)', borderWidth:1, stack:'net' },
+      ],
+    },
     options:{
       responsive:true, maintainAspectRatio:false, animation:false,
       plugins:{ legend:{ display:false } },
       interaction:{ mode:'index', intersect:false },
-      elements:{ point:{ radius:0 }},
       scales:{
-        x:{ grid:{ display:false }, ticks:{ display:false } },
-        y:{ beginAtZero:true, min:0, max:1000, ticks:{ stepSize:500, autoSkip:false, callback:v=>v.toLocaleString() } }
+        x:{
+          stacked:true,
+          grid:{ display:false },
+          ticks:{
+            autoSkip:false,
+            maxRotation:0,
+            minRotation:0,
+            color:(ctx)=>{
+              const label = String(ctx?.tick?.label ?? netMiniChart?.data?.labels?.[ctx.index] ?? '');
+              return netRoleLabelColors.get(label) || AXIS_COLOR;
+            },
+            font:(ctx)=>{
+              const label = String(ctx?.tick?.label ?? netMiniChart?.data?.labels?.[ctx.index] ?? '');
+              return { size:10, weight: netRoleLabelColors.has(label) ? '700' : '400' };
+            },
+          }
+        },
+        y:{ stacked:true, beginAtZero:true, max:500, grid:{ display:false }, ticks:{ autoSkip:false, callback:v=>v.toLocaleString() } }
       }
     }
   });
-
-  const hostOrder = [];
-  const dsIndexByHost = {};
-  function ensureHostDatasets(host){
-    if (dsIndexByHost[host]) return;
-    if (!hostOrder.includes(host)) hostOrder.push(host);
-    const color = PALETTE[hostOrder.indexOf(host) % PALETTE.length];
-    const rx = { label:`${host} RX`, data:[], borderColor:color, borderWidth:2, fill:false, tension:0.12, spanGaps:true };
-    const tx = { label:`${host} TX`, data:[], borderColor:lighten(color,0.38), borderDash:[6,4], borderWidth:2, fill:false, tension:0.12, spanGaps:true };
-    netMiniChart.data.datasets.push(rx); const rxIdx = netMiniChart.data.datasets.length-1;
-    netMiniChart.data.datasets.push(tx); const txIdx = netMiniChart.data.datasets.length-1;
-    dsIndexByHost[host] = { rx: rxIdx, tx: txIdx };
-  }
-
-  function renderMiniFromCache(cache){
-    const start = Math.max(0, cache.labels.length - MINI_WINDOW);
-    netMiniChart.data.labels = cache.labels.slice(start).map(()=> '');
-    const hosts = Object.keys(cache.hosts).sort((a,b)=>{
-      const na = parseInt((a||'').match(/\d+/)?.[0] || 0,10);
-      const nb = parseInt((b||'').match(/\d+/)?.[0] || 0,10);
-      return na - nb || a.localeCompare(b);
-    });
-    hosts.forEach(h=>{
-      ensureHostDatasets(h);
-      const idxs = dsIndexByHost[h];
-      netMiniChart.data.datasets[idxs.rx].data = cache.hosts[h].rx.slice(start);
-      netMiniChart.data.datasets[idxs.tx].data = cache.hosts[h].tx.slice(start);
-    });
-    netMiniChart.update('none');
-  }
 
   async function fetchAndUpdateMiniNet(){
     try{
       const res = await fetch('/metrics_snapshot');
       if (!res.ok) return;
       const { nodes } = await res.json();
-      const sample = {};
-      (nodes||[]).forEach(n=>{
-        const host = n.hostname; if (!host) return;
-        sample[host] = { rx: mbps(n.rx_bps||0), tx: mbps(n.tx_bps||0) };
+      const sorted = (nodes||[]).slice().sort((a,b)=>{
+        const na = parseInt((a.hostname||'').match(/\d+/)?.[0] || 0,10);
+        const nb = parseInt((b.hostname||'').match(/\d+/)?.[0] || 0,10);
+        return na - nb || String(a.hostname||'').localeCompare(String(b.hostname||''));
       });
-      const cache = window.NETCACHE.push(nowSec(), sample);
-      renderMiniFromCache(cache);
-      const latestTs = cache.labels[cache.labels.length-1] || 0;
+      netMiniChart.data.labels = sorted.map(n => shortHost(n.hostname || ''));
+      netRoleLabelColors = buildRoleLabelColorMap(sorted);
+      netMiniChart.data.datasets[0].data = sorted.map(n => Number(mbps(n.rx_bps||0).toFixed(2)));
+      netMiniChart.data.datasets[1].data = sorted.map(n => Number(mbps(n.tx_bps||0).toFixed(2)));
+      netMiniChart.update('none');
+      const latestTs = sorted.length ? Math.max(...sorted.map(n => Number(n.ts || 0))) : 0;
       el('net-updated').textContent = latestTs ? new Date(latestTs*1000).toLocaleTimeString() : '';
     }catch{}
   }
-
-  // seed on load
-  renderMiniFromCache(window.NETCACHE.load());
 </script>
 
 <!-- JOB LIST, PAGINATION & METRICS -->
@@ -709,8 +804,11 @@
       const labels = nodes.map(n=>shortHost(n.hostname));
       const gpu = nodes.map(n => (n.gpu >= 0 ? Number(n.gpu.toFixed(1)) : 0));
       const cpu = nodes.map(n => Number((n.cpu||0).toFixed(1)));
-      updateBars(gpuChart, labels, gpu, 100);
-      updateBars(cpuChart, labels, cpu, 100);
+      const gpuAvg = gpu.length ? Number((gpu.reduce((sum, v) => sum + Number(v || 0), 0) / gpu.length).toFixed(1)) : 0;
+      const cpuAvg = cpu.length ? Number((cpu.reduce((sum, v) => sum + Number(v || 0), 0) / cpu.length).toFixed(1)) : 0;
+      const roleLabelColors = buildRoleLabelColorMap(nodes);
+      updateBars(gpuChart, labels, gpu, 100, undefined, undefined, gpuAvg, roleLabelColors);
+      updateBars(cpuChart, labels, cpu, 100, undefined, undefined, cpuAvg, roleLabelColors);
       const latestTs = nodes.length ? Math.max(...nodes.map(n=>n.ts||0)) : 0;
       const stamp = latestTs ? tsStr(latestTs) : '';
       el('gpu-updated').textContent = stamp;
@@ -782,7 +880,6 @@
     items.forEach(job=>{
       const row = document.createElement('tr');
 
-      const idShort = (job.job_id||'').split('-')[0] || '';
       const baseName = (job.filename||'').split('/').pop() || '';
       const displayName = baseName.replace(/\.[^.]+$/,'') || baseName || 'N/A';
       const nameColor = statusColorClass(job.status||'');
@@ -807,6 +904,11 @@
                 : ''));
 
       const isDone = String(job.status||'').toUpperCase()==='DONE';
+      const displayFileSize = (() => {
+        const destSize = Number(job.dest_file_size || 0);
+        if (isDone && destSize > 0) return destSize;
+        return Number(job.source_file_size || 0);
+      })();
       const nameInner = isDone
         ? `<button class="name-text font-bold underline ${nameColor} hover:opacity-80 name-preview"
             title="Preview"
@@ -829,9 +931,8 @@
         <td class="px-2 py-1 text-center">
           <input class="job-select" type="checkbox" data-jobid="${job.job_id}" ${SELECTED_JOB_IDS.has(job.job_id) ? 'checked' : ''}>
         </td>
-        <td class="px-2 py-1">${idShort}</td>
-        <td class="px-2 py-1 name-cell">${nameCellHTML}</td>
-        <td class="px-2 py-1">${formatBytes(job.source_file_size)}</td>
+        <td class="px-2 py-1 text-left name-cell">${nameCellHTML}</td>
+        <td class="px-2 py-1">${formatBytes(displayFileSize)}</td>
         <td class="px-2 py-1">${job.source_codec || '…'}</td>
         <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.segment_elapsed||0, job.segment_progress||0)}</div></td>
         <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.encode_elapsed ||0, job.encode_progress ||0)}</div></td>

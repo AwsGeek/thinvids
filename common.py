@@ -5,6 +5,7 @@ Shared types/utilities for manager/worker/agent.
 # repo/common.py
 import os, re
 import json
+from datetime import datetime
 from functools import lru_cache
 
 
@@ -168,7 +169,11 @@ DEFAULT_SETTINGS = {
     "max_source_file_size_gb": "15",
     "av1_check_enabled": "1",
     "use_nfs_for_all_files": "0",
-    "large_file_behavior": "reject",
+    "use_direct_source_for_all_files": "0",
+    "low_disk_direct_enabled": "1",
+    "low_disk_min_free_gb": "20",
+    "target_segment_mb": "10",
+    "large_file_behavior": "direct",
     "default_target_height": "1080",
 }
 
@@ -257,12 +262,13 @@ def emit_activity(message, job_id=None, filename=None, stage=None, source=None):
 
     try:
         encoded = json.dumps(payload, separators=(",", ":"))
+        compact = _format_activity_line(payload)
         pipe = redis_client.pipeline()
         pipe.lpush(ACTIVITY_LOG_KEY, encoded)
         pipe.ltrim(ACTIVITY_LOG_KEY, 0, max(1, ACTIVITY_LOG_MAX) - 1)
         if job_id:
             job_key = f"joblog:{job_id}"
-            pipe.rpush(job_key, encoded)
+            pipe.rpush(job_key, compact)
             pipe.ltrim(job_key, -max(1, ACTIVITY_JOB_LOG_MAX), -1)
         pipe.execute()
     except Exception:
@@ -303,12 +309,89 @@ def fetch_job_activity(job_id, limit=None):
                 limit_n = 500
             rows = redis_client.lrange(key, -limit_n, -1) or []
         for row in rows:
+            if row is None:
+                continue
+            if isinstance(row, bytes):
+                row = row.decode("utf-8", errors="replace")
+            row = str(row).strip()
+            if not row:
+                continue
+
+            # New compact storage format: plain text line.
+            if row.startswith("--:") or (len(row) >= 9 and row[2:3] == ":" and row[5:6] == ":"):
+                out.append(row)
+                continue
+
+            # Backward-compatible path for older JSON object rows.
             try:
                 data = json.loads(row)
                 if isinstance(data, dict):
-                    out.append(data)
+                    out.append(_format_activity_line(data))
+                elif isinstance(data, str):
+                    out.append(data.strip())
             except Exception:
-                continue
+                out.append(row)
     except Exception:
         return []
     return out
+
+
+def _activity_label(stage: str, message: str) -> str:
+    st = (stage or "").strip().lower()
+    msg = (message or "").strip().lower()
+    if st == "rejected" or "error" in st or " failed" in msg or "error" in msg or "rejected" in msg:
+        return "ERROR"
+    if st in {"stitch_complete", "write"} or msg.startswith('writing "'):
+        return "FINISH"
+    if st.startswith("stitch") or st == "stitch":
+        return "STITCH"
+    if st.startswith("encode") or st == "encode":
+        return "ENCODE"
+    if st.startswith("segment") or st in {"segment", "split"}:
+        return "SEGMENT"
+    return "START"
+
+
+def _extract_part(message: str):
+    m = re.search(r"\bpart\s+(\d+)\b", message or "", flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_elapsed_ms(message: str):
+    m = re.search(r"\b(\d+)ms\b", message or "", flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_name(message: str):
+    m = re.search(r'"([^"]+)"', message or "")
+    return m.group(1).strip() if m else ""
+
+
+def _format_activity_line(payload: Dict) -> str:
+    try:
+        ts = float(payload.get("ts") or time_now())
+    except Exception:
+        ts = time_now()
+    try:
+        stamp = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    except Exception:
+        stamp = "--:--:--"
+
+    message = str(payload.get("message") or "").strip()
+    stage = str(payload.get("stage") or "").strip()
+    label = _activity_label(stage, message)
+    raw_job_id = str(payload.get("job_id") or "").strip()
+    job_short = (raw_job_id.split("-", 1)[0] if raw_job_id else "")[:8] or "--------"
+
+    parts = [stamp, f"[{label}]", job_short]
+    if label == "START":
+        name = _extract_name(message)
+        if name:
+            parts.append(name)
+    part = _extract_part(message)
+    if part:
+        parts.append(f"part {part}")
+    elapsed = _extract_elapsed_ms(message)
+    if elapsed:
+        parts.append(f"{elapsed}ms")
+    return " ".join(parts)

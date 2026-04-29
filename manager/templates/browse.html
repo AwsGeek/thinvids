@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+{% block title %}Browse Media Sources{% endblock %}
+{% block head_extra %}
+<style>
+  .browse-row { transition: background-color 120ms ease, transform 120ms ease; }
+  .browse-row:hover { background-color: #f8fafc; }
+  .browse-row.selected { background-color: #eff6ff; }
+  .file-name { max-width: 64vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded shadow p-4">
+  <div class="flex flex-wrap items-center gap-3 mb-4">
+    <div>
+      <h2 class="text-xl font-semibold">Browse Media Sources</h2>
+      <p class="text-sm text-gray-600">Select one video file to create a paused READY job for review.</p>
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      <div class="flex rounded overflow-hidden border">
+        <button id="source-watch" class="source-toggle px-3 py-2 text-sm bg-blue-600 text-white" data-source="watch">Watch Folder</button>
+        <button id="source-media" class="source-toggle px-3 py-2 text-sm bg-white hover:bg-gray-100" data-source="source_media">Source Media</button>
+      </div>
+      <button id="browse-refresh" class="inline-flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+        <span class="material-icons text-base">refresh</span>
+        Refresh
+      </button>
+      <button id="queue-selected" disabled class="inline-flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed">
+        <span class="material-icons text-base">playlist_add</span>
+        Create READY Job
+      </button>
+    </div>
+  </div>
+
+  <div class="border rounded bg-gray-50 px-3 py-2 mb-3">
+    <div class="text-xs uppercase tracking-wide text-gray-500 mb-1">Current Folder</div>
+    <div id="breadcrumb" class="flex flex-wrap items-center gap-1 text-sm"></div>
+  </div>
+
+  <div id="browse-status" class="text-sm text-gray-600 mb-3">Loading...</div>
+
+  <div class="overflow-x-auto border rounded">
+    <table class="w-full bg-white">
+      <thead>
+        <tr class="bg-gray-100 text-xs text-gray-700">
+          <th class="text-left px-3 py-2 w-10"></th>
+          <th class="text-left px-3 py-2">Name</th>
+          <th class="text-left px-3 py-2 w-32">Size</th>
+          <th class="text-left px-3 py-2 w-48">Modified</th>
+        </tr>
+      </thead>
+      <tbody id="browse-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const state = {
+    path: '',
+    source: 'watch',
+    rootLabel: '/watch',
+    selected: null,
+    loading: false,
+  };
+
+  const listEl = document.getElementById('browse-list');
+  const statusEl = document.getElementById('browse-status');
+  const breadcrumbEl = document.getElementById('breadcrumb');
+  const queueBtn = document.getElementById('queue-selected');
+  const refreshBtn = document.getElementById('browse-refresh');
+  const sourceButtons = document.querySelectorAll('.source-toggle');
+
+  function fmtDate(ts){
+    if (!ts) return '';
+    try { return new Date(ts * 1000).toLocaleString(); }
+    catch { return ''; }
+  }
+
+  function esc(value){
+    return String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function setSelected(file){
+    state.selected = file;
+    queueBtn.disabled = !file;
+    document.querySelectorAll('.browse-row.file').forEach(row => {
+      row.classList.toggle('selected', row.dataset.path === (file?.path || ''));
+      const input = row.querySelector('input[type="radio"]');
+      if (input) input.checked = row.dataset.path === (file?.path || '');
+    });
+  }
+
+  function renderSourceTabs(){
+    sourceButtons.forEach(btn => {
+      const active = btn.dataset.source === state.source;
+      btn.classList.toggle('bg-blue-600', active);
+      btn.classList.toggle('text-white', active);
+      btn.classList.toggle('bg-white', !active);
+      btn.classList.toggle('hover:bg-gray-100', !active);
+    });
+  }
+
+  function renderBreadcrumb(path){
+    breadcrumbEl.innerHTML = '';
+    const rootBtn = document.createElement('button');
+    rootBtn.className = 'text-blue-700 hover:underline';
+    rootBtn.textContent = state.rootLabel || '/watch';
+    rootBtn.onclick = () => loadFolder('');
+    breadcrumbEl.appendChild(rootBtn);
+
+    let acc = '';
+    for (const part of (path || '').split('/').filter(Boolean)) {
+      const sep = document.createElement('span');
+      sep.className = 'text-gray-400';
+      sep.textContent = '/';
+      breadcrumbEl.appendChild(sep);
+
+      acc = acc ? `${acc}/${part}` : part;
+      const target = acc;
+      const btn = document.createElement('button');
+      btn.className = 'text-blue-700 hover:underline';
+      btn.textContent = part;
+      btn.onclick = () => loadFolder(target);
+      breadcrumbEl.appendChild(btn);
+    }
+  }
+
+  function rowForDir(dir){
+    const tr = document.createElement('tr');
+    tr.className = 'browse-row border-t cursor-pointer';
+    tr.innerHTML = `
+      <td class="px-3 py-2 text-gray-500"><span class="material-icons text-base">folder</span></td>
+      <td class="px-3 py-2 font-medium text-blue-700"><span class="file-name">${esc(dir.name)}</span></td>
+      <td class="px-3 py-2 text-sm text-gray-500">Folder</td>
+      <td class="px-3 py-2"></td>
+    `;
+    tr.onclick = () => loadFolder(dir.path);
+    return tr;
+  }
+
+  function rowForFile(file){
+    const tr = document.createElement('tr');
+    tr.className = 'browse-row file border-t cursor-pointer';
+    tr.dataset.path = file.path;
+    tr.innerHTML = `
+      <td class="px-3 py-2"><input type="radio" name="selected-file" class="h-4 w-4"></td>
+      <td class="px-3 py-2"><span class="material-icons text-base align-middle text-gray-500 mr-1">movie</span><span class="file-name align-middle">${esc(file.name)}</span></td>
+      <td class="px-3 py-2 text-sm text-gray-700">${esc(file.size_label || '')}</td>
+      <td class="px-3 py-2 text-sm text-gray-700">${fmtDate(file.mtime)}</td>
+    `;
+    tr.onclick = () => setSelected(file);
+    return tr;
+  }
+
+  function renderListing(data){
+    state.source = data.source || state.source || 'watch';
+    state.rootLabel = data.root_label || (state.source === 'source_media' ? '/source_media' : '/watch');
+    state.path = data.path || '';
+    setSelected(null);
+    renderSourceTabs();
+    renderBreadcrumb(state.path);
+    listEl.innerHTML = '';
+
+    if (data.parent !== null && state.path) {
+      const up = document.createElement('tr');
+      up.className = 'browse-row border-t cursor-pointer bg-gray-50';
+      up.innerHTML = `
+        <td class="px-3 py-2 text-gray-500"><span class="material-icons text-base">drive_folder_upload</span></td>
+        <td class="px-3 py-2 font-medium text-blue-700">..</td>
+        <td class="px-3 py-2 text-sm text-gray-500">Parent</td>
+        <td class="px-3 py-2"></td>
+      `;
+      up.onclick = () => loadFolder(data.parent || '');
+      listEl.appendChild(up);
+    }
+
+    for (const dir of data.dirs || []) listEl.appendChild(rowForDir(dir));
+    for (const file of data.files || []) listEl.appendChild(rowForFile(file));
+
+    const count = (data.dirs || []).length + (data.files || []).length;
+    if (!count) {
+      const empty = document.createElement('tr');
+      empty.innerHTML = '<td colspan="4" class="border-t px-3 py-8 text-center text-gray-500">No folders or supported video files here.</td>';
+      listEl.appendChild(empty);
+    }
+    statusEl.textContent = `${data.label || 'Source'}: ${(data.dirs || []).length} folders, ${(data.files || []).length} video files`;
+  }
+
+  async function loadFolder(path){
+    if (state.loading) return;
+    state.loading = true;
+    statusEl.textContent = 'Loading...';
+    try {
+      const params = new URLSearchParams({source: state.source, path: path || ''});
+      const r = await fetch(`/browse/list?${params.toString()}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Failed to load folder');
+      renderListing(data);
+    } catch (e) {
+      listEl.innerHTML = '';
+      statusEl.textContent = e.message || 'Failed to load folder';
+      toast(statusEl.textContent, false);
+    } finally {
+      state.loading = false;
+    }
+  }
+
+  function switchSource(source){
+    if (state.source === source) return;
+    state.source = source;
+    state.rootLabel = source === 'source_media' ? '/source_media' : '/watch';
+    renderSourceTabs();
+    loadFolder('');
+  }
+
+  async function queueSelected(){
+    if (!state.selected) return;
+    queueBtn.disabled = true;
+    const label = state.selected.name;
+    try {
+      const r = await fetch('/add_job', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          filename: state.selected.path,
+          input_path: state.source === 'source_media' ? `${state.rootLabel.replace(/\/$/, '')}/${state.selected.path}` : '',
+          force_paused: true,
+          manual_review: true,
+          mark_watcher_processed: state.source === 'watch',
+        })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.message || data.error || 'Failed to create job');
+      if (data.status === 'rejected') {
+        toast(`Created rejected job for ${label}: ${data.message || data.reason || 'policy rejected'}`, false);
+      } else {
+        toast(`Created READY job for ${label}`);
+      }
+      if (data.policy_warning) {
+        toast(`Policy warning: ${data.policy_warning}`, false);
+      }
+      if (data.watcher_mark_warning) {
+        toast(`Watcher ledger warning: ${data.watcher_mark_warning}`, false);
+      }
+      setSelected(null);
+    } catch (e) {
+      toast(e.message || 'Failed to create job', false);
+      queueBtn.disabled = !state.selected;
+    }
+  }
+
+  sourceButtons.forEach(btn => btn.addEventListener('click', () => switchSource(btn.dataset.source)));
+  refreshBtn.addEventListener('click', () => loadFolder(state.path));
+  queueBtn.addEventListener('click', queueSelected);
+  document.addEventListener('DOMContentLoaded', () => loadFolder(''));
+</script>
+{% endblock %}

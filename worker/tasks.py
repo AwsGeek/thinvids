@@ -20,6 +20,7 @@ import socket
 import logging
 import subprocess
 import threading
+from math import ceil
 from typing import List, Tuple, Optional
 from collections import deque
 
@@ -31,6 +32,7 @@ logger = get_logging("worker")
 # Filesystem layout
 PROJECT_ROOT = ENV("PROJECT_ROOT", "/projects")
 WATCH_ROOT   = ENV("WATCH_ROOT",   "/watch")
+SOURCE_MEDIA_ROOT = ENV("SOURCE_MEDIA_ROOT", "/source_media")
 LIBRARY_ROOT = ENV("LIBRARY_ROOT", "/library")
 
 # Metrics TTL heuristic to consider a node "active"
@@ -43,11 +45,13 @@ HTTP_PORT      = int(ENV("MASTER_HTTP_PORT", "8000"))
 
 # Encoding parameters
 VAAPI_DEVICE  = ENV("VAAPI_DEVICE", "/dev/dri/renderD128")
-ALLOWED_TARGET_HEIGHTS = {720, 1080}
+ALLOWED_TARGET_HEIGHTS = {480, 576, 720, 1080}
 try:
     DEFAULT_TARGET_HEIGHT = int(ENV("VEM_DEFAULT_TARGET_HEIGHT", "1080"))
 except Exception:
     DEFAULT_TARGET_HEIGHT = 1080
+SCALE_FILTER_480 = ENV("VEM_SCALE_FILTER_480", "bwdif=mode=send_frame:parity=auto:deint=all,scale=-2:480,format=nv12,hwupload")
+SCALE_FILTER_576 = ENV("VEM_SCALE_FILTER_576", "bwdif=mode=send_frame:parity=auto:deint=all,scale=-2:576,format=nv12,hwupload")
 SCALE_FILTER_720 = ENV("VEM_SCALE_FILTER_720", "scale=-2:720,format=nv12,hwupload")
 SCALE_FILTER_1080 = ENV("VEM_SCALE_FILTER_1080", "scale=-2:1080,format=nv12,hwupload")
 VAAPI_RC_MODE = ENV("VEM_RC_MODE", "CQP")
@@ -58,6 +62,8 @@ AUDIO_ARGS    = ENV("VEM_AUDIO_ARGS", "-c:a aac -ac 2 -b:a 192k")  # space-separ
 PARTS_PER_WORKER = int(ENV("PARTS_PER_WORKER", "4"))
 MIN_PARTS        = int(ENV("MIN_PARTS", "4"))
 MAX_PARTS        = int(ENV("MAX_PARTS", "200"))
+DEFAULT_TARGET_SEGMENT_MB = 10.0
+DEFAULT_TARGET_SEGMENT_BYTES = max(1, int(DEFAULT_TARGET_SEGMENT_MB * 1024 * 1024))
 
 
 # --------------- Helpers ----------------
@@ -115,12 +121,12 @@ def _active_nodes() -> List[str]:
     return actives
 
 def _bsf_for_codec(codec: str) -> str:
-    if codec == 'hevc':
-        return 'hevc_mp4toannexb' 
-    elif codec == 'av1':
-        return ""
-    else:
+    codec = (codec or "").strip().lower()
+    if codec == 'h264':
         return 'h264_mp4toannexb'
+    if codec == 'hevc':
+        return 'hevc_mp4toannexb'
+    return ""
 
 def _ffprobe_duration(input_path: str) -> float:
     try:
@@ -263,6 +269,9 @@ def _reset_job_run_state(job_id: str, job=None):
             'failed_part': 0,
             'failed_stage': '',
             'failed_worker': '',
+            'processing_mode_effective': '',
+            'processing_mode_reason': '',
+            'direct_segment_duration': '',
             'ended_at': 0,
         })
         redis.delete(f"job_done_parts:{job_id}")
@@ -276,6 +285,14 @@ def _reset_job_run_state(job_id: str, job=None):
 def _final_output_path(src_filename: str) -> str:
     base, _ = os.path.splitext(src_filename)
     return os.path.join(LIBRARY_ROOT, base.lstrip('/') + '.mp4')
+
+
+def _final_output_path_with_ext(src_filename: str, extension: str) -> str:
+    base, _ = os.path.splitext(src_filename)
+    ext = (extension or ".mp4").strip()
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    return os.path.join(LIBRARY_ROOT, base.lstrip('/') + ext)
 
 def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
@@ -292,7 +309,209 @@ def _target_height_for_job(job_key: str) -> int:
     return _normalize_target_height(redis.hget(job_key, "target_height"))
 
 def _vaapi_scale_filter(target_height: int) -> str:
+    if target_height == 480:
+        return SCALE_FILTER_480
+    if target_height == 576:
+        return SCALE_FILTER_576
     return SCALE_FILTER_1080 if target_height == 1080 else SCALE_FILTER_720
+
+
+def _software_scale_filter(target_height: int, *, deinterlace: bool) -> str:
+    filters = []
+    if deinterlace:
+        filters.append("bwdif=mode=send_frame:parity=auto:deint=all")
+    filters.append(f"scale=-2:{target_height}")
+    return ",".join(filters)
+
+
+def _reset_segment_video_pts_filter(filtergraph: str) -> str:
+    """
+    Encoded chunks are later concat-copied, so each chunk should start its
+    video timeline at its first decoded frame. TS segments can otherwise carry
+    a small leading PTS gap that ffmpeg fills by duplicating the first frame.
+    """
+    filtergraph = (filtergraph or "").strip()
+    if not filtergraph:
+        return "setpts=PTS-STARTPTS"
+    return f"setpts=PTS-STARTPTS,{filtergraph}"
+
+
+def _source_dimensions_for_job(job) -> Tuple[int, int]:
+    raw = str(job.get("source_resolution") or "").strip().lower()
+    match = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", raw)
+    if not match:
+        return (0, 0)
+    try:
+        return (int(match.group(1)), int(match.group(2)))
+    except Exception:
+        return (0, 0)
+
+
+def _dvd_native_target_height(job) -> int | None:
+    filename = str(job.get("filename") or "").strip().lower()
+    codec = str(job.get("source_codec") or "").strip().lower()
+    width, height = _source_dimensions_for_job(job)
+    is_dvd_path = (
+        filename.startswith("dvd/")
+        or "/dvd/" in filename
+        or filename.startswith("movies/")
+        or "/movies/" in filename
+    )
+    is_sd_dimensions = width > 0 and width <= 720 and height > 0 and height <= 576
+    if not is_dvd_path or not is_sd_dimensions:
+        return None
+    if codec and codec != "mpeg2video":
+        return None
+    if height <= 480:
+        return 480
+    return 576
+
+
+def _effective_target_height_for_job(job_key: str) -> Tuple[int, bool]:
+    job = redis.hgetall(job_key) or {}
+    dvd_height = _dvd_native_target_height(job)
+    if dvd_height:
+        return (dvd_height, True)
+    return (_normalize_target_height(job.get("target_height")), False)
+
+
+def _source_english_subtitle_streams(src_path: str) -> list[dict]:
+    if not src_path or not os.path.exists(src_path):
+        return []
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=index,codec_name:stream_tags=language,title",
+                "-of",
+                "json",
+                src_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(completed.stdout or "{}")
+    except Exception:
+        return []
+
+    english_streams = []
+    for stream in list(payload.get("streams") or []):
+        tags = stream.get("tags") or {}
+        language = str(tags.get("language") or "").strip().lower()
+        if language in {"en", "eng"}:
+            english_streams.append(stream)
+    return english_streams
+
+def _as_bool(value, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+def _as_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def _load_global_settings():
+    settings = {}
+    try:
+        settings.update(redis.hgetall("settings:global") or {})
+    except Exception:
+        pass
+    try:
+        settings.update(redis.hgetall("global:settings") or {})
+    except Exception:
+        pass
+    settings.setdefault("low_disk_direct_enabled", "1")
+    settings.setdefault("low_disk_min_free_gb", "20")
+    settings.setdefault("target_segment_mb", "10")
+    return settings
+
+def _disk_free_bytes(path: str) -> int:
+    try:
+        return int(shutil.disk_usage(path).free)
+    except Exception:
+        return -1
+
+def _direct_source_plan_for_part(source_duration: float, segment_duration: float, idx: int):
+    if idx <= 0:
+        return None, None
+    segment_duration = max(1.0, float(segment_duration or 10.0))
+    start_s = (idx - 1) * segment_duration
+    if source_duration and start_s >= source_duration:
+        return None, None
+    part_duration = segment_duration
+    if source_duration:
+        part_duration = max(0.05, min(segment_duration, source_duration - start_s))
+    return start_s, part_duration
+
+
+def _parts_for_target_size(size_b: int, target_segment_bytes: int = DEFAULT_TARGET_SEGMENT_BYTES) -> int:
+    size_b = int(size_b or 0)
+    target_segment_bytes = max(1, int(target_segment_bytes or 1))
+    if size_b <= 0:
+        return 0
+    return max(1, int(ceil(float(size_b) / float(target_segment_bytes))))
+
+
+def _target_segment_bytes_from_settings(settings) -> Tuple[float, int]:
+    target_mb = _as_float((settings or {}).get("target_segment_mb", DEFAULT_TARGET_SEGMENT_MB), DEFAULT_TARGET_SEGMENT_MB)
+    if target_mb <= 0:
+        target_mb = DEFAULT_TARGET_SEGMENT_MB
+    return target_mb, max(1, int(target_mb * 1024 * 1024))
+
+
+def _host_from_endpoint(endpoint: str) -> str:
+    raw = str(endpoint or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"^https?://", "", raw, flags=re.IGNORECASE)
+    return raw.split("/", 1)[0].split(":", 1)[0].strip().lower()
+
+def _resolve_processing_mode(job_id: str, job, source_size_b: int) -> Tuple[str, str]:
+    input_path = os.path.realpath((job.get("input_path") or "").strip())
+    source_root = os.path.realpath(SOURCE_MEDIA_ROOT)
+    if (
+        str(job.get("source_origin") or "").strip().lower() == "source_media"
+        or (input_path and (input_path == source_root or input_path.startswith(source_root + os.sep)))
+    ):
+        return "split", "source_media_forces_split"
+
+    mode = str(job.get("processing_mode") or "split").strip().lower()
+    if mode not in ("split", "direct"):
+        mode = "split"
+    if mode == "direct":
+        return "direct", "policy"
+    if str(job.get("scratch_mode") or "local").strip().lower() != "local":
+        return "split", "non_local_scratch"
+
+    settings = _load_global_settings()
+    low_disk_direct_enabled = _as_bool(settings.get("low_disk_direct_enabled", "1"), True)
+    if not low_disk_direct_enabled:
+        return "split", "policy"
+
+    low_disk_min_free_gb = max(1.0, _as_float(settings.get("low_disk_min_free_gb", 20), 20.0))
+    scratch_root = _job_project_root(job_id, job)
+    free_b = _disk_free_bytes(scratch_root)
+    if free_b < 0:
+        return "split", "unknown_free_space"
+
+    min_free_b = int(low_disk_min_free_gb * (1024 ** 3))
+    estimated_need_b = max(min_free_b, int(source_size_b * 1.1) + (2 * 1024 ** 3))
+    if free_b < estimated_need_b:
+        return "direct", f"low_disk free={free_b} need={estimated_need_b} root={scratch_root}"
+    return "split", "policy"
 
 
 # --------------- Built-in HTTP server (shared) ----------------
@@ -481,13 +700,17 @@ def split(job_id: str, file_path: str):
 
         target_height = _normalize_target_height(job.get("target_height"))
 
-        # Resolve input path
-        src_path = file_path
+        # Resolve input path. Newer jobs may carry an explicit source path
+        # (for example /source_media) while legacy jobs derive it from /watch.
+        src_path = (job.get('input_path') or '').strip() or file_path
         if not os.path.exists(src_path):
-            filename = job.get('filename') or ''
-            alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
-            if os.path.exists(alt):
-                src_path = alt
+            if file_path and os.path.exists(file_path):
+                src_path = file_path
+            else:
+                filename = job.get('filename') or ''
+                alt = os.path.join(WATCH_ROOT, filename.lstrip('/'))
+                if os.path.exists(alt):
+                    src_path = alt
         if not os.path.exists(src_path):
             redis.hset(job_key, 'status', Status.FAILED.value)
             return {'status': 'FAILED', 'reason': f'input not found: {src_path}'}
@@ -542,10 +765,111 @@ def split(job_id: str, file_path: str):
         master_url = f"http://{master_host_name}:{HTTP_PORT}"
         redis.hset(job_key, 'master_host', master_url)
 
-        # Decide number of parts (keep previous fixed estimate of 100)
-        actives = _active_nodes()
-        P = 100 # Make progress updates easy
-        logger.info(f"[{job_id}] Target parts (estimate): {P}")
+        try:
+            v_sel = int(job.get("selected_v_stream") or 0)
+        except Exception:
+            v_sel = 0
+        try:
+            a_sel = int(job.get("selected_a_stream") or 0)
+        except Exception:
+            a_sel = 0
+        logger.info(f"[{job_id}] Video stream: {v_sel}")
+        logger.info(f"[{job_id}] Audio stream: {a_sel}")
+
+        processing_mode, processing_reason = _resolve_processing_mode(job_id, job, int(size_b or 0))
+        redis.hset(job_key, mapping={
+            "processing_mode_effective": processing_mode,
+            "processing_mode_reason": processing_reason,
+        })
+        logger.info(f"[{job_id}] Processing mode: {processing_mode} ({processing_reason})")
+        if processing_mode == "direct" and duration <= 0:
+            processing_mode = "split"
+            processing_reason = "missing_source_duration"
+            redis.hset(job_key, mapping={
+                "processing_mode_effective": processing_mode,
+                "processing_mode_reason": processing_reason,
+            })
+            logger.warning(f"[{job_id}] Falling back to split mode because source duration is unavailable.")
+
+        split_settings = _load_global_settings()
+        target_segment_mb, target_segment_bytes = _target_segment_bytes_from_settings(split_settings)
+
+        # requested parts from configured segment size
+        requested_parts = _parts_for_target_size(int(size_b or 0), target_segment_bytes)
+        if requested_parts <= 0:
+            requested_parts = 100
+            logger.warning(f"[{job_id}] Source size unavailable; falling back to {requested_parts} requested parts.")
+
+        # estimate usable encoder workers: active workers minus reserved master/stitcher nodes
+        stitch_endpoint = redis.hget(job_key, "stitch_host") or ""
+        if not stitch_endpoint:
+            # stitch task is enqueued first; give it a brief chance to publish stitch_host
+            deadline = _now() + 3.0
+            while _now() < deadline and not stitch_endpoint:
+                if _is_job_halted(job_id):
+                    break
+                stitch_endpoint = redis.hget(job_key, "stitch_host") or ""
+                if stitch_endpoint:
+                    break
+                time.sleep(0.1)
+
+        master_host_lc = str(master_host_name or "").strip().lower()
+        stitch_host_lc = _host_from_endpoint(stitch_endpoint)
+        reserved_hosts = {h for h in (master_host_lc, stitch_host_lc) if h}
+
+        active_hosts = {str(h or "").strip().lower() for h in _active_nodes() if str(h or "").strip()}
+        if not active_hosts:
+            try:
+                warmup_hosts = json.loads(job.get("warmup_workers_json") or "[]")
+            except Exception:
+                warmup_hosts = []
+            if isinstance(warmup_hosts, list):
+                active_hosts = {str(h or "").strip().lower() for h in warmup_hosts if str(h or "").strip()}
+
+        if active_hosts:
+            usable_encoder_workers = max(0, len(active_hosts - reserved_hosts))
+        else:
+            # fallback heuristic when host-level visibility is unavailable
+            try:
+                warmup_count = int(job.get("warmup_worker_count") or 0)
+            except Exception:
+                warmup_count = 0
+            usable_encoder_workers = max(0, warmup_count - len(reserved_hosts))
+
+        # effective parts / segment size:
+        # - guarantee at least one segment per usable encoder worker
+        # - when above that, round up to a full multiple of usable workers
+        effective_parts = requested_parts
+        if usable_encoder_workers > 0:
+            if requested_parts <= usable_encoder_workers:
+                effective_parts = usable_encoder_workers
+            else:
+                effective_parts = int(ceil(float(requested_parts) / float(usable_encoder_workers)) * usable_encoder_workers)
+
+        P = max(1, effective_parts)
+        effective_segment_bytes = max(1, int(ceil(float(size_b) / float(P)))) if int(size_b or 0) > 0 else target_segment_bytes
+        effective_segment_mb = float(effective_segment_bytes) / float(1024 * 1024)
+        redis.hset(job_key, mapping={
+            "requested_segment_size_mb": f"{target_segment_mb:.6f}",
+            "requested_segment_size_bytes": int(target_segment_bytes),
+            "effective_segment_size_mb": f"{effective_segment_mb:.6f}",
+            "effective_segment_size_bytes": int(effective_segment_bytes),
+            "requested_parts": int(requested_parts),
+            "effective_parts": int(P),
+            "usable_encoder_workers": int(usable_encoder_workers),
+        })
+        if processing_mode == "direct":
+            segment_duration_hint = max(1.0, float(duration) / float(P)) if duration else max(1.0, float(job.get("segment_duration") or 10))
+            redis.hset(job_key, 'direct_segment_duration', f"{segment_duration_hint:.6f}")
+        else:
+            segment_duration_hint = max(1.0, float(duration) / float(P)) if duration else 10.0
+            redis.hdel(job_key, 'direct_segment_duration')
+        logger.info(
+            f"[{job_id}] Parts plan: requested={requested_parts}, effective={P}, "
+            f"usable_encoder_workers={usable_encoder_workers}, source_size={int(size_b or 0)} bytes, "
+            f"requested_segment_mb={target_segment_mb:g}, effective_segment_mb={effective_segment_mb:.3f}, "
+            f"reserved_hosts={sorted(reserved_hosts)}"
+        )
         emit_activity(
             f'Splitting "{title}" into {P} parts',
             job_id=job_id,
@@ -562,13 +886,68 @@ def split(job_id: str, file_path: str):
             stage='segment_start',
             source='worker',
         )
-        redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0})
+        redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0, 'segmented_chunks': 0, 'segment_progress': 0, 'segment_elapsed': 0})
 
-        logger.info(f"[{job_id}] {job}")
-        v_sel = int(job.get("selected_v_stream"))
-        a_sel = int(job.get("selected_a_stream"))
-        logger.info(f"[{job_id}] Video stream: {v_sel}")
-        logger.info(f"[{job_id}] Audio stream: {a_sel}")
+        if processing_mode == "direct":
+            total_chunks = 0
+            part_opened_at = _now()
+            for part_idx in range(1, P + 1):
+                if _is_job_halted(job_id):
+                    logger.warning(f"[{job_id}] Halted while scheduling direct-source parts.")
+                    return {'status': 'ABORTED'}
+
+                start_s, part_duration = _direct_source_plan_for_part(duration, segment_duration_hint, part_idx)
+                if start_s is None:
+                    break
+
+                total_chunks = part_idx
+                part_elapsed_ms = _elapsed_ms(part_opened_at)
+                part_opened_at = _now()
+                emit_activity(
+                    f'Segmenting "{title}" part {part_idx} completed in {part_elapsed_ms}ms',
+                    job_id=job_id,
+                    filename=job.get('filename'),
+                    stage='segment',
+                    source='worker',
+                )
+                encode(
+                    job_id,
+                    part_idx,
+                    master_url,
+                    v_sel,
+                    a_sel,
+                    source_path=src_path,
+                    source_start_s=start_s,
+                    source_duration_s=part_duration,
+                )
+                prog = int((part_idx / max(1, P)) * 100)
+                if part_idx < P:
+                    prog = min(prog, 99)
+                redis.hset(job_key, mapping={
+                    'segmented_chunks': part_idx,
+                    'segment_progress': prog,
+                    'segment_elapsed': round(_now() - seg_t0, 2),
+                })
+
+            if total_chunks <= 0:
+                redis.hset(job_key, 'status', Status.FAILED.value)
+                return {'status': 'FAILED', 'reason': 'no segments produced'}
+
+            redis.hset(job_key, mapping={
+                'parts_total': total_chunks,
+                'segmented_chunks': total_chunks,
+                'segment_progress': 100,
+                'segment_elapsed': round(_now() - seg_t0, 2),
+            })
+            emit_activity(
+                f'Segmenting "{title}" completed in {_elapsed_ms(seg_t0)}ms',
+                job_id=job_id,
+                filename=job.get('filename'),
+                stage='segment_complete',
+                source='worker',
+            )
+            logger.info(f"[{job_id}] Direct-source scheduling complete; {total_chunks} parts queued for encoding")
+            return {'status': 'QUEUED', 'parts': total_chunks}
 
         # Prepare parts dir + naming
         parts_dir = os.path.join(_job_base_dir(job_id, job), "parts")
@@ -589,12 +968,13 @@ def split(job_id: str, file_path: str):
             '-map_metadata', '-1',
             '-map_chapters', '-1',
             '-c', 'copy',
-            '-bsf:v', bsf,
             '-f', 'segment',
             '-segment_time', f"{segment_duration:.6f}",
             '-reset_timestamps', '1',
             temp_pattern
         ]
+        if bsf:
+            cmd[cmd.index('-f'):cmd.index('-f')] = ['-bsf:v', bsf]
         logger.info(f"[{job_id}] Segment command: {' '.join(cmd)}")
 
         # Parse ffmpeg stderr for new-chunk openings
@@ -609,6 +989,7 @@ def split(job_id: str, file_path: str):
         estimated_chunks = max(1, P)
         queued_count = 0
 
+        segment_stderr_tail = deque(maxlen=120)
         while True:
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] Halted. Terminating segmentation.")
@@ -619,6 +1000,7 @@ def split(job_id: str, file_path: str):
             line = process.stderr.readline()
             if not line:
                 break
+            segment_stderr_tail.append(line.rstrip())
 
             m = segment_re.search(line)
             if m:
@@ -677,9 +1059,18 @@ def split(job_id: str, file_path: str):
 
         process.wait()
         if process.returncode != 0:
-            logger.error(f"[{job_id}] ffmpeg segmentation failed (rc={process.returncode})")
-            redis.hset(job_key, 'status', Status.FAILED.value)
-            return {'status': 'FAILED'}
+            err_tail = "\n".join(segment_stderr_tail).strip()
+            reason = f"ffmpeg segmentation failed (rc={process.returncode})"
+            if err_tail:
+                reason = f"{reason}: {err_tail[-1200:]}"
+            logger.error(f"[{job_id}] {reason}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'failed_stage': 'segment',
+                'failed_worker': master_host_name,
+            })
+            return {'status': 'FAILED', 'reason': reason}
 
         # Queue final chunk
         total_chunks = 0
@@ -737,10 +1128,20 @@ def split(job_id: str, file_path: str):
 
 
 @huey.task()
-def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int = 0, stitch_host: Optional[str] = None):
+def encode(
+    job_id: str,
+    idx: int,
+    master_host: str,
+    v_sel: int = 0,
+    a_sel: int = 0,
+    stitch_host: Optional[str] = None,
+    source_path: Optional[str] = None,
+    source_start_s: Optional[float] = None,
+    source_duration_s: Optional[float] = None,
+):
     """
     Worker task:
-      - GET /job/<job_id>/part/<idx> from MASTER
+      - Either GET /job/<job_id>/part/<idx> from MASTER, or read source range directly
       - ffmpeg VAAPI transcode (monitored only to detect halt)
       - PUT /job/<job_id>/result/<idx> to STITCHER
       - After successful upload, update parts_done/completed_chunks and encode_progress
@@ -802,49 +1203,82 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
         # Paths in local tmpfs (worker)
         wtmp = _job_base_dir(job_id)
         _ensure_dirs(wtmp)
+        in_path = None
         in_path  = os.path.join(wtmp, f"in_{idx:03d}.ts")
         out_path = os.path.join(wtmp, f"out_{idx:03d}.mp4")
+        direct_source = bool(source_path) and source_start_s is not None and source_duration_s is not None
+        if not direct_source:
+            # Download part from master
+            stage = "download"
+            get_url = f"{master_host.rstrip('/')}/job/{job_id}/part/{idx}"
+            logger.info(f"[{job_id}] GET part {idx} from {get_url}")
 
-        # Download part from master
-        stage = "download"
-        get_url = f"{master_host.rstrip('/')}/job/{job_id}/part/{idx}"
-        logger.info(f"[{job_id}] GET part {idx} from {get_url}")
+            if _is_job_halted(job_id):
+                logger.warning(f"[{job_id}] encode {idx}: halted before downloading part")
+                return {'status': 'ABORTED'}
 
-        if _is_job_halted(job_id):
-            logger.warning(f"[{job_id}] encode {idx}: halted before downloading part")
-            return {'status': 'ABORTED'}
+            try:
+                with requests.get(get_url, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    with open(in_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                            if _is_job_halted(job_id):
+                                logger.warning(f"[{job_id}] encode {idx}: halted during download")
+                                try:
+                                    os.remove(in_path)
+                                except Exception:
+                                    pass
+                                return {'status': 'ABORTED'}
+            except Exception as e:
+                return _fail(f"download failed: {e}", stage)
 
-        try:
-            with requests.get(get_url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                with open(in_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                        if _is_job_halted(job_id):
-                            logger.warning(f"[{job_id}] encode {idx}: halted during download")
-                            try: os.remove(in_path)
-                            except Exception: pass
-                            return {'status': 'ABORTED'}
-        except Exception as e:
-            return _fail(f"download failed: {e}", stage)
-
-        logger.info(f"[{job_id}] Downloaded part {idx}")
+            logger.info(f"[{job_id}] Downloaded part {idx}")
+        else:
+            logger.info(
+                f"[{job_id}] Direct-source encode part {idx} "
+                f"start={float(source_start_s or 0):.3f}s dur={float(source_duration_s or 0):.3f}s source={source_path}"
+            )
 
         # Build ffmpeg command
         stage = "encode"
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
-        target_height = _target_height_for_job(job_key)
+        target_height, force_deinterlace = _effective_target_height_for_job(job_key)
+        try:
+            redis.hset(job_key, mapping={
+                'target_height_effective': target_height,
+                'deinterlace_effective': '1' if force_deinterlace else '0',
+            })
+        except Exception:
+            pass
+        input_args = ['-fflags', '+genpts', '-i', in_path]
+        map_args = ['-map', '0:v:0', '-map', '0:a?']
+        if direct_source:
+            input_args = [
+                '-ss', f"{float(source_start_s or 0):.6f}",
+                '-i', source_path,
+                '-t', f"{max(0.05, float(source_duration_s or 0.0)):.6f}",
+            ]
+            map_args = [
+                '-map', f'0:v:{int(v_sel)}',
+                '-map', f'0:a:{int(a_sel)}?',
+                '-sn', '-dn',
+                '-map_metadata', '-1',
+                '-map_chapters', '-1',
+            ]
         if software_encode:
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
                 '-y',
                 '-progress','pipe:2',
-                '-i', in_path,
-                '-map','0:v:0',
-                '-vf', f"scale=-2:{target_height}",
+                *input_args,
+                *map_args,
+                '-vf', _reset_segment_video_pts_filter(
+                    _software_scale_filter(target_height, deinterlace=force_deinterlace)
+                ),
                 '-c:v','libx264','-preset','veryfast','-crf','23',
-                '-map','0:a?', *AUDIO_ARGS.split(),
+                *AUDIO_ARGS.split(),
                 out_path
             ]
         else:
@@ -853,13 +1287,13 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
                 '-y',
                 '-progress','pipe:2',
                 '-vaapi_device', VAAPI_DEVICE,
-                '-i', in_path,
-                '-map','0:v:0',
-                '-vf', _vaapi_scale_filter(target_height),
+                *input_args,
+                *map_args,
+                '-vf', _reset_segment_video_pts_filter(_vaapi_scale_filter(target_height)),
                 '-c:v','h264_vaapi',
                 '-rc_mode', VAAPI_RC_MODE,
                 '-qp', VAAPI_QP,
-                '-map','0:a?', *AUDIO_ARGS.split(),
+                *AUDIO_ARGS.split(),
                 out_path
             ]
 
@@ -958,7 +1392,10 @@ def encode(job_id: str, idx: int, master_host: str, v_sel: int = 0, a_sel: int =
         )
 
         # Cleanup local tmpfs
-        for p in (in_path, out_path):
+        cleanup_paths = [out_path]
+        if not direct_source:
+            cleanup_paths.append(in_path)
+        for p in cleanup_paths:
             try: os.remove(p)
             except Exception: pass
 
@@ -1111,6 +1548,7 @@ def stitch(job_id: str):
         def _retry_part(idx: int):
             job = redis.hgetall(job_key) or {}
             master_host = job.get('master_host') or stitch_host
+            source_path = (job.get('input_path') or '').strip()
             try:
                 v_sel = int(job.get('selected_v_stream') or 0)
             except Exception:
@@ -1119,6 +1557,10 @@ def stitch(job_id: str):
                 a_sel = int(job.get('selected_a_stream') or 0)
             except Exception:
                 a_sel = 0
+            try:
+                seg_dur = float(job.get('direct_segment_duration') or job.get('segment_duration') or 10.0)
+            except Exception:
+                seg_dur = 10.0
 
             # Avoid duplicate redispatch if already inflight
             added = redis.sadd(inflight_key, idx)
@@ -1126,7 +1568,25 @@ def stitch(job_id: str):
                 return False  # already inflight from a prior retry
 
             logger.warning(f"[{job_id}] stitch: re-dispatching part {idx}")
-            encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host)
+            if str(job.get("processing_mode_effective") or job.get("processing_mode") or "split").strip().lower() == "direct":
+                start_s, part_dur = _direct_source_plan_for_part(src_dur, seg_dur, idx)
+                if start_s is None or part_dur is None or not source_path:
+                    logger.error(f"[{job_id}] stitch: cannot retry direct-source part {idx}; missing segment plan")
+                    redis.srem(inflight_key, idx)
+                    return False
+                encode(
+                    job_id,
+                    idx,
+                    master_host,
+                    v_sel,
+                    a_sel,
+                    stitch_host=stitch_host,
+                    source_path=source_path,
+                    source_start_s=start_s,
+                    source_duration_s=part_dur,
+                )
+            else:
+                encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host)
 
             now_ts = _now()
             pipe = redis.pipeline()
@@ -1358,9 +1818,11 @@ def stitch(job_id: str):
             logger.warning(f"[{job_id}] stitch halted before moving file")
             return {'status': 'ABORTED'}
 
-        # Move final to library + set metadata
+        # Decide whether to remux English subtitles from the source into the final file.
         job = redis.hgetall(job_key) or {}
         src_filename = job.get('filename') or os.path.basename(job.get('input_path','') or '')
+        src_input_path = (job.get('input_path') or '').strip()
+        english_subtitle_streams = _source_english_subtitle_streams(src_input_path)
         emit_activity(
             f'Writing "{_job_title(job)}"',
             job_id=job_id,
@@ -1368,9 +1830,58 @@ def stitch(job_id: str):
             stage='write',
             source='worker',
         )
-        final_path = _final_output_path(src_filename)
+        final_extension = ".mkv" if english_subtitle_streams else ".mp4"
+        final_path = _final_output_path_with_ext(src_filename, final_extension)
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
-        shutil.move(local_out, final_path)
+        if english_subtitle_streams:
+            subtitle_mux_path = os.path.join(base_dir, f"job_{job_id}_output_with_subs.mkv")
+            subtitle_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                local_out,
+                "-i",
+                src_input_path,
+                "-map",
+                "0:v",
+                "-map",
+                "0:a?",
+                "-map",
+                "1:s:m:language:eng?",
+                "-map",
+                "1:s:m:language:en?",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-c:s",
+                "copy",
+                subtitle_mux_path,
+            ]
+            logger.info(f"[{job_id}] Subtitle remux cmd: {' '.join(subtitle_cmd)}")
+            subtitle_mux = subprocess.run(
+                subtitle_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if subtitle_mux.returncode != 0 or not os.path.exists(subtitle_mux_path):
+                err_tail = ((subtitle_mux.stderr or "") or (subtitle_mux.stdout or ""))[-1200:]
+                logger.error(f"[{job_id}] Subtitle remux failed (rc={subtitle_mux.returncode}): {err_tail}")
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': f"subtitle remux failed: {err_tail or subtitle_mux.returncode}",
+                    'failed_stage': 'subtitle_mux',
+                    'failed_worker': ENV("HOSTNAME") or socket.gethostname(),
+                })
+                return {'status': 'FAILED', 'reason': 'subtitle remux failed'}
+            shutil.move(subtitle_mux_path, final_path)
+        else:
+            shutil.move(local_out, final_path)
 
         # Probe final for UI fields
         try:
@@ -1414,7 +1925,8 @@ def stitch(job_id: str):
                 'dest_codec': dst_codec,
                 'dest_resolution': f"{w}x{h}" if (w and h) else '',
                 'dest_fps': f"{dst_fps:.2f}" if dst_fps else '0',
-                'dest_bitrate_kbps': f"{dst_kbps:.0f}" if dst_kbps>0 else '0'
+                'dest_bitrate_kbps': f"{dst_kbps:.0f}" if dst_kbps>0 else '0',
+                'english_subtitles_kept': '1' if english_subtitle_streams else '0',
             })
         except Exception:
             pass
@@ -1490,18 +2002,18 @@ def stamp(job_id: str):
         return {'status': 'FAILED', 'reason': reason}
 
     # --------- resolve paths ----------
-    # Prefer WATCH_ROOT + filename; fall back to input_path if set.
+    # Prefer explicit input_path; fall back to WATCH_ROOT + filename for legacy jobs.
     filename = job.get('filename') or ''
-    src_path = os.path.join(WATCH_ROOT, filename.lstrip('/')) if filename else ''
+    src_path = (job.get('input_path') or '').strip()
     if not src_path or not os.path.exists(src_path):
-        alt = job.get('input_path') or ''
+        alt = os.path.join(WATCH_ROOT, filename.lstrip('/')) if filename else ''
         if alt and os.path.exists(alt):
             src_path = alt
-            # If this was absolute to WATCH_ROOT, derive relative filename for stamped output
-            if src_path.startswith(WATCH_ROOT.rstrip('/') + '/'):
-                filename = src_path[len(WATCH_ROOT.rstrip('/') + '/'):]
         else:
             return _fail(f"source not found: {filename or src_path or '(empty)'}")
+    # If this was absolute to WATCH_ROOT, derive relative filename for stamped output.
+    if src_path.startswith(WATCH_ROOT.rstrip('/') + '/'):
+        filename = src_path[len(WATCH_ROOT.rstrip('/') + '/'):]
 
     # stamped path: same dir, ".stamped" suffix before extension
     base, ext = os.path.splitext(src_path)

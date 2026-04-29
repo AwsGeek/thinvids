@@ -14,6 +14,7 @@
     watch_dir: /watch
     library_dir: /library
     config_dir: /config
+    source_media_dir: /source_media
     nfs_project_root: /library/.thinvids-projects
 
     # Redis (manager uses same Redis as workers)
@@ -47,6 +48,10 @@
     nfs_watch_export:   /volume1/shared/projects/media/archive
     nfs_library_export: /volume1/shared/projects/media/library
     nfs_config_export:   /volume1/shared/projects/transcoder/config
+    source_media_server: swarm2
+    source_media_export: /home/jerry/media/data/media
+    source_media_fstype: nfs4
+    source_media_opts: "ro,soft,timeo=5,retrans=1,_netdev,nofail"
 
     # Optional centralized journald upload
     enable_journal_upload: false
@@ -97,6 +102,11 @@
         - "{{ library_dir }}"
         - "{{ config_dir }}"
 
+    - name: Ensure /source_media mountpoint exists
+      ansible.builtin.file:
+        path: "{{ source_media_dir }}"
+        state: directory
+
     # --- NFS mounts (idempotent) ---
     - name: Mount /watch (NFS)
       ansible.builtin.mount:
@@ -128,6 +138,14 @@
         src: "{{ nfs_server }}:{{ nfs_config_export }}"
         fstype: "{{ nfs_fstype }}"
         opts: "{{ nfs_opts }}"
+        state: mounted
+
+    - name: Mount /source_media (swarm2 read-only NFS)
+      ansible.builtin.mount:
+        path: "{{ source_media_dir }}"
+        src: "{{ source_media_server }}:{{ source_media_export }}"
+        fstype: "{{ source_media_fstype }}"
+        opts: "{{ source_media_opts }}"
         state: mounted
 
     # --- venv for manager ---
@@ -214,7 +232,7 @@
           Description=Thinvids Manager (Flask via Gunicorn)
           After=network-online.target remote-fs.target
           Wants=network-online.target remote-fs.target
-          RequiresMountsFor={{ watch_dir }} {{ library_dir }} 
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }} {{ config_dir }} {{ source_media_dir }}
 
           [Service]
           Type=simple
@@ -226,8 +244,10 @@
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
-          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=WATCH_ROOT={{ source_media_dir }}
+          Environment=SOURCE_MEDIA_ROOT={{ source_media_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=PROCESSED_FILE={{ config_dir }}/processed.log
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           ExecStart={{ app_root }}/venv/bin/gunicorn -w 2 -t 120 -b 0.0.0.0:{{ manager_http_port }} app:app
@@ -287,15 +307,19 @@
           Description=Thinvids Watcher (submit new files to manager)
           After=network-online.target remote-fs.target thinvids_manager.service
           Wants=network-online.target remote-fs.target thinvids_manager.service
-          RequiresMountsFor={{ watch_dir }} {{ config_dir }}
+          RequiresMountsFor={{ source_media_dir }} {{ config_dir }}
 
           [Service]
           Type=simple
           User={{ thinman_user }}
           Group={{ thinman_group }}
           WorkingDirectory={{ app_root }}/current
-          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=WATCH_ROOT={{ source_media_dir }}
           Environment=CONFIG_ROOT={{ config_dir }}
+          Environment=PROCESSED_FILE={{ config_dir }}/processed.log
+          Environment=ADOPT_EXISTING_PROCESSED_ON_STARTUP=1
+          Environment=ADOPT_EXISTING_PROCESSED_MARKER={{ config_dir }}/processed.log.source_media.adopted
+          Environment=PROCESSED_PATH_ALIASES=tv=television
           Environment=MANAGER_HTTP_PORT={{ manager_http_port }}
           # Optional tunables:
           # Environment=STABILIZE_CHECKS=5
