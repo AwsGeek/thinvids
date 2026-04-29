@@ -26,6 +26,10 @@
             <span class="material-icons">dns</span>
             Nodes
             </button>
+            <button id="open-browse" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">folder_open</span>
+            Browse
+            </button>
             <button id="open-metrics" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
             <span class="material-icons">show_chart</span>
             Metrics
@@ -70,7 +74,7 @@
         <div>
           <label for="gs-max-source-size-gb" class="block text-sm font-medium mb-1">Max source file size (GiB)</label>
           <input id="gs-max-source-size-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
-          <p class="text-xs text-gray-600 mt-1">Files larger than this are rejected before processing.</p>
+          <p class="text-xs text-gray-600 mt-1">Threshold used by the large-file policy below.</p>
         </div>
 
         <div class="flex items-center gap-2">
@@ -81,6 +85,7 @@
         <div>
           <label for="gs-large-file-behavior" class="block text-sm font-medium mb-1">Large file policy</label>
           <select id="gs-large-file-behavior" class="border p-2 rounded w-full">
+            <option value="direct">Use direct source reads for large files</option>
             <option value="reject">Reject large files</option>
             <option value="nfs">Use NFS scratch for large files</option>
           </select>
@@ -89,6 +94,27 @@
         <div class="flex items-center gap-2">
           <input id="gs-use-nfs-for-all-files" type="checkbox" class="h-4 w-4">
           <label for="gs-use-nfs-for-all-files" class="text-sm">Use NFS scratch for all files</label>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-use-direct-source-for-all-files" type="checkbox" class="h-4 w-4">
+          <label for="gs-use-direct-source-for-all-files" class="text-sm">Use direct source reads for all files</label>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <input id="gs-low-disk-direct-enabled" type="checkbox" class="h-4 w-4">
+          <label for="gs-low-disk-direct-enabled" class="text-sm">Auto-switch to direct source when local scratch is low</label>
+        </div>
+
+        <div>
+          <label for="gs-low-disk-min-free-gb" class="block text-sm font-medium mb-1">Low-disk free-space floor (GiB)</label>
+          <input id="gs-low-disk-min-free-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+        </div>
+
+        <div>
+          <label for="gs-target-segment-mb" class="block text-sm font-medium mb-1">Target segment size (MiB)</label>
+          <input id="gs-target-segment-mb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+          <p class="text-xs text-gray-600 mt-1">Used to estimate number of parts from source file size.</p>
         </div>
 
         <div>
@@ -136,6 +162,10 @@
       const chkAv1     = document.getElementById('gs-av1-check-enabled');
       const selLargeBehavior = document.getElementById('gs-large-file-behavior');
       const chkNfsAll  = document.getElementById('gs-use-nfs-for-all-files');
+      const chkDirectAll = document.getElementById('gs-use-direct-source-for-all-files');
+      const chkLowDiskDirect = document.getElementById('gs-low-disk-direct-enabled');
+      const numLowDiskMinFree = document.getElementById('gs-low-disk-min-free-gb');
+      const numTargetSegment = document.getElementById('gs-target-segment-mb');
       const selTarget  = document.getElementById('gs-default-target-height');
 
       const asBool = (v) => {
@@ -162,8 +192,13 @@
           chkGC.checked = asBool(d.suspend_gc_enabled);
           numMaxSize.value = Number(d.max_source_file_size_gb ?? 15);
           chkAv1.checked = asBool(d.av1_check_enabled ?? true);
-          selLargeBehavior.value = (d.large_file_behavior === 'nfs') ? 'nfs' : 'reject';
+          const largeBehavior = String(d.large_file_behavior || 'direct').toLowerCase();
+          selLargeBehavior.value = (largeBehavior === 'nfs' || largeBehavior === 'direct') ? largeBehavior : 'reject';
           chkNfsAll.checked = asBool(d.use_nfs_for_all_files ?? false);
+          chkDirectAll.checked = asBool(d.use_direct_source_for_all_files ?? false);
+          chkLowDiskDirect.checked = asBool(d.low_disk_direct_enabled ?? true);
+          numLowDiskMinFree.value = Number(d.low_disk_min_free_gb ?? 20);
+          numTargetSegment.value = Number(d.target_segment_mb ?? 10);
           selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
         }catch{ toast('Failed to load global settings', false); }
       }
@@ -175,8 +210,12 @@
             suspend_gc_enabled: !!chkGC.checked,
             max_source_file_size_gb: Math.max(1, Number(numMaxSize.value || 15)),
             av1_check_enabled: !!chkAv1.checked,
-            large_file_behavior: selLargeBehavior.value === 'nfs' ? 'nfs' : 'reject',
+            large_file_behavior: ['nfs', 'direct'].includes(selLargeBehavior.value) ? selLargeBehavior.value : 'reject',
             use_nfs_for_all_files: !!chkNfsAll.checked,
+            use_direct_source_for_all_files: !!chkDirectAll.checked,
+            low_disk_direct_enabled: !!chkLowDiskDirect.checked,
+            low_disk_min_free_gb: Math.max(1, Number(numLowDiskMinFree.value || 20)),
+            target_segment_mb: Math.max(1, Number(numTargetSegment.value || 10)),
             default_target_height: asTargetHeight(selTarget.value, 1080)
           };
           const r = await fetch('/settings', {
@@ -202,6 +241,7 @@
       const hook = (id, href) => { const b=document.getElementById(id); if (b) b.onclick=()=>location.href=href; };
       hook('open-home','/');
       hook('open-nodes','/nodes');
+      hook('open-browse','/browse');
       hook('open-metrics','/metrics');
     });
   </script>

@@ -25,6 +25,8 @@ MIN_UPTIME_BEFORE_SUSPEND = int(os.getenv("MIN_UPTIME_BEFORE_SUSPEND", "300"))# 
 
 # Garbage collection (local default: off). Global setting can enable per controller.
 GC_BASE_DIR = os.getenv("GC_BASE_DIR", "/opt/jerry/current")
+GC_INTERVAL_SEC = max(60, int(os.getenv("GC_INTERVAL_SEC", "900")))
+GC_MIN_AGE_SEC = max(300, int(os.getenv("GC_MIN_AGE_SEC", "21600")))
 
 HOSTNAME = os.getenv("HOSTNAME", socket.gethostname())  # e.g. thinman07
 KEY      = f"metrics:node:{HOSTNAME}"
@@ -202,12 +204,46 @@ def _uptime_seconds() -> float:
 # ---------------- Garbage collection of stale projects ----------------
 _GUID_RE = re.compile(r"^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
 
-def remove_stale_projects(base_dir: str):
+def _active_job_ids() -> set[str]:
+    active = set()
+    try:
+        job_ids = redis_client.smembers("jobs:index") or set()
+    except Exception as e:
+        logger.warning("GC: failed to read jobs:index: %s", e)
+        return active
+
+    if not job_ids:
+        return active
+
+    pipe = redis_client.pipeline()
+    ordered = []
+    for job_id in job_ids:
+        jid = str(job_id or "").strip()
+        if not jid:
+            continue
+        ordered.append(jid)
+        pipe.hget(f"job:{jid}", "status")
+    try:
+        statuses = pipe.execute()
+    except Exception as e:
+        logger.warning("GC: failed to fetch job statuses: %s", e)
+        return active
+
+    for job_id, status_raw in zip(ordered, statuses):
+        try:
+            status = str(status_raw or "").strip().upper()
+        except Exception:
+            status = ""
+        if status in {"STARTING", "WAITING", "RUNNING", "STAMPING"}:
+            active.add(job_id)
+    return active
+
+
+def remove_stale_projects(base_dir: str, *, min_age_sec: int = GC_MIN_AGE_SEC):
     """
-    Remove immediate subdirectories under base_dir whose names are GUIDs.
-    Equivalent to:
-      find <base_dir> -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
-           -regex '.*/[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$' -exec rm -rf {} +
+    Remove immediate UUID-named subdirectories under base_dir when they are both:
+      - not associated with an active job, and
+      - older than min_age_sec based on directory mtime.
     """
     try:
         entries = os.listdir(base_dir)
@@ -217,12 +253,27 @@ def remove_stale_projects(base_dir: str):
         logger.warning("GC: listdir failed for %s: %s", base_dir, e)
         return
 
+    now = time.time()
+    active_jobs = _active_job_ids()
     removed = 0
+    skipped_active = 0
+    skipped_recent = 0
     for name in entries:
         path = os.path.join(base_dir, name)
         if not os.path.isdir(path):
             continue
         if not _GUID_RE.match(name):
+            continue
+        if name in active_jobs:
+            skipped_active += 1
+            continue
+        try:
+            age_sec = max(0.0, now - os.path.getmtime(path))
+        except Exception as e:
+            logger.warning("GC: stat failed for %s: %s", path, e)
+            continue
+        if age_sec < float(min_age_sec):
+            skipped_recent += 1
             continue
         try:
             shutil.rmtree(path, ignore_errors=True)
@@ -230,8 +281,15 @@ def remove_stale_projects(base_dir: str):
         except Exception as e:
             logger.warning("GC: failed to remove %s: %s", path, e)
 
-    if removed:
-        logger.info("GC: removed %d GUID project dirs under %s", removed, base_dir)
+    if removed or skipped_active or skipped_recent:
+        logger.info(
+            "GC: base=%s removed=%d skipped_active=%d skipped_recent=%d min_age_sec=%d",
+            base_dir,
+            removed,
+            skipped_active,
+            skipped_recent,
+            int(min_age_sec),
+        )
 
 def _get_global_suspend_settings():
 
@@ -260,6 +318,7 @@ def main():
     # Idle detection state
     idle_since = None
     last_suspend_ts = 0.0
+    next_gc_ts = 0.0
 
     while True:
         t0 = time.time()
@@ -322,6 +381,13 @@ def main():
         except Exception as e:
             logger.warning("Failed to publish metrics: %s", e)
 
+        if now_ts >= next_gc_ts:
+            try:
+                remove_stale_projects(GC_BASE_DIR, min_age_sec=GC_MIN_AGE_SEC)
+            except Exception as e:
+                logger.warning("GC: periodic cleanup failed for %s: %s", GC_BASE_DIR, e)
+            next_gc_ts = now_ts + GC_INTERVAL_SEC
+
         # ---- Idle detection & suspend (controller-gated) ----
         # Pull global flags (with small cache)
         g_suspend_enabled, g_idle_sec, g_gc_enabled = _get_global_suspend_settings()
@@ -349,7 +415,7 @@ def main():
             if idle_dur >= effective_idle_threshold and enough_time_since_boot and enough_time_since_last:
                 # Optional GC before suspend (controller-controlled)
                 if g_gc_enabled:
-                    remove_stale_projects(GC_BASE_DIR)
+                    remove_stale_projects(GC_BASE_DIR, min_age_sec=GC_MIN_AGE_SEC)
 
                 logger.info(
                     "Idle for %ds (cpu=%.1f%%, gpu=%.1f%%), threshold=%ds, suspend_enabled=%s -> suspending",

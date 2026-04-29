@@ -201,3 +201,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Thinvids DVD rip helpers
+/rips/dvd_title_cache.json
+/rips/*.probe.json

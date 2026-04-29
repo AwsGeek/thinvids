@@ -13,6 +13,7 @@
     projects_dir: /projects
     watch_dir: /watch
     library_dir: /library
+    source_media_dir: /source_media
     nfs_project_root: /library/.thinvids-projects
 
     # Redis / pipeline
@@ -50,6 +51,10 @@
     nfs_opts: "nolock,soft,_netdev"
     nfs_watch_export:   /volume1/shared/projects/media/archive
     nfs_library_export: /volume1/shared/projects/media/library
+    source_media_server: swarm2
+    source_media_export: /home/jerry/media/data/media
+    source_media_fstype: nfs4
+    source_media_opts: "ro,soft,timeo=5,retrans=1,_netdev,nofail"
 
     # Optional centralized journald upload
     enable_journal_upload: false
@@ -99,6 +104,19 @@
         - "{{ watch_dir }}"
         - "{{ library_dir }}"
 
+    - name: Ensure local scratch root exists
+      ansible.builtin.file:
+        path: "{{ projects_dir }}"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0775"
+
+    - name: Ensure /source_media mountpoint exists
+      ansible.builtin.file:
+        path: "{{ source_media_dir }}"
+        state: directory
+
     # --- NFS mounts (idempotent, adds to fstab & mounts now) ---
     - name: Mount /watch (NFS)
       ansible.builtin.mount:
@@ -114,6 +132,14 @@
         src: "{{ nfs_server }}:{{ nfs_library_export }}"
         fstype: "{{ nfs_fstype }}"
         opts: "{{ nfs_opts }}"
+        state: mounted
+
+    - name: Mount /source_media (swarm2 read-only NFS)
+      ansible.builtin.mount:
+        path: "{{ source_media_dir }}"
+        src: "{{ source_media_server }}:{{ source_media_export }}"
+        fstype: "{{ source_media_fstype }}"
+        opts: "{{ source_media_opts }}"
         state: mounted
 
     - name: Ensure NFS project scratch root exists
@@ -205,6 +231,9 @@
           Environment=REDIS_DB={{ redis_db_data }}
           Environment=TTL_SEC={{ ttl_sec }}
           Environment=NODE_NAME=%H
+          Environment=GC_BASE_DIR={{ projects_dir }}
+          Environment=GC_INTERVAL_SEC=900
+          Environment=GC_MIN_AGE_SEC=21600
 
           # Use the SAME venv as the worker
           ExecStart={{ app_root }}/venv/bin/python agent.py
@@ -224,7 +253,7 @@
           Description=Thinman Worker (Huey)
           After=network-online.target remote-fs.target
           Wants=network-online.target remote-fs.target
-          RequiresMountsFor={{ watch_dir }} {{ library_dir }}
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }} {{ source_media_dir }}
 
           [Service]
           Type=simple
@@ -237,8 +266,9 @@
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
-          Environment=PROJECT_ROOT={{ app_root }}/current
-          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=PROJECT_ROOT={{ projects_dir }}
+          Environment=WATCH_ROOT={{ source_media_dir }}
+          Environment=SOURCE_MEDIA_ROOT={{ source_media_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}

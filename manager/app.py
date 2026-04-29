@@ -13,6 +13,7 @@ import struct
 from typing import List
 import subprocess
 import threading
+import fcntl
 
 # import backend task planner
 from tasks import transcode, stamp
@@ -117,6 +118,10 @@ MIN_PARTS           = int(os.getenv("MIN_PARTS", "20"))            # hint only
 MAX_PARTS           = int(os.getenv("MAX_PARTS", "20"))          # hint only
 ALLOWED_TARGET_HEIGHTS = (720, 1080)
 DEFAULT_TARGET_HEIGHT = 1080
+WATCH_ROOT = os.getenv("WATCH_ROOT", "/watch")
+SOURCE_MEDIA_ROOT = os.getenv("SOURCE_MEDIA_ROOT", "/source_media")
+PROCESSED_FILE = os.getenv("PROCESSED_FILE", "/config/processed.log")
+VIDEO_EXTS = {".mkv", ".mp4"}
 LOCAL_PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/projects")
 NFS_PROJECT_ROOT = os.getenv("NFS_PROJECT_ROOT", "/library/.thinvids-projects")
 PIPELINE_QUEUE_ACTION_TRANSCODE = "TRANSCODE"
@@ -197,17 +202,22 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
         # Compute parts hint
         parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
 
+        job = redis_client.hgetall(job_key) or {}
+        input_path = (job.get("input_path") or "").strip()
+        source_path = input_path or os.path.join(WATCH_ROOT, filename.lstrip('/'))
+
         # Stash info for UI/debug + hint for tasks.transcode
         redis_client.hset(job_key, mapping={
             'warmup_workers_json': json.dumps(seen),
             'warmup_worker_count': len(seen),
             'warmup_wait_s': CLUSTER_WARMUP_SEC,
             'parts_hint': parts_hint,
+            'input_path': source_path,
         })
 
         # Kick the pipeline
         redis_client.hset(job_key, mapping={'status': Status.WAITING.value, 'waiting_at': time.time()})
-        transcode(job_id, f'/watch/{filename}')
+        transcode(job_id, source_path)
     except Exception as e:
         logger.exception("[%s] launch_after_warmup failed", job_id)
         try:
@@ -255,7 +265,11 @@ def _load_global_settings():
     settings.setdefault("max_source_file_size_gb", "15")
     settings.setdefault("av1_check_enabled", "1")
     settings.setdefault("use_nfs_for_all_files", "0")
-    settings.setdefault("large_file_behavior", "reject")
+    settings.setdefault("use_direct_source_for_all_files", "0")
+    settings.setdefault("low_disk_direct_enabled", "1")
+    settings.setdefault("low_disk_min_free_gb", "20")
+    settings.setdefault("target_segment_mb", "10")
+    settings.setdefault("large_file_behavior", "direct")
     return settings
 
 def _display_title(filename):
@@ -264,16 +278,136 @@ def _display_title(filename):
         return "Unknown"
     return os.path.splitext(base)[0] or base
 
+def _is_video_filename(filename: str) -> bool:
+    _, ext = os.path.splitext(filename or "")
+    return ext.lower() in VIDEO_EXTS
+
+def _safe_watch_rel_path(value: str) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if "\x00" in raw:
+        raise ValueError("Invalid path")
+    if raw.startswith("/"):
+        raw = raw.lstrip("/")
+    normalized = os.path.normpath(raw or ".")
+    if normalized == ".":
+        return ""
+    if normalized.startswith("../") or normalized == "..":
+        raise ValueError("Path must stay under watch root")
+    return normalized.replace("\\", "/")
+
+def _watch_abs_path(rel_path: str) -> str:
+    rel = _safe_watch_rel_path(rel_path)
+    root = os.path.realpath(WATCH_ROOT)
+    path = os.path.realpath(os.path.join(root, rel))
+    if path != root and not path.startswith(root + os.sep):
+        raise ValueError("Path must stay under watch root")
+    return path
+
+def _abs_under_root(root_path: str, rel_path: str, label: str) -> str:
+    rel = _safe_watch_rel_path(rel_path)
+    root = os.path.realpath(root_path)
+    path = os.path.realpath(os.path.join(root, rel))
+    if path != root and not path.startswith(root + os.sep):
+        raise ValueError(f"Path must stay under {label} root")
+    return path
+
+def _browse_root(source: str):
+    raw = str(source or "watch").strip().lower()
+    if raw in ("watch", "archive", ""):
+        return {
+            "source": "watch",
+            "label": "Watch Folder",
+            "root_label": WATCH_ROOT,
+            "root_path": WATCH_ROOT,
+        }
+    if raw in ("source_media", "source", "media"):
+        return {
+            "source": "source_media",
+            "label": "Source Media",
+            "root_label": "/source_media",
+            "root_path": SOURCE_MEDIA_ROOT,
+        }
+    raise ValueError("Unknown browse source")
+
+def _safe_existing_input_path(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "\x00" in raw:
+        raise ValueError("Invalid input path")
+
+    path = os.path.realpath(raw)
+    allowed_roots = [os.path.realpath(WATCH_ROOT), os.path.realpath(SOURCE_MEDIA_ROOT)]
+    for root in allowed_roots:
+        if path == root or path.startswith(root + os.sep):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            if not _is_video_filename(path):
+                raise ValueError("Input path must be a supported video file")
+            return path
+    raise ValueError("Input path must stay under watch or source media root")
+
+def _job_source_path(filename: str, input_path: str = "") -> str:
+    if input_path:
+        return _safe_existing_input_path(input_path)
+    return _watch_abs_path(filename)
+
+def _file_signature(path: str) -> str:
+    st = os.stat(path)
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    return f"{int(st.st_size)}:{int(mtime_ns)}"
+
+def _source_origin_for_path(path: str) -> str:
+    real = os.path.realpath(path or "")
+    source_root = os.path.realpath(SOURCE_MEDIA_ROOT)
+    watch_root = os.path.realpath(WATCH_ROOT)
+    if real == source_root or real.startswith(source_root + os.sep):
+        return "source_media"
+    if real == watch_root or real.startswith(watch_root + os.sep):
+        return "watch"
+    return "unknown"
+
+def _mark_watcher_processed(rel_path: str) -> None:
+    """
+    Record a manually queued file in the watcher ledger so the watcher does not
+    also submit it. New watcher versions read these JSON lines; legacy path-only
+    entries remain supported by the watcher.
+    """
+    rel = _safe_watch_rel_path(rel_path)
+    full_path = _watch_abs_path(rel)
+    if not os.path.isfile(full_path):
+        raise FileNotFoundError(full_path)
+    if not _is_video_filename(rel):
+        raise ValueError("Only video files can be marked processed")
+
+    signature = _file_signature(full_path)
+    payload = json.dumps({"path": rel, "sig": signature}, separators=(",", ":"))
+    os.makedirs(os.path.dirname(PROCESSED_FILE) or ".", exist_ok=True)
+    with open(PROCESSED_FILE, "a+", encoding="utf-8") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+        f.write(payload + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+
 def _evaluate_job_policy(video_details, settings):
     max_source_file_size_gb = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
     av1_check_enabled = _as_bool(settings.get("av1_check_enabled", "1"), True)
     use_nfs_for_all_files = _as_bool(settings.get("use_nfs_for_all_files", "0"), False)
-    large_file_behavior = str(settings.get("large_file_behavior", "reject") or "reject").strip().lower()
-    if large_file_behavior not in ("reject", "nfs"):
+    use_direct_source_for_all_files = _as_bool(settings.get("use_direct_source_for_all_files", "0"), False)
+    large_file_behavior = str(settings.get("large_file_behavior", "direct") or "direct").strip().lower()
+    if large_file_behavior not in ("reject", "nfs", "direct"):
         large_file_behavior = "reject"
 
     source_size = _as_int(video_details.get("source_file_size", 0), 0)
     source_codec = str(video_details.get("source_codec") or "").strip().lower()
+    processing_mode = "direct" if use_direct_source_for_all_files else "split"
 
     if av1_check_enabled and source_codec in ("av1", "av01"):
         return (
@@ -281,24 +415,30 @@ def _evaluate_job_policy(video_details, settings):
             "AV1 source rejected by global setting (av1_check_enabled).",
             "local",
             LOCAL_PROJECT_ROOT,
+            "split",
         )
 
-    if use_nfs_for_all_files:
-        return (None, None, "nfs", NFS_PROJECT_ROOT)
+    scratch_mode = "nfs" if use_nfs_for_all_files else "local"
+    scratch_root = NFS_PROJECT_ROOT if use_nfs_for_all_files else LOCAL_PROJECT_ROOT
 
     max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
     is_large = max_source_bytes > 0 and source_size > max_source_bytes
     if is_large:
         if large_file_behavior == "nfs":
-            return (None, None, "nfs", NFS_PROJECT_ROOT)
+            scratch_mode = "nfs"
+            scratch_root = NFS_PROJECT_ROOT
+            return (None, None, scratch_mode, scratch_root, processing_mode)
+        if large_file_behavior == "direct":
+            return (None, None, scratch_mode, scratch_root, "direct")
         return (
             "size_limit",
             f"Source file too large: {humanize.naturalsize(source_size, binary=True)} > {max_source_file_size_gb:g} GiB limit",
-            "local",
-            LOCAL_PROJECT_ROOT,
+            scratch_mode,
+            scratch_root,
+            "split",
         )
 
-    return (None, None, "local", LOCAL_PROJECT_ROOT)
+    return (None, None, scratch_mode, scratch_root, processing_mode)
 
 def _job_index_keys() -> List[str]:
     keys = list(redis_client.smembers("jobs:all") or [])
@@ -519,6 +659,71 @@ def index():
 def metrics_page():
     return render_template('metrics.html')
 
+@app.get('/browse')
+def browse_page():
+    return render_template('browse.html')
+
+@app.get('/browse/list')
+def browse_list():
+    try:
+        root_info = _browse_root(request.args.get("source", "watch"))
+        rel = _safe_watch_rel_path(request.args.get("path", ""))
+        abs_path = _abs_under_root(root_info["root_path"], rel, root_info["root_label"])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if not os.path.isdir(abs_path):
+        return jsonify({"error": "Directory not found"}), 404
+
+    dirs = []
+    files = []
+    try:
+        with os.scandir(abs_path) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        child_rel = "/".join(p for p in (rel, name) if p)
+                        dirs.append({
+                            "name": name,
+                            "path": child_rel,
+                        })
+                    elif entry.is_file(follow_symlinks=False) and _is_video_filename(name):
+                        st = entry.stat(follow_symlinks=False)
+                        child_rel = "/".join(p for p in (rel, name) if p)
+                        files.append({
+                            "name": name,
+                            "path": child_rel,
+                            "size": st.st_size,
+                            "size_label": humanize.naturalsize(st.st_size, binary=True),
+                            "mtime": st.st_mtime,
+                        })
+                except FileNotFoundError:
+                    continue
+    except OSError as e:
+        logger.warning("browse_list failed for %s: %s", abs_path, e)
+        return jsonify({"error": "Failed to read directory"}), 500
+
+    dirs.sort(key=lambda x: x["name"].lower())
+    files.sort(key=lambda x: x["name"].lower())
+    parent = ""
+    if rel:
+        parent = os.path.dirname(rel).replace("\\", "/")
+        if parent == ".":
+            parent = ""
+
+    return jsonify({
+        "source": root_info["source"],
+        "label": root_info["label"],
+        "root_label": root_info["root_label"],
+        "path": rel,
+        "parent": parent,
+        "dirs": dirs,
+        "files": files,
+    })
+
 # -------------------- tiny in-process caches --------------------
 # (shield front-end polling from re-hitting Redis every time)
 _metrics_cache = (0.0, None)  # (ts, payload dict)
@@ -630,7 +835,15 @@ def get_settings():
     out["max_source_file_size_gb"] = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
     out["av1_check_enabled"] = _as_bool(settings.get("av1_check_enabled", "1"), True)
     out["use_nfs_for_all_files"] = _as_bool(settings.get("use_nfs_for_all_files", "0"), False)
-    out["large_file_behavior"] = str(settings.get("large_file_behavior", "reject") or "reject").strip().lower()
+    out["use_direct_source_for_all_files"] = _as_bool(settings.get("use_direct_source_for_all_files", "0"), False)
+    out["low_disk_direct_enabled"] = _as_bool(settings.get("low_disk_direct_enabled", "1"), True)
+    out["low_disk_min_free_gb"] = _as_float(settings.get("low_disk_min_free_gb", 20), 20.0)
+    out["target_segment_mb"] = _as_float(settings.get("target_segment_mb", 10), 10.0)
+    if out["target_segment_mb"] <= 0:
+        out["target_segment_mb"] = 10.0
+    out["large_file_behavior"] = str(settings.get("large_file_behavior", "direct") or "direct").strip().lower()
+    if out["large_file_behavior"] not in ("reject", "nfs", "direct"):
+        out["large_file_behavior"] = "reject"
     out["default_target_height"] = normalize_target_height(
         settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
         DEFAULT_TARGET_HEIGHT
@@ -648,7 +861,11 @@ def post_global_settings():
         "max_source_file_size_gb": number (>0),
         "av1_check_enabled": bool,
         "use_nfs_for_all_files": bool,
-        "large_file_behavior": "reject"|"nfs",
+        "use_direct_source_for_all_files": bool,
+        "low_disk_direct_enabled": bool,
+        "low_disk_min_free_gb": number (>=1),
+        "target_segment_mb": number (>0),
+        "large_file_behavior": "reject"|"nfs"|"direct",
         "default_target_height": 720|1080
     }
     """
@@ -664,8 +881,16 @@ def post_global_settings():
             max_size_gb = 15.0
         av1_check_enabled = _as_bool(payload.get("av1_check_enabled", True), True)
         use_nfs_for_all_files = _as_bool(payload.get("use_nfs_for_all_files", False), False)
-        large_file_behavior = str(payload.get("large_file_behavior", "reject") or "reject").strip().lower()
-        if large_file_behavior not in ("reject", "nfs"):
+        use_direct_source_for_all_files = _as_bool(payload.get("use_direct_source_for_all_files", False), False)
+        low_disk_direct_enabled = _as_bool(payload.get("low_disk_direct_enabled", True), True)
+        low_disk_min_free_gb = _as_float(payload.get("low_disk_min_free_gb", 20), 20.0)
+        if low_disk_min_free_gb < 1:
+            low_disk_min_free_gb = 1.0
+        target_segment_mb = _as_float(payload.get("target_segment_mb", 10), 10.0)
+        if target_segment_mb <= 0:
+            target_segment_mb = 10.0
+        large_file_behavior = str(payload.get("large_file_behavior", "direct") or "direct").strip().lower()
+        if large_file_behavior not in ("reject", "nfs", "direct"):
             large_file_behavior = "reject"
         default_target_height = normalize_target_height(
             payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
@@ -681,6 +906,10 @@ def post_global_settings():
         "max_source_file_size_gb": str(max_size_gb),
         "av1_check_enabled": "1" if av1_check_enabled else "0",
         "use_nfs_for_all_files": "1" if use_nfs_for_all_files else "0",
+        "use_direct_source_for_all_files": "1" if use_direct_source_for_all_files else "0",
+        "low_disk_direct_enabled": "1" if low_disk_direct_enabled else "0",
+        "low_disk_min_free_gb": str(low_disk_min_free_gb),
+        "target_segment_mb": str(target_segment_mb),
         "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
     })
@@ -692,6 +921,10 @@ def post_global_settings():
         "max_source_file_size_gb": str(max_size_gb),
         "av1_check_enabled": "1" if av1_check_enabled else "0",
         "use_nfs_for_all_files": "1" if use_nfs_for_all_files else "0",
+        "use_direct_source_for_all_files": "1" if use_direct_source_for_all_files else "0",
+        "low_disk_direct_enabled": "1" if low_disk_direct_enabled else "0",
+        "low_disk_min_free_gb": str(low_disk_min_free_gb),
+        "target_segment_mb": str(target_segment_mb),
         "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
     })
@@ -703,6 +936,10 @@ def post_global_settings():
         "max_source_file_size_gb": max_size_gb,
         "av1_check_enabled": av1_check_enabled,
         "use_nfs_for_all_files": use_nfs_for_all_files,
+        "use_direct_source_for_all_files": use_direct_source_for_all_files,
+        "low_disk_direct_enabled": low_disk_direct_enabled,
+        "low_disk_min_free_gb": low_disk_min_free_gb,
+        "target_segment_mb": target_segment_mb,
         "large_file_behavior": large_file_behavior,
         "default_target_height": default_target_height,
     })
@@ -1005,13 +1242,28 @@ def get_video_details(job_id: str, file_path: str):
 @app.post('/add_job')
 def add_job():
     data = request.get_json(silent=True) or {}
-    filename = data.get('filename')
+    try:
+        filename = _safe_watch_rel_path(data.get('filename'))
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
     force_paused = bool(data.get('force_paused', False))  # copies set this true
+    mark_watcher_processed = bool(data.get('mark_watcher_processed', False))
+    manual_review = bool(data.get('manual_review', False))
+    input_path_raw = data.get('input_path') or ''
 
-    if not filename or not filename.endswith(('.mkv', '.mp4')):
+    if not filename or not _is_video_filename(filename):
         return jsonify({'status': 'error', 'message': 'Invalid file format'}), 400
 
-    full_path = os.path.join("/watch", filename.lstrip('/'))
+    try:
+        input_path = _safe_existing_input_path(input_path_raw) if input_path_raw else ""
+        full_path = _job_source_path(filename, input_path)
+    except FileNotFoundError:
+        return jsonify({'status': 'error', 'message': 'Source file not found'}), 404
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+    if not os.path.isfile(full_path):
+        return jsonify({'status': 'error', 'message': 'Source file not found'}), 404
+
     job_id = str(uuid.uuid4())
     job_key = f"job:{job_id}"
 
@@ -1030,12 +1282,16 @@ def add_job():
     segment_duration = _as_int(global_settings.get('segment_duration', 10), 10)
     number_parts = _as_int(global_settings.get('number_parts', 2), 2)
 
+    source_origin = _source_origin_for_path(full_path)
     status = Status.WAITING if auto_start_effective else Status.READY
     scratch_mode = 'local'
     scratch_root = LOCAL_PROJECT_ROOT
+    processing_mode = 'split'
     job_settings = {
         'job_id': job_id,
         'filename': filename,
+        'input_path': full_path,
+        'source_origin': source_origin,
         'status': status.value,
         'created_at': now,
         'started_at': now if auto_start_effective else '0',
@@ -1058,6 +1314,9 @@ def add_job():
         'total_frames': 0,
         'scratch_mode': scratch_mode,
         'scratch_root': scratch_root,
+        'processing_mode': processing_mode,
+        'processing_mode_effective': '',
+        'processing_mode_reason': '',
     }
     emit_activity(
         f'Received "{_display_title(filename)}"',
@@ -1070,12 +1329,40 @@ def add_job():
     video_details = get_video_details(job_id, full_path)
     job_settings = {**job_settings, **video_details}
 
-    rejection_reason, rejection_message, scratch_mode, scratch_root = _evaluate_job_policy(video_details, global_settings)
+    rejection_reason, rejection_message, scratch_mode, scratch_root, processing_mode = _evaluate_job_policy(video_details, global_settings)
     job_settings.update({
         'scratch_mode': scratch_mode,
         'scratch_root': scratch_root,
+        'processing_mode': processing_mode,
     })
-    if rejection_reason:
+    if source_origin == "source_media" and processing_mode == "direct":
+        processing_mode = "split"
+        job_settings.update({
+            'processing_mode': processing_mode,
+            'processing_mode_reason': 'source_media_forces_split',
+            'policy_warning': 'Source-media jobs are forced to split mode for initial testing.',
+        })
+    policy_warning = None
+    if rejection_reason and manual_review and force_paused:
+        policy_warning = rejection_message
+        job_settings.update({
+            'status': Status.READY.value,
+            'started_at': '0',
+            'queue_action': '',
+            'waiting_at': '0',
+            'policy_warning': rejection_message,
+            'policy_warning_reason': rejection_reason,
+            'policy_warning_at': now,
+        })
+        emit_activity(
+            f'Queued "{_display_title(filename)}" for review with warning: {rejection_message}',
+            job_id=job_id,
+            filename=filename,
+            stage='ready',
+            source='manager',
+        )
+        rejection_reason = None
+    elif rejection_reason:
         job_settings.update({
             'status': Status.REJECTED.value,
             'started_at': '0',
@@ -1098,19 +1385,35 @@ def add_job():
     # index the job for fast listing
     redis_client.sadd("jobs:all", job_key)
 
+    watcher_mark_warning = None
+    if mark_watcher_processed:
+        try:
+            _mark_watcher_processed(filename)
+        except Exception as e:
+            watcher_mark_warning = str(e)
+            logger.warning("[%s] failed to mark watcher ledger for %s: %s", job_id, filename, e)
+
     if auto_start_effective and not rejection_reason:
         _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, _float_or(now, time.time()))
         dispatch_next_waiting_job()
 
     if rejection_reason:
-        return jsonify({
+        payload = {
             'status': 'rejected',
             'job_id': job_id,
             'message': rejection_message,
             'reason': rejection_reason,
-        }), 201
+        }
+        if watcher_mark_warning:
+            payload['watcher_mark_warning'] = watcher_mark_warning
+        return jsonify(payload), 201
 
-    return jsonify({'status': 'success', 'job_id': job_id}), 201
+    payload = {'status': 'success', 'job_id': job_id}
+    if policy_warning:
+        payload['policy_warning'] = policy_warning
+    if watcher_mark_warning:
+        payload['watcher_mark_warning'] = watcher_mark_warning
+    return jsonify(payload), 201
 
 @app.route('/copy_job', methods=['POST'])
 def copy_job():
@@ -1157,6 +1460,8 @@ def copy_job():
     new_job = {
         'job_id': new_job_id,
         'filename': filename,
+        'input_path': src.get('input_path', ''),
+        'source_origin': src.get('source_origin', ''),
         'status': Status.READY.value,
         'created_at': str(now),
         'started_at': '0',
@@ -1169,6 +1474,9 @@ def copy_job():
         'selected_a_stream': selected_a_stream,
         'scratch_mode': src.get('scratch_mode', 'local'),
         'scratch_root': src.get('scratch_root', LOCAL_PROJECT_ROOT),
+        'processing_mode': src.get('processing_mode', 'split'),
+        'processing_mode_effective': '',
+        'processing_mode_reason': '',
         'total_chunks': 0,
         'completed_chunks': 0,
         'stitched_chunks': 0,
@@ -1254,7 +1562,11 @@ def restart_job(job_id):
     selected_a_stream= job.get('selected_a_stream', 0)
     source_updates = {}
     global_settings = _load_global_settings()
-    full_path = os.path.join("/watch", filename.lstrip('/'))
+    input_path = (job.get('input_path') or '').strip()
+    try:
+        full_path = _job_source_path(filename, input_path)
+    except Exception:
+        full_path = os.path.join(WATCH_ROOT, filename.lstrip('/'))
     try:
         video_details = get_video_details(job_id, full_path)
         source_updates = {
@@ -1278,12 +1590,17 @@ def restart_job(job_id):
             'total_frames': job.get('total_frames', 0),
         }
 
-    rejection_reason, rejection_message, scratch_mode, scratch_root = _evaluate_job_policy(source_updates, global_settings)
+    rejection_reason, rejection_message, scratch_mode, scratch_root, processing_mode = _evaluate_job_policy(source_updates, global_settings)
+    source_origin = _source_origin_for_path(input_path or full_path)
+    if source_origin == "source_media" and processing_mode == "direct":
+        processing_mode = "split"
 
     now = time.time()
     new_fields = {
         'job_id': job_id,
         'filename': filename,
+        'input_path': input_path or full_path,
+        'source_origin': source_origin,
         'status': Status.WAITING.value,
         'started_at': str(now),
         'ended_at': 0,
@@ -1317,6 +1634,9 @@ def restart_job(job_id):
         'streams_json': job.get('streams_json'),
         'scratch_mode': scratch_mode,
         'scratch_root': scratch_root,
+        'processing_mode': processing_mode,
+        'processing_mode_effective': '',
+        'processing_mode_reason': 'source_media_forces_split' if source_origin == "source_media" else '',
         'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE,
         'waiting_at': str(now),
 
@@ -1646,10 +1966,11 @@ def stamp_job(job_id):
 
     # verify source exists
     filename = job.get('filename') or ''
-    full_path = os.path.join("/watch", filename.lstrip('/'))
-    if (not filename or not os.path.exists(full_path)) and job.get('input_path'):
-        full_path = job.get('input_path')
-    if not os.path.exists(full_path):
+    try:
+        full_path = _job_source_path(filename, job.get('input_path') or '')
+    except Exception:
+        full_path = os.path.join(WATCH_ROOT, filename.lstrip('/')) if filename else ''
+    if not full_path or not os.path.exists(full_path):
         return jsonify({'status':'error','message':f'Input not found: {full_path}'}), 400
 
     now = time.time()

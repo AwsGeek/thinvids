@@ -4,6 +4,7 @@ This file defines how AI coding agents should operate in the `thinvids` reposito
 
 ## 1. Scope and priorities
 - Make the smallest safe change that solves the user request.
+- Do not guess.
 - Preserve the existing manager/worker/agent architecture unless a refactor is explicitly requested.
 - Prefer correctness, operability, and maintainability over cleverness.
 - Keep momentum: implement, verify, and report concrete outcomes.

@@ -1,0 +1,17 @@
+[Unit]
+Description=Thinvids automatic DVD rip for /dev/%I
+After=local-fs.target network-online.target
+Wants=network-online.target
+ConditionPathExists=/dev/%I
+
+[Service]
+Type=oneshot
+User=jerry
+Group=jerry
+EnvironmentFile=-/etc/default/thinvids-dvd-auto
+ExecStart=/usr/local/bin/thinvids-dvd-auto.sh %I
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
