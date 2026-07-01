@@ -10,7 +10,7 @@ subtitle streams when possible, and hand the result to `thinvids`.
 
 `auto_dvd/` contains a thinvids-native automatic insert workflow:
 
-1. a `udev` rule that watches for DVD inserts on `/dev/sr*`
+1. a `udev` rule that watches for DVD or Blu-ray inserts on `/dev/sr*`
 2. a tiny launcher script that reads `udev` properties and calls `dvd_rip_queue.py`
 3. a `systemd` template unit so the actual rip work runs outside of `udev`
 
@@ -160,7 +160,7 @@ script can preserve English subtitle streams in the source MKV it queues, but
 the current transcode pipeline may not carry subtitle streams into the final
 encoded output.
 
-## Automatic DVD Insert Workflow
+## Automatic Optical-Disc Insert Workflow
 
 The `auto_dvd/` folder contains:
 
@@ -252,10 +252,18 @@ sudo systemctl start thinvids-dvd-auto@sr0.service
 sudo journalctl -u thinvids-dvd-auto@sr0.service -n 200 --no-pager
 ```
 
+For a second optical drive, use its kernel name:
+
+```bash
+sudo /usr/local/bin/thinvids-dvd-auto.sh sr1
+sudo systemctl start thinvids-dvd-auto@sr1.service
+sudo journalctl -u thinvids-dvd-auto@sr1.service -n 200 --no-pager
+```
+
 ### Run
 
-Once the rule is installed and reloaded, insert a DVD into `/dev/sr0` (or
-another optical drive). `udev` will start the corresponding
+Once the rule is installed and reloaded, insert a DVD or Blu-ray into
+`/dev/sr0`, `/dev/sr1`, or another optical drive. `udev` will start the corresponding
 `thinvids-dvd-auto@srX.service`, which will:
 
 1. wait briefly for the drive to settle

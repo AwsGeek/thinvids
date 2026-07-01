@@ -14,7 +14,7 @@
   <div class="flex flex-wrap items-center gap-3 mb-4">
     <div>
       <h2 class="text-xl font-semibold">Browse Media Sources</h2>
-      <p class="text-sm text-gray-600">Select one video file to create a paused READY job for review.</p>
+      <p class="text-sm text-gray-600">Select one or more video files to create paused READY jobs for review.</p>
     </div>
     <div class="ml-auto flex items-center gap-2">
       <div class="flex rounded overflow-hidden border">
@@ -27,7 +27,7 @@
       </button>
       <button id="queue-selected" disabled class="inline-flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed">
         <span class="material-icons text-base">playlist_add</span>
-        Create READY Job
+        Create READY Jobs
       </button>
     </div>
   </div>
@@ -59,7 +59,7 @@
     path: '',
     source: 'watch',
     rootLabel: '/watch',
-    selected: null,
+    selected: new Map(),
     loading: false,
   };
 
@@ -85,13 +85,40 @@
       .replaceAll("'", '&#39;');
   }
 
-  function setSelected(file){
-    state.selected = file;
-    queueBtn.disabled = !file;
+  function selectedFiles(){
+    return Array.from(state.selected.values());
+  }
+
+  function selectedCount(){
+    return state.selected.size;
+  }
+
+  function updateQueueButton(){
+    const count = selectedCount();
+    queueBtn.disabled = count === 0 || state.loading;
+    queueBtn.querySelector('span.material-icons').textContent = count > 1 ? 'playlist_add_check' : 'playlist_add';
+    queueBtn.lastChild.textContent = count > 0 ? ` Create ${count} READY Job${count === 1 ? '' : 's'}` : ' Create READY Jobs';
+  }
+
+  function setFileSelected(file, selected){
+    if (!file?.path) return;
+    if (selected) state.selected.set(file.path, file);
+    else state.selected.delete(file.path);
+    updateSelectionUi();
+  }
+
+  function clearSelection(){
+    state.selected.clear();
+    updateSelectionUi();
+  }
+
+  function updateSelectionUi(){
+    updateQueueButton();
     document.querySelectorAll('.browse-row.file').forEach(row => {
-      row.classList.toggle('selected', row.dataset.path === (file?.path || ''));
-      const input = row.querySelector('input[type="radio"]');
-      if (input) input.checked = row.dataset.path === (file?.path || '');
+      const selected = state.selected.has(row.dataset.path || '');
+      row.classList.toggle('selected', selected);
+      const input = row.querySelector('input[type="checkbox"]');
+      if (input) input.checked = selected;
     });
   }
 
@@ -148,12 +175,16 @@
     tr.className = 'browse-row file border-t cursor-pointer';
     tr.dataset.path = file.path;
     tr.innerHTML = `
-      <td class="px-3 py-2"><input type="radio" name="selected-file" class="h-4 w-4"></td>
+      <td class="px-3 py-2"><input type="checkbox" class="h-4 w-4" aria-label="Select ${esc(file.name)}"></td>
       <td class="px-3 py-2"><span class="material-icons text-base align-middle text-gray-500 mr-1">movie</span><span class="file-name align-middle">${esc(file.name)}</span></td>
       <td class="px-3 py-2 text-sm text-gray-700">${esc(file.size_label || '')}</td>
       <td class="px-3 py-2 text-sm text-gray-700">${fmtDate(file.mtime)}</td>
     `;
-    tr.onclick = () => setSelected(file);
+    const checkbox = tr.querySelector('input[type="checkbox"]');
+    checkbox.checked = state.selected.has(file.path);
+    checkbox.onclick = (event) => event.stopPropagation();
+    checkbox.onchange = () => setFileSelected(file, checkbox.checked);
+    tr.onclick = () => setFileSelected(file, !state.selected.has(file.path));
     return tr;
   }
 
@@ -161,7 +192,7 @@
     state.source = data.source || state.source || 'watch';
     state.rootLabel = data.root_label || (state.source === 'source_media' ? '/source_media' : '/watch');
     state.path = data.path || '';
-    setSelected(null);
+    clearSelection();
     renderSourceTabs();
     renderBreadcrumb(state.path);
     listEl.innerHTML = '';
@@ -219,38 +250,55 @@
   }
 
   async function queueSelected(){
-    if (!state.selected) return;
+    const files = selectedFiles();
+    if (!files.length) return;
     queueBtn.disabled = true;
-    const label = state.selected.name;
+    const originalText = queueBtn.lastChild.textContent;
+    queueBtn.lastChild.textContent = ` Creating ${files.length} job${files.length === 1 ? '' : 's'}...`;
+    const successes = [];
+    const rejected = [];
+    const failures = [];
+    const warnings = [];
     try {
-      const r = await fetch('/add_job', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          filename: state.selected.path,
-          input_path: state.source === 'source_media' ? `${state.rootLabel.replace(/\/$/, '')}/${state.selected.path}` : '',
-          force_paused: true,
-          manual_review: true,
-          mark_watcher_processed: state.source === 'watch',
-        })
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.message || data.error || 'Failed to create job');
-      if (data.status === 'rejected') {
-        toast(`Created rejected job for ${label}: ${data.message || data.reason || 'policy rejected'}`, false);
-      } else {
-        toast(`Created READY job for ${label}`);
+      for (const file of files) {
+        try {
+          const r = await fetch('/add_job', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              filename: file.path,
+              input_path: state.source === 'source_media' ? `${state.rootLabel.replace(/\/$/, '')}/${file.path}` : '',
+              force_paused: true,
+              manual_review: true,
+              mark_watcher_processed: state.source === 'watch',
+            })
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.message || data.error || 'Failed to create job');
+          if (data.status === 'rejected') rejected.push({file, message: data.message || data.reason || 'policy rejected'});
+          else successes.push(file);
+          if (data.policy_warning) warnings.push(`Policy warning for ${file.name}: ${data.policy_warning}`);
+          if (data.watcher_mark_warning) warnings.push(`Watcher ledger warning for ${file.name}: ${data.watcher_mark_warning}`);
+        } catch (e) {
+          failures.push({file, message: e.message || 'Failed to create job'});
+        }
       }
-      if (data.policy_warning) {
-        toast(`Policy warning: ${data.policy_warning}`, false);
+
+      if (successes.length) toast(`Created ${successes.length} READY job${successes.length === 1 ? '' : 's'}`);
+      if (rejected.length) toast(`Created ${rejected.length} rejected job${rejected.length === 1 ? '' : 's'}: ${rejected.map(item => item.file.name).join(', ')}`, false);
+      for (const warning of warnings.slice(0, 3)) toast(warning, false);
+      if (warnings.length > 3) toast(`${warnings.length - 3} more warning${warnings.length === 4 ? '' : 's'} omitted`, false);
+      if (failures.length) {
+        toast(`Failed to create ${failures.length} job${failures.length === 1 ? '' : 's'}: ${failures.map(item => `${item.file.name} (${item.message})`).join(', ')}`, false);
       }
-      if (data.watcher_mark_warning) {
-        toast(`Watcher ledger warning: ${data.watcher_mark_warning}`, false);
+
+      for (const file of [...successes, ...rejected.map(item => item.file)]) {
+        state.selected.delete(file.path);
       }
-      setSelected(null);
-    } catch (e) {
-      toast(e.message || 'Failed to create job', false);
-      queueBtn.disabled = !state.selected;
+      updateSelectionUi();
+    } finally {
+      queueBtn.lastChild.textContent = originalText;
+      updateQueueButton();
     }
   }
 

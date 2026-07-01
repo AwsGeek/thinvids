@@ -9,6 +9,10 @@
         <span class="material-icons">power_settings_new</span>
         Wake All
       </button>
+      <button id="reboot-all" class="flex items-center gap-1 bg-orange-600 hover:bg-orange-700 text-white px-3 py-2 rounded">
+        <span class="material-icons">restart_alt</span>
+        Reboot All
+      </button>
       <button id="refresh" class="flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded">
         <span class="material-icons">refresh</span>
         Refresh
@@ -25,6 +29,7 @@
           <th class="px-2 py-1">MAC</th>
           <th class="px-2 py-1">Last Seen</th>
           <th class="px-2 py-1">Status</th>
+          <th class="px-2 py-1">Quarantine</th>
           <th class="px-2 py-1">Actions</th>
         </tr>
       </thead>
@@ -72,26 +77,54 @@
       <td class="px-2 py-1 cell-status">
         <span class="badge px-2 py-0.5 rounded text-xs"></span>
       </td>
+      <td class="px-2 py-1 text-sm cell-quarantine"></td>
       <td class="px-2 py-1 cell-actions"></td>
     `;
     body.appendChild(tr);
     return tr;
   }
 
-  function setBadge(el, active) {
+  function setBadge(el, active, disabled) {
+    if (disabled) {
+      el.textContent = 'disabled';
+      el.className = 'badge px-2 py-0.5 rounded text-xs bg-yellow-100 text-yellow-800';
+      return;
+    }
     el.textContent = active ? 'online' : 'offline';
     el.className = `badge px-2 py-0.5 rounded text-xs ${
       active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
     }`;
   }
 
-  function setActions(td, hostname, active) {
+  function setActions(td, hostname, active, disabled) {
       td.innerHTML = '';
 
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = `${disabled ? 'bg-blue-600 hover:bg-blue-700' : 'bg-yellow-600 hover:bg-yellow-700'} text-white px-2 py-1 rounded text-sm`;
+      toggleBtn.textContent = disabled ? 'Enable' : 'Disable';
+      toggleBtn.title = disabled ? 'Allow this node to participate again' : 'Prevent this node from being used for new work';
+      toggleBtn.addEventListener('click', async () => {
+        const action = disabled ? 'enable' : 'disable';
+        if (!disabled && !confirm(`Disable node "${hostname}"?\nIt will be excluded from active worker counts and Wake All.`)) return;
+        try {
+          const r = await fetch(`/nodes/${action}/${encodeURIComponent(hostname)}`, { method: 'POST' });
+          const j = await r.json().catch(()=>({}));
+          if (r.ok) {
+            toast(`${disabled ? 'Enabled' : 'Disabled'} ${hostname}`);
+            loadNodes();
+          } else {
+            toast(j.error || `Failed to ${action} ${hostname}`, false);
+          }
+        } catch {
+          toast(`Failed to ${action} ${hostname}`, false);
+        }
+      });
+      td.appendChild(toggleBtn);
+
       // Wake (only when offline)
-      if (!active) {
+      if (!active && !disabled) {
         const btn = document.createElement('button');
-        btn.className = 'wake-btn bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
+        btn.className = 'wake-btn ml-2 bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-sm';
         btn.textContent = 'Wake';
         btn.addEventListener('click', async () => {
           try {
@@ -150,12 +183,13 @@
         tr.querySelector('.cell-ip').textContent   = n.ip || '';
         tr.querySelector('.cell-mac').textContent  = n.mac || '';
         tr.querySelector('.cell-last').textContent = tsToStr(n.last_seen_ts);
+        tr.querySelector('.cell-quarantine').textContent = n.disabled ? (n.quarantine_reason || 'disabled') : '';
 
         const badge = tr.querySelector('.cell-status .badge');
-        setBadge(badge, !!n.active);
+        setBadge(badge, !!n.active, !!n.disabled);
 
         const actions = tr.querySelector('.cell-actions');
-        setActions(actions, host, !!n.active);
+        setActions(actions, host, !!n.active, !!n.disabled);
       }
 
       body.querySelectorAll('tr[data-host]').forEach(tr => {
@@ -176,6 +210,20 @@
       if (r.ok) toast(`Sent WOL to ${j.sent ?? 0} nodes`);
       else toast(j.error || 'Wake All failed', false);
     } catch { toast('Wake All failed', false); }
+  });
+  document.getElementById('reboot-all').addEventListener('click', async () => {
+    if (!confirm('Reboot all active enabled worker nodes?\n\nThe manager host is excluded.')) return;
+    try {
+      const r = await fetch('/nodes/reboot_all', { method: 'POST' });
+      const j = await r.json().catch(()=>({}));
+      const failed = Array.isArray(j.failed) ? j.failed.length : 0;
+      if (r.ok || r.status === 207) {
+        toast(`Reboot accepted by ${j.accepted ?? 0}/${j.requested ?? 0} nodes${failed ? `; ${failed} failed` : ''}`, failed === 0);
+        if (failed) console.warn('Reboot All failures', j.failed);
+      } else {
+        toast(j.error || 'Reboot All failed', false);
+      }
+    } catch { toast('Reboot All failed', false); }
   });
 
   loadNodes();

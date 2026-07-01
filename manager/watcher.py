@@ -410,7 +410,7 @@ def submit_job_if_stable(path: str, store: FileProcessedStore):
             store.add(rel, final_sig)
             logger.info(f"Skipping legacy processed file during migration: {rel}")
             return
-        payload = {"filename": rel}
+        payload = {"filename": rel, "input_path": path}
         logger.info(f"Submitting job for {rel}")
         r = _session.post(SUBMIT_URL, json=payload, timeout=20)
         if r.ok:

@@ -1,5 +1,5 @@
 [Unit]
-Description=Thinvids automatic DVD rip for /dev/%I
+Description=Thinvids automatic optical-disc rip for /dev/%I
 After=local-fs.target network-online.target
 Wants=network-online.target
 ConditionPathExists=/dev/%I

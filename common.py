@@ -26,6 +26,7 @@ REDIS_HOST = ENV("REDIS_HOST", "swarm3")
 REDIS_PORT = int(ENV("REDIS_PORT", "6379"))
 REDIS_DB_TASKS = int(ENV("REDIS_DB_TASKS", "0"))  # Huey broker
 REDIS_DB_DATA  = int(ENV("REDIS_DB_DATA",  "1"))  # App/job state
+HUEY_NAME = ENV("HUEY_NAME", "tasks")
 
 @lru_cache(maxsize=None)
 def get_redis() -> redis.Redis:
@@ -46,7 +47,7 @@ from huey import RedisHuey
 @lru_cache(maxsize=None)
 def get_huey() -> RedisHuey:
     return RedisHuey(
-        'tasks',
+        HUEY_NAME,
         host=REDIS_HOST,
         port=REDIS_PORT,
         db=REDIS_DB_TASKS,
@@ -165,6 +166,7 @@ ACTIVITY_JOB_LOG_MAX = int(ENV("ACTIVITY_JOB_LOG_MAX", "50000"))
 DEFAULT_SETTINGS = {
     "suspend_enabled": "0",
     "suspend_idle_sec": "300",
+    "suspend_idle_cpu_pct_max": "15",
     "suspend_gc_enabled": "0",
     "max_source_file_size_gb": "15",
     "av1_check_enabled": "1",
@@ -211,16 +213,27 @@ def get_settings() -> Dict:
 
     return settings
 
+def is_base_job_key(key: str) -> bool:
+    key = (key or "").strip()
+    return key.startswith("job:") and ":" not in key[4:]
+
 def all_jobs_are_idle() -> bool:
 
     redis_client = get_redis()
-    
+
     active = [Status.RUNNING, Status.WAITING, Status.STARTING]
 
     # Pull indexed job keys; seed from keyspace if empty
-    keys = list(redis_client.smembers("jobs:all") or [])
+    raw_keys = list(redis_client.smembers("jobs:all") or [])
+    keys = [k for k in raw_keys if is_base_job_key(k)]
+    invalid_keys = [k for k in raw_keys if not is_base_job_key(k)]
+    if invalid_keys:
+        try:
+            redis_client.srem("jobs:all", *invalid_keys)
+        except Exception:
+            pass
     if not keys:
-        keys = [k for k in redis_client.scan_iter("job:*", count=1000)]
+        keys = [k for k in redis_client.scan_iter("job:*", count=1000) if is_base_job_key(k)]
         if keys:
             try:
                 redis_client.sadd("jobs:all", *keys)

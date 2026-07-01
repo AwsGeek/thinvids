@@ -30,6 +30,10 @@
             <span class="material-icons">folder_open</span>
             Browse
             </button>
+            <button id="open-watcher" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
+            <span class="material-icons">visibility</span>
+            Watcher
+            </button>
             <button id="open-metrics" class="flex items-center gap-1 bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-2 rounded">
             <span class="material-icons">show_chart</span>
             Metrics
@@ -64,6 +68,12 @@
           <label for="gs-idle-seconds" class="block text-sm font-medium mb-1">Idle time before suspend (seconds)</label>
           <input id="gs-idle-seconds" type="number" min="30" step="10" class="border p-2 rounded w-full">
           <p class="text-xs text-gray-600 mt-1">Minimum 30 seconds.</p>
+        </div>
+
+        <div>
+          <label for="gs-idle-cpu-pct-max" class="block text-sm font-medium mb-1">Idle CPU threshold (%)</label>
+          <input id="gs-idle-cpu-pct-max" type="number" min="1" max="100" step="0.5" class="border p-2 rounded w-full">
+          <p class="text-xs text-gray-600 mt-1">Workers can suspend when CPU is at or below this value.</p>
         </div>
 
         <div class="flex items-center gap-2">
@@ -157,6 +167,7 @@
 
       const chkEnabled = document.getElementById('gs-suspend-enabled');
       const numIdle    = document.getElementById('gs-idle-seconds');
+      const numIdleCpu = document.getElementById('gs-idle-cpu-pct-max');
       const chkGC      = document.getElementById('gs-gc-enabled');
       const numMaxSize = document.getElementById('gs-max-source-size-gb');
       const chkAv1     = document.getElementById('gs-av1-check-enabled');
@@ -189,6 +200,7 @@
           const d = await r.json();
           chkEnabled.checked = asBool(d.suspend_enabled);
           numIdle.value = Number(d.suspend_idle_sec ?? 300);
+          numIdleCpu.value = Number(d.suspend_idle_cpu_pct_max ?? 15);
           chkGC.checked = asBool(d.suspend_gc_enabled);
           numMaxSize.value = Number(d.max_source_file_size_gb ?? 15);
           chkAv1.checked = asBool(d.av1_check_enabled ?? true);
@@ -207,6 +219,7 @@
           const payload = {
             suspend_enabled: !!chkEnabled.checked,
             suspend_idle_sec: Math.max(30, parseInt(numIdle.value || 300, 10)),
+            suspend_idle_cpu_pct_max: Math.min(100, Math.max(1, Number(numIdleCpu.value || 15))),
             suspend_gc_enabled: !!chkGC.checked,
             max_source_file_size_gb: Math.max(1, Number(numMaxSize.value || 15)),
             av1_check_enabled: !!chkAv1.checked,
@@ -242,6 +255,7 @@
       hook('open-home','/');
       hook('open-nodes','/nodes');
       hook('open-browse','/browse');
+      hook('open-watcher','/watcher');
       hook('open-metrics','/metrics');
     });
   </script>

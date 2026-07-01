@@ -38,11 +38,19 @@ udevadm settle || true
 sleep "${THINVIDS_DVD_START_DELAY_SEC:-8}"
 
 MEDIA_DVD="$(read_udev_property ID_CDROM_MEDIA_DVD || true)"
+MEDIA_BD="$(read_udev_property ID_CDROM_MEDIA_BD || true)"
 MEDIA_STATE="$(read_udev_property ID_CDROM_MEDIA_STATE || true)"
 DISC_LABEL="$(read_udev_property ID_FS_LABEL || true)"
 
-if [[ "${MEDIA_DVD}" != "1" ]]; then
-  log "Skipping ${DEVICE_PATH}; inserted media is not a DVD."
+MEDIA_KIND=""
+if [[ "${MEDIA_DVD}" == "1" ]]; then
+  MEDIA_KIND="DVD"
+elif [[ "${MEDIA_BD}" == "1" ]]; then
+  MEDIA_KIND="Blu-ray"
+fi
+
+if [[ -z "${MEDIA_KIND}" ]]; then
+  log "Skipping ${DEVICE_PATH}; inserted media is not DVD/Blu-ray video."
   exit 0
 fi
 
@@ -92,5 +100,5 @@ if [[ "${THINVIDS_DVD_DEBUG:-0}" == "1" ]]; then
   cmd+=(--debug)
 fi
 
-log "Starting automatic DVD rip for ${DEVICE_PATH}${DISC_LABEL:+ (label=${DISC_LABEL})} using ${RIP_SCRIPT}"
+log "Starting automatic ${MEDIA_KIND} rip for ${DEVICE_PATH}${DISC_LABEL:+ (label=${DISC_LABEL})} using ${RIP_SCRIPT}"
 "${cmd[@]}"

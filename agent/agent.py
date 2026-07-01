@@ -19,7 +19,7 @@ AGENT_MAC   = os.getenv("AGENT_MAC", "").strip()    # if set, use this MAC as-is
 # --- Local defaults for suspend/idle behavior (can be overridden by global settings) ---
 SUSPEND_ENABLED           = str(os.getenv("SUSPEND_ENABLED", "1")).lower() in ("1", "true", "yes", "on")
 SUSPEND_AFTER_IDLE_SEC    = int(os.getenv("SUSPEND_AFTER_IDLE_SEC", "300"))  # default 5 minutes
-IDLE_CPU_PCT_MAX          = float(os.getenv("IDLE_CPU_PCT_MAX", "10"))       # <= 10% CPU considered idle
+IDLE_CPU_PCT_MAX          = float(os.getenv("IDLE_CPU_PCT_MAX", "15"))       # <= 15% CPU considered idle
 IDLE_GPU_PCT_MAX          = float(os.getenv("IDLE_GPU_PCT_MAX", "10"))       # <= 10% GPU considered idle
 MIN_UPTIME_BEFORE_SUSPEND = int(os.getenv("MIN_UPTIME_BEFORE_SUSPEND", "300"))# don't suspend within 5 minutes of boot
 
@@ -300,9 +300,15 @@ def _get_global_suspend_settings():
     idle_sec = as_int(settings.get("suspend_idle_sec"), SUSPEND_AFTER_IDLE_SEC)
     if idle_sec <= 0:
         idle_sec = SUSPEND_AFTER_IDLE_SEC
+    try:
+        idle_cpu_pct_max = float(settings.get("suspend_idle_cpu_pct_max", IDLE_CPU_PCT_MAX))
+    except Exception:
+        idle_cpu_pct_max = IDLE_CPU_PCT_MAX
+    if idle_cpu_pct_max <= 0:
+        idle_cpu_pct_max = IDLE_CPU_PCT_MAX
     gc_before = as_bool(settings.get("suspend_gc_enabled"), False)
 
-    return suspend_enabled, idle_sec, gc_before
+    return suspend_enabled, idle_sec, idle_cpu_pct_max, gc_before
 
 
 # ---------------- Main loop: unified metrics + heartbeat (1 Hz) ----------------
@@ -390,7 +396,7 @@ def main():
 
         # ---- Idle detection & suspend (controller-gated) ----
         # Pull global flags (with small cache)
-        g_suspend_enabled, g_idle_sec, g_gc_enabled = _get_global_suspend_settings()
+        g_suspend_enabled, g_idle_sec, g_idle_cpu_pct_max, g_gc_enabled = _get_global_suspend_settings()
 
         # Determine effective enable/threshold (global must allow it; local can further restrict)
         effective_suspend_enabled = bool(g_suspend_enabled)
@@ -398,7 +404,7 @@ def main():
 
         # Consider idle if CPU and GPU are both below thresholds (GPU may be absent)
         gpu_idle = (gpu is None) or (gpu_val <= IDLE_GPU_PCT_MAX)
-        is_idle  = (cpu <= IDLE_CPU_PCT_MAX) and gpu_idle
+        is_idle  = (cpu <= g_idle_cpu_pct_max) and gpu_idle
         is_idle  = all_jobs_are_idle() and is_idle
 
         now = time.time()
@@ -418,8 +424,8 @@ def main():
                     remove_stale_projects(GC_BASE_DIR, min_age_sec=GC_MIN_AGE_SEC)
 
                 logger.info(
-                    "Idle for %ds (cpu=%.1f%%, gpu=%.1f%%), threshold=%ds, suspend_enabled=%s -> suspending",
-                    int(idle_dur), cpu, (gpu_val if gpu is not None else -1), effective_idle_threshold,
+                    "Idle for %ds (cpu=%.1f%% <= %.1f%%, gpu=%.1f%%), threshold=%ds, suspend_enabled=%s -> suspending",
+                    int(idle_dur), cpu, g_idle_cpu_pct_max, (gpu_val if gpu is not None else -1), effective_idle_threshold,
                     effective_suspend_enabled
                 )
                 try:

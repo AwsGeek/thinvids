@@ -1,1 +1,1 @@
-ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA_DVD}=="1", ENV{ID_CDROM_MEDIA_STATE}!="blank", TAG+="systemd", ENV{SYSTEMD_WANTS}+="thinvids-dvd-auto@%k.service"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", ENV{ID_CDROM_MEDIA_STATE}!="blank", TAG+="systemd", ENV{SYSTEMD_WANTS}+="thinvids-dvd-auto@%k.service"

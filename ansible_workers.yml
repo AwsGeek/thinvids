@@ -21,10 +21,12 @@
     redis_port: 6379
     redis_db_tasks: 0
     redis_db_data: 1
+    huey_name: thinvids_tasks
     ttl_sec: 15
     master_http_port: 8000
     vaapi_device: /dev/dri/renderD128
     huey_workers: 1
+    manager_reboot_ssh_key_path: "/home/{{ thinman_user }}/.ssh/id_ed25519"
 
     # OS packages
     base_packages:
@@ -85,6 +87,56 @@
         append: yes
         shell: /bin/bash
         create_home: yes
+
+    - name: Ensure manager SSH directory exists
+      ansible.builtin.file:
+        path: "/home/{{ thinman_user }}/.ssh"
+        state: directory
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0700"
+      delegate_to: "{{ groups['thinman_managers'][0] }}"
+      run_once: true
+
+    - name: Check manager reboot SSH key
+      ansible.builtin.stat:
+        path: "{{ manager_reboot_ssh_key_path }}"
+      delegate_to: "{{ groups['thinman_managers'][0] }}"
+      register: manager_reboot_ssh_key
+      run_once: true
+
+    - name: Create manager reboot SSH key
+      ansible.builtin.command:
+        cmd: "ssh-keygen -t ed25519 -f {{ manager_reboot_ssh_key_path }} -N '' -C thinvids-manager-reboot"
+        creates: "{{ manager_reboot_ssh_key_path }}"
+      become_user: "{{ thinman_user }}"
+      delegate_to: "{{ groups['thinman_managers'][0] }}"
+      run_once: true
+      when: not manager_reboot_ssh_key.stat.exists
+
+    - name: Read manager reboot SSH public key
+      ansible.builtin.slurp:
+        src: "{{ manager_reboot_ssh_key_path }}.pub"
+      delegate_to: "{{ groups['thinman_managers'][0] }}"
+      register: manager_reboot_ssh_public_key
+      run_once: true
+
+    - name: Allow manager SSH key to log in to workers
+      ansible.posix.authorized_key:
+        user: "{{ thinman_user }}"
+        key: "{{ manager_reboot_ssh_public_key.content | b64decode }}"
+        state: present
+        comment: thinvids-manager-reboot
+
+    - name: Allow manager-triggered worker reboot
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/thinvids-worker-reboot
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          {{ thinman_user }} ALL=(root) NOPASSWD: /bin/systemctl reboot, /usr/bin/systemctl reboot
+        validate: "visudo -cf %s"
 
     # --- Directories (mountpoints + app dir) ---
     - name: Create application directory
@@ -266,15 +318,18 @@
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
+          Environment=HUEY_NAME={{ huey_name }}
           Environment=PROJECT_ROOT={{ projects_dir }}
-          Environment=WATCH_ROOT={{ source_media_dir }}
+          Environment=WATCH_ROOT={{ watch_dir }}
           Environment=SOURCE_MEDIA_ROOT={{ source_media_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           Environment=VAAPI_DEVICE={{ vaapi_device }}
+          Environment=PART_FAILURE_MAX_RETRIES=5
           ExecStart={{ app_root }}/venv/bin/huey_consumer tasks.huey -k thread -w {{ huey_workers }} --flush-locks
           Restart=always
+          RestartPreventExitStatus=75
           RestartSec=2
           SyslogIdentifier=thinman-worker
 

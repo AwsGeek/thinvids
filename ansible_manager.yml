@@ -22,7 +22,11 @@
     redis_port: 6379
     redis_db_tasks: 0
     redis_db_data: 1
+    huey_name: thinvids_tasks
     master_http_port: 8000
+    pipeline_max_active_jobs: 2
+    pipeline_drain_ratio_to_start_next: "0.75"
+    pipeline_min_idle_workers_to_start_next: 4
 
     # Manager HTTP port
     manager_http_port: 5005
@@ -37,6 +41,7 @@
       - rsync
       - ffmpeg
       - nfs-common
+      - sudo
 
     # Python packages (in venv)
     pip_packages: [flask, huey, redis, psutil, humanize, gunicorn, requests, watchdog]
@@ -82,6 +87,16 @@
         append: yes
         shell: /bin/bash
         create_home: yes
+
+    - name: Allow manager to control only the watcher service
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/thinvids-manager-watcher-control
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+        content: |
+          {{ thinman_user }} ALL=(root) NOPASSWD: /bin/systemctl start thinvids_watcher.service, /bin/systemctl stop thinvids_watcher.service, /bin/systemctl restart thinvids_watcher.service, /usr/bin/systemctl start thinvids_watcher.service, /usr/bin/systemctl stop thinvids_watcher.service, /usr/bin/systemctl restart thinvids_watcher.service
 
     # --- Directories (mountpoints + app dir) ---
     - name: Create application directory
@@ -148,6 +163,24 @@
         opts: "{{ source_media_opts }}"
         state: mounted
 
+    - name: Ensure watcher env override file exists
+      ansible.builtin.copy:
+        dest: "{{ config_dir }}/watcher.env"
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0644"
+        force: false
+        content: |
+          # Optional thinvids watcher overrides.
+          # The manager Watcher page updates this file and restarts thinvids_watcher.service.
+
+    - name: Ensure watcher env override file ownership
+      ansible.builtin.file:
+        path: "{{ config_dir }}/watcher.env"
+        owner: "{{ thinman_user }}"
+        group: "{{ thinman_group }}"
+        mode: "0644"
+
     # --- venv for manager ---
     - name: Create venv
       command: python3 -m venv {{ app_root }}/venv
@@ -171,7 +204,9 @@
         owner: "{{ thinman_user }}"
         group: "{{ thinman_group }}"
         mode: preserve
-      notify: restart thinvids_manager
+      notify:
+        - restart thinvids_manager
+        - restart thinvids_manager_housekeeping
       tags: build_app # Add a tag here
 
     - name: Install tasks.py from worker tree
@@ -181,7 +216,9 @@
         owner: "{{ thinman_user }}"
         group: "{{ thinman_group }}"
         mode: "0644"
-      notify: restart thinvids_manager
+      notify:
+        - restart thinvids_manager
+        - restart thinvids_manager_housekeeping
       tags: build_app # Add a tag here
 
     - name: Install common.py
@@ -193,6 +230,7 @@
         mode: "0644"
       notify: 
         - restart thinvids_manager 
+        - restart thinvids_manager_housekeeping
         - restart thinvids_watcher
       tags: build_app # Add a tag here
 
@@ -244,12 +282,19 @@
           Environment=REDIS_PORT={{ redis_port }}
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
-          Environment=WATCH_ROOT={{ source_media_dir }}
+          Environment=HUEY_NAME={{ huey_name }}
+          Environment=CONFIG_ROOT={{ config_dir }}
+          Environment=WATCH_ROOT={{ watch_dir }}
           Environment=SOURCE_MEDIA_ROOT={{ source_media_dir }}
           Environment=LIBRARY_ROOT={{ library_dir }}
           Environment=PROCESSED_FILE={{ config_dir }}/processed.log
+          Environment=WATCHER_SERVICE=thinvids_watcher.service
+          Environment=WATCHER_ENV_FILE={{ config_dir }}/watcher.env
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
+          Environment=PIPELINE_MAX_ACTIVE_JOBS={{ pipeline_max_active_jobs }}
+          Environment=PIPELINE_DRAIN_RATIO_TO_START_NEXT={{ pipeline_drain_ratio_to_start_next }}
+          Environment=PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT={{ pipeline_min_idle_workers_to_start_next }}
           ExecStart={{ app_root }}/venv/bin/gunicorn -w 2 -t 120 -b 0.0.0.0:{{ manager_http_port }} app:app
           Restart=always
           RestartSec=2
@@ -261,6 +306,51 @@
         - systemd daemon-reload
         - restart thinvids_manager
 
+    - name: thinvids_manager_housekeeping.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/thinvids_manager_housekeeping.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Thinvids Manager Housekeeping
+          After=network-online.target remote-fs.target
+          Wants=network-online.target remote-fs.target
+          RequiresMountsFor={{ watch_dir }} {{ library_dir }} {{ config_dir }} {{ source_media_dir }}
+
+          [Service]
+          Type=simple
+          User={{ thinman_user }}
+          Group={{ thinman_group }}
+          WorkingDirectory={{ app_root }}/current
+          Environment=PYTHONPATH={{ app_root }}/current
+          Environment=REDIS_HOST={{ redis_host }}
+          Environment=REDIS_PORT={{ redis_port }}
+          Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
+          Environment=REDIS_DB_DATA={{ redis_db_data }}
+          Environment=HUEY_NAME={{ huey_name }}
+          Environment=CONFIG_ROOT={{ config_dir }}
+          Environment=WATCH_ROOT={{ watch_dir }}
+          Environment=SOURCE_MEDIA_ROOT={{ source_media_dir }}
+          Environment=LIBRARY_ROOT={{ library_dir }}
+          Environment=PROCESSED_FILE={{ config_dir }}/processed.log
+          Environment=WATCHER_SERVICE=thinvids_watcher.service
+          Environment=WATCHER_ENV_FILE={{ config_dir }}/watcher.env
+          Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
+          Environment=MASTER_HTTP_PORT={{ master_http_port }}
+          Environment=PIPELINE_MAX_ACTIVE_JOBS={{ pipeline_max_active_jobs }}
+          Environment=PIPELINE_DRAIN_RATIO_TO_START_NEXT={{ pipeline_drain_ratio_to_start_next }}
+          Environment=PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT={{ pipeline_min_idle_workers_to_start_next }}
+          ExecStart={{ app_root }}/venv/bin/python housekeeping.py
+          Restart=always
+          RestartSec=2
+          SyslogIdentifier=thinvids_manager_housekeeping
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - systemd daemon-reload
+        - restart thinvids_manager_housekeeping
+
     - name: Reload systemd (ensure unit visible before first start)
       ansible.builtin.systemd:
         daemon_reload: yes
@@ -268,6 +358,12 @@
     - name: Enable & start thinvids_manager
       ansible.builtin.systemd:
         name: thinvids_manager
+        enabled: true
+        state: started
+
+    - name: Enable & start thinvids_manager_housekeeping
+      ansible.builtin.systemd:
+        name: thinvids_manager_housekeeping
         enabled: true
         state: started
 
@@ -307,23 +403,24 @@
           Description=Thinvids Watcher (submit new files to manager)
           After=network-online.target remote-fs.target thinvids_manager.service
           Wants=network-online.target remote-fs.target thinvids_manager.service
-          RequiresMountsFor={{ source_media_dir }} {{ config_dir }}
+          RequiresMountsFor={{ watch_dir }} {{ config_dir }}
 
           [Service]
           Type=simple
           User={{ thinman_user }}
           Group={{ thinman_group }}
           WorkingDirectory={{ app_root }}/current
-          Environment=WATCH_ROOT={{ source_media_dir }}
+          Environment=WATCH_ROOT={{ watch_dir }}
           Environment=CONFIG_ROOT={{ config_dir }}
           Environment=PROCESSED_FILE={{ config_dir }}/processed.log
           Environment=ADOPT_EXISTING_PROCESSED_ON_STARTUP=1
-          Environment=ADOPT_EXISTING_PROCESSED_MARKER={{ config_dir }}/processed.log.source_media.adopted
+          Environment=ADOPT_EXISTING_PROCESSED_MARKER={{ config_dir }}/processed.log.watch.adopted
           Environment=PROCESSED_PATH_ALIASES=tv=television
           Environment=MANAGER_HTTP_PORT={{ manager_http_port }}
+          EnvironmentFile=-{{ config_dir }}/watcher.env
           # Optional tunables:
-          # Environment=STABILIZE_CHECKS=5
-          # Environment=STABILIZE_DELAY=10
+          # Environment=STABLE_CHECKS=5
+          # Environment=STABLE_DELAY_SEC=10
           ExecStart={{ app_root }}/venv/bin/python watcher.py
           Restart=always
           RestartSec=3
@@ -353,6 +450,11 @@
     - name: restart thinvids_manager
       ansible.builtin.systemd:
         name: thinvids_manager
+        state: restarted
+
+    - name: restart thinvids_manager_housekeeping
+      ansible.builtin.systemd:
+        name: thinvids_manager_housekeeping
         state: restarted
 
     - name: restart thinvids_watcher

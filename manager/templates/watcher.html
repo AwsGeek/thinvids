@@ -1,0 +1,279 @@
+{% extends "base.html" %}
+{% block title %}Watcher | Trans the Vids!{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+  <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+    <div>
+      <h1 class="text-2xl font-bold">Watcher</h1>
+      <p class="text-sm text-gray-600">Monitor the manager-node watcher, review activity, and safely apply watcher configuration.</p>
+    </div>
+    <div class="flex flex-wrap gap-2">
+      <button id="refresh-btn" class="bg-gray-700 hover:bg-gray-800 text-white px-3 py-2 rounded flex items-center gap-1">
+        <span class="material-icons text-sm">refresh</span>
+        Refresh
+      </button>
+      <button data-action="start" class="watcher-action bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded">Start</button>
+      <button data-action="stop" class="watcher-action bg-red-600 hover:bg-red-700 text-white px-3 py-2 rounded">Stop</button>
+      <button data-action="restart" class="watcher-action bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded">Restart</button>
+    </div>
+  </div>
+
+  <div id="status-alert" class="hidden rounded border px-4 py-3 text-sm"></div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <section class="bg-white rounded shadow p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-lg">Service</h2>
+        <span id="service-badge" class="px-2 py-1 rounded text-xs font-semibold bg-gray-200 text-gray-700">Loading</span>
+      </div>
+      <dl class="text-sm space-y-2">
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Node</dt><dd id="service-host" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Unit</dt><dd id="service-name" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Enabled</dt><dd id="service-enabled" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Main PID</dt><dd id="service-pid" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Restarts</dt><dd id="service-restarts" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Active since</dt><dd id="service-active-since" class="font-mono text-right"></dd></div>
+      </dl>
+    </section>
+
+    <section class="bg-white rounded shadow p-4">
+      <h2 class="font-semibold text-lg mb-3">Watch Root</h2>
+      <dl class="text-sm space-y-2">
+        <div><dt class="text-gray-600">Path</dt><dd id="root-path" class="font-mono break-all"></dd></div>
+        <div><dt class="text-gray-600">Real path</dt><dd id="root-realpath" class="font-mono break-all"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Exists</dt><dd id="root-exists" class="font-mono text-right"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Free</dt><dd id="root-free" class="font-mono text-right"></dd></div>
+        <div><dt class="text-gray-600">Mount source</dt><dd id="root-source" class="font-mono break-all"></dd></div>
+      </dl>
+    </section>
+
+    <section class="bg-white rounded shadow p-4">
+      <h2 class="font-semibold text-lg mb-3">Configuration File</h2>
+      <dl class="text-sm space-y-2">
+        <div><dt class="text-gray-600">Path</dt><dd id="env-path" class="font-mono break-all"></dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-gray-600">Exists</dt><dd id="env-exists" class="font-mono text-right"></dd></div>
+      </dl>
+      <p class="text-xs text-gray-500 mt-3">Changes are written to the watcher env file and take effect after restart.</p>
+    </section>
+  </div>
+
+  <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+    <section class="bg-white rounded shadow p-4">
+      <h2 class="font-semibold text-lg mb-3">Configure Watcher</h2>
+      <form id="watcher-form" class="space-y-4" onsubmit="return false;">
+        <div>
+          <label for="cfg-WATCH_ROOT" class="block text-sm font-medium mb-1">Watch root</label>
+          <select id="cfg-WATCH_ROOT" class="border p-2 rounded w-full"></select>
+          <p class="text-xs text-gray-500 mt-1">Limited to known media roots for safety.</p>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <label class="flex items-center gap-2 text-sm"><input id="cfg-USE_WATCHDOG" type="checkbox" class="h-4 w-4">Watchdog events</label>
+          <label class="flex items-center gap-2 text-sm"><input id="cfg-USE_SCANNER" type="checkbox" class="h-4 w-4">Periodic scanner</label>
+          <label class="flex items-center gap-2 text-sm"><input id="cfg-ADOPT_EXISTING_PROCESSED_ON_STARTUP" type="checkbox" class="h-4 w-4">Adopt existing files on startup</label>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label for="cfg-SCAN_INTERVAL_SEC" class="block text-sm font-medium mb-1">Scanner interval seconds</label>
+            <input id="cfg-SCAN_INTERVAL_SEC" type="number" min="5" max="86400" class="border p-2 rounded w-full">
+          </div>
+          <div>
+            <label for="cfg-STABLE_CHECKS" class="block text-sm font-medium mb-1">Stable checks</label>
+            <input id="cfg-STABLE_CHECKS" type="number" min="1" max="60" class="border p-2 rounded w-full">
+          </div>
+          <div>
+            <label for="cfg-STABLE_DELAY_SEC" class="block text-sm font-medium mb-1">Stable delay seconds</label>
+            <input id="cfg-STABLE_DELAY_SEC" type="number" min="1" max="600" class="border p-2 rounded w-full">
+          </div>
+          <div>
+            <label for="cfg-WORKERS" class="block text-sm font-medium mb-1">Watcher workers</label>
+            <input id="cfg-WORKERS" type="number" min="1" max="32" class="border p-2 rounded w-full">
+          </div>
+        </div>
+
+        <div>
+          <label for="cfg-PROCESSED_PATH_ALIASES" class="block text-sm font-medium mb-1">Processed path aliases</label>
+          <input id="cfg-PROCESSED_PATH_ALIASES" class="border p-2 rounded w-full font-mono text-sm" placeholder="tv=television,series=television">
+        </div>
+
+        <label class="flex items-center gap-2 text-sm">
+          <input id="restart-after-save" type="checkbox" class="h-4 w-4" checked>
+          Restart watcher after saving
+        </label>
+
+        <div class="flex gap-2">
+          <button id="save-config-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save Configuration</button>
+          <button id="reset-form-btn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded">Reset Form</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="bg-white rounded shadow p-4">
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <h2 class="font-semibold text-lg">Watcher Activity</h2>
+        <span id="activity-count" class="text-xs text-gray-500"></span>
+      </div>
+      <div id="activity-error" class="hidden text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3"></div>
+      <pre id="activity-log" class="bg-gray-900 text-green-100 rounded p-3 text-xs overflow-auto h-96 whitespace-pre-wrap"></pre>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  let lastSnapshot = null;
+
+  const $ = (id) => document.getElementById(id);
+  const truthy = (v) => ['1','true','yes','on'].includes(String(v ?? '').toLowerCase());
+  const setText = (id, value) => { const el = $(id); if (el) el.textContent = value ?? ''; };
+
+  function showAlert(message, ok=true){
+    const el = $('status-alert');
+    el.className = `rounded border px-4 py-3 text-sm ${ok ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`;
+    el.textContent = message;
+    el.classList.remove('hidden');
+  }
+
+  function badgeClass(active){
+    if (active === 'active') return 'px-2 py-1 rounded text-xs font-semibold bg-green-100 text-green-800';
+    if (active === 'inactive') return 'px-2 py-1 rounded text-xs font-semibold bg-gray-200 text-gray-700';
+    if (active === 'failed') return 'px-2 py-1 rounded text-xs font-semibold bg-red-100 text-red-800';
+    return 'px-2 py-1 rounded text-xs font-semibold bg-yellow-100 text-yellow-800';
+  }
+
+  function populateRootOptions(snapshot){
+    const select = $('cfg-WATCH_ROOT');
+    if (!select) return;
+    const current = snapshot.config?.WATCH_ROOT || '';
+    select.innerHTML = '';
+    for (const root of snapshot.known_roots || []){
+      const option = document.createElement('option');
+      option.value = root.path;
+      option.textContent = `${root.label} (${root.path})`;
+      option.selected = root.path === current;
+      select.appendChild(option);
+    }
+  }
+
+  function render(snapshot){
+    lastSnapshot = snapshot;
+    const service = snapshot.service || {};
+    const props = service.properties || {};
+    const active = service.active || props.ActiveState || 'unknown';
+    const badge = $('service-badge');
+    badge.textContent = active;
+    badge.className = badgeClass(active);
+
+    setText('service-host', service.hostname || '');
+    setText('service-name', service.service_name || '');
+    setText('service-enabled', service.enabled || '');
+    setText('service-pid', props.MainPID && props.MainPID !== '0' ? props.MainPID : '');
+    setText('service-restarts', props.NRestarts || '0');
+    setText('service-active-since', props.ActiveEnterTimestamp || '');
+
+    const root = snapshot.watch_root || {};
+    setText('root-path', root.path || '');
+    setText('root-realpath', root.realpath || '');
+    setText('root-exists', root.exists ? (root.is_dir ? 'directory' : 'yes') : 'no');
+    setText('root-free', root.free_label ? `${root.free_label} / ${root.total_label}` : '');
+    setText('root-source', root.mount?.source || '');
+
+    setText('env-path', snapshot.env_file?.path || '');
+    setText('env-exists', snapshot.env_file?.exists ? 'yes' : 'no');
+
+    populateRootOptions(snapshot);
+    const cfg = snapshot.config || {};
+    for (const key of ['USE_WATCHDOG','USE_SCANNER','ADOPT_EXISTING_PROCESSED_ON_STARTUP']){
+      const el = $(`cfg-${key}`);
+      if (el) el.checked = truthy(cfg[key]);
+    }
+    for (const key of ['SCAN_INTERVAL_SEC','STABLE_CHECKS','STABLE_DELAY_SEC','WORKERS','PROCESSED_PATH_ALIASES']){
+      const el = $(`cfg-${key}`);
+      if (el) el.value = cfg[key] ?? '';
+    }
+
+    const activity = snapshot.activity || {};
+    const lines = activity.lines || [];
+    setText('activity-count', `${lines.length} lines`);
+    setText('activity-log', lines.join('\n'));
+    const activityError = $('activity-error');
+    if (activity.error){
+      activityError.textContent = activity.error;
+      activityError.classList.remove('hidden');
+    } else {
+      activityError.classList.add('hidden');
+    }
+  }
+
+  async function load(){
+    const r = await fetch('/watcher/status');
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.message || data.error || 'Failed to load watcher status');
+    render(data);
+  }
+
+  function formPayload(){
+    return {
+      WATCH_ROOT: $('cfg-WATCH_ROOT').value,
+      USE_WATCHDOG: $('cfg-USE_WATCHDOG').checked,
+      USE_SCANNER: $('cfg-USE_SCANNER').checked,
+      ADOPT_EXISTING_PROCESSED_ON_STARTUP: $('cfg-ADOPT_EXISTING_PROCESSED_ON_STARTUP').checked,
+      SCAN_INTERVAL_SEC: $('cfg-SCAN_INTERVAL_SEC').value,
+      STABLE_CHECKS: $('cfg-STABLE_CHECKS').value,
+      STABLE_DELAY_SEC: $('cfg-STABLE_DELAY_SEC').value,
+      WORKERS: $('cfg-WORKERS').value,
+      PROCESSED_PATH_ALIASES: $('cfg-PROCESSED_PATH_ALIASES').value,
+      restart: $('restart-after-save').checked,
+    };
+  }
+
+  async function postJson(url, payload){
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.message || data.action?.stderr || data.error || 'Request failed');
+    if (data.snapshot) render(data.snapshot);
+    return data;
+  }
+
+  $('refresh-btn')?.addEventListener('click', async () => {
+    try { await load(); showAlert('Watcher status refreshed.'); }
+    catch (err) { showAlert(err.message, false); }
+  });
+
+  $('save-config-btn')?.addEventListener('click', async () => {
+    try {
+      await postJson('/watcher/config', formPayload());
+      showAlert('Watcher configuration saved.');
+    } catch (err) {
+      showAlert(err.message, false);
+    }
+  });
+
+  $('reset-form-btn')?.addEventListener('click', () => {
+    if (lastSnapshot) render(lastSnapshot);
+  });
+
+  document.querySelectorAll('.watcher-action').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const action = button.dataset.action;
+      try {
+        await postJson('/watcher/control', {action});
+        showAlert(`Watcher ${action} command completed.`);
+      } catch (err) {
+        showAlert(err.message, false);
+      }
+    });
+  });
+
+  load().catch((err) => showAlert(err.message, false));
+})();
+</script>
+{% endblock %}

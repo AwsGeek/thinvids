@@ -19,6 +19,8 @@ import shutil
 import socket
 import logging
 import subprocess
+import select
+import sys
 import threading
 from math import ceil
 from typing import List, Tuple, Optional
@@ -28,6 +30,11 @@ from common import ENV, Status, get_huey, get_redis, get_logging, emit_activity
 huey = get_huey()
 redis = get_redis()
 logger = get_logging("worker")
+WORKER_NAME = ENV("HOSTNAME") or socket.gethostname()
+DISABLED_NODES_KEY = "nodes:disabled"
+if redis.sismember(DISABLED_NODES_KEY, WORKER_NAME):
+    logger.error("Worker node %s is disabled/quarantined; refusing to start Huey consumer.", WORKER_NAME)
+    sys.exit(75)
 
 # Filesystem layout
 PROJECT_ROOT = ENV("PROJECT_ROOT", "/projects")
@@ -57,6 +64,11 @@ SCALE_FILTER_1080 = ENV("VEM_SCALE_FILTER_1080", "scale=-2:1080,format=nv12,hwup
 VAAPI_RC_MODE = ENV("VEM_RC_MODE", "CQP")
 VAAPI_QP      = ENV("VEM_QP", "27")
 AUDIO_ARGS    = ENV("VEM_AUDIO_ARGS", "-c:a aac -ac 2 -b:a 192k")  # space-separated
+DIRECT_SOURCE_REQUIRED_CODECS = {"vc1", "vc-1", "wmv3"}
+PART_FAILURE_MAX_RETRIES = int(ENV("PART_FAILURE_MAX_RETRIES", "5"))
+SEGMENT_IO_IDLE_TIMEOUT_SEC = max(30, int(ENV("SEGMENT_IO_IDLE_TIMEOUT_SEC", "900")))
+FFPROBE_TIMEOUT_SEC = max(10, int(ENV("FFPROBE_TIMEOUT_SEC", "120")))
+JOB_HEARTBEAT_INTERVAL_SEC = max(2.0, float(ENV("JOB_HEARTBEAT_INTERVAL_SEC", "15")))
 
 # Parts planning (used only as fallback if manager didn't hint)
 PARTS_PER_WORKER = int(ENV("PARTS_PER_WORKER", "4"))
@@ -70,6 +82,8 @@ DEFAULT_TARGET_SEGMENT_BYTES = max(1, int(DEFAULT_TARGET_SEGMENT_MB * 1024 * 102
 
 def _job_key(job_id: str) -> str:
     return f"job:{job_id}"
+
+_JOB_HEARTBEAT_CACHE: dict[str, float] = {}
 
 def _job_title(job):
     filename = (job.get("filename") or "").strip()
@@ -87,6 +101,45 @@ def _elapsed_ms(started_at):
     except Exception:
         return 0
 
+def _job_heartbeat(job_id: str, stage: str, *, force: bool = False, note: str = "") -> None:
+    now = _now()
+    stage = str(stage or "").strip() or "unknown"
+    last = _JOB_HEARTBEAT_CACHE.get(job_id, 0.0)
+    if not force and (now - last) < JOB_HEARTBEAT_INTERVAL_SEC:
+        return
+    mapping = {
+        "last_heartbeat_at": str(now),
+        "last_heartbeat_stage": stage,
+        "last_heartbeat_host": WORKER_NAME,
+    }
+    if note:
+        mapping["last_heartbeat_note"] = str(note)[:500]
+    try:
+        redis.hset(_job_key(job_id), mapping=mapping)
+        _JOB_HEARTBEAT_CACHE[job_id] = now
+    except Exception:
+        pass
+
+def _quarantine_current_node(reason: str, *, job_id: str | None = None, part_idx: int | None = None) -> None:
+    worker_name = WORKER_NAME
+    now = _now()
+    try:
+        redis.sadd(DISABLED_NODES_KEY, worker_name)
+        redis.hset(f"node:quarantine:{worker_name}", mapping={
+            "hostname": worker_name,
+            "reason": str(reason or "")[:1000],
+            "job_id": job_id or "",
+            "part_idx": "" if part_idx is None else str(part_idx),
+            "quarantined_at": now,
+        })
+        redis.delete(f"metrics:node:{worker_name}")
+    except Exception:
+        logger.exception("Failed to quarantine worker node %s", worker_name)
+
+def _stop_quarantined_worker() -> None:
+    logger.error("Worker node %s is quarantined; exiting without restart.", WORKER_NAME)
+    os._exit(75)
+
 def _ensure_dirs(*paths: str):
     for p in paths:
         os.makedirs(p, exist_ok=True)
@@ -100,6 +153,7 @@ def _active_nodes() -> List[str]:
     """
     cutoff = int(_now()) - (METRICS_TTL_SEC + METRICS_GRACE_SEC)
     mac_map = redis.hgetall("nodes:mac") or {}
+    disabled = set(redis.smembers("nodes:disabled") or [])
     hosts = list(mac_map.keys())
     if not hosts:
         return []
@@ -115,7 +169,7 @@ def _active_nodes() -> List[str]:
             t = int(float(ts or 0))
         except Exception:
             t = 0
-        if t >= cutoff:
+        if t >= cutoff and h not in disabled:
             actives.append(h)
     actives.sort()
     return actives
@@ -128,27 +182,58 @@ def _bsf_for_codec(codec: str) -> str:
         return 'hevc_mp4toannexb'
     return ""
 
-def _ffprobe_duration(input_path: str) -> float:
-    try:
-        out = subprocess.check_output(
-            ['ffprobe','-v','error','-show_entries','format=duration',
-             '-of','default=noprint_wrappers=1:nokey=1', input_path],
-            text=True
-        ).strip()
-        return float(out)
-    except Exception:
-        return 0.0
+def _requires_direct_source_codec(codec: str) -> bool:
+    return (codec or "").strip().lower() in DIRECT_SOURCE_REQUIRED_CODECS
 
-def _ffprobe_stream0(input_path: str):
+def _run_ffprobe(args: list[str]) -> Tuple[str, str, bool]:
     try:
-        probe = subprocess.check_output([
-            'ffprobe','-v','error',
-            '-select_streams','v:0',
-            '-show_entries','stream=codec_name,width,height,avg_frame_rate,nb_frames',
-            '-show_entries','format=size,bit_rate',
-            '-of','json', input_path
-        ], text=True)
-        data = json.loads(probe)
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=FFPROBE_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ("", f"ffprobe timed out after {FFPROBE_TIMEOUT_SEC}s", True)
+    except Exception as exc:
+        return ("", str(exc), False)
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if detail:
+            detail = detail[-600:]
+        return ("", f"ffprobe rc={completed.returncode}{(': ' + detail) if detail else ''}", False)
+    return (completed.stdout or "", "", False)
+
+def _ffprobe_duration_details(input_path: str) -> Tuple[float, str, bool]:
+    out, err, timed_out = _run_ffprobe([
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', input_path
+    ])
+    if err:
+        return (0.0, err, timed_out)
+    try:
+        return (float((out or '').strip()), "", False)
+    except Exception as exc:
+        return (0.0, f"ffprobe duration parse failed: {exc}", False)
+
+def _ffprobe_duration(input_path: str) -> float:
+    duration, _, _ = _ffprobe_duration_details(input_path)
+    return duration
+
+def _ffprobe_stream0_details(input_path: str) -> Tuple[dict, str, bool]:
+    out, err, timed_out = _run_ffprobe([
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name,width,height,avg_frame_rate,nb_frames',
+        '-show_entries', 'format=size,bit_rate',
+        '-of', 'json', input_path
+    ])
+    if err:
+        return ({"codec":"","width":0,"height":0,"fps":0.0,"nb_frames":0,"size":0,"bit_rate":0}, err, timed_out)
+    try:
+        data = json.loads(out)
         v = (data.get('streams') or [{}])[0]
         fmt = data.get('format', {}) or {}
         afr = v.get('avg_frame_rate') or '0'
@@ -164,7 +249,7 @@ def _ffprobe_stream0(input_path: str):
                 fps = float(afr)
             except Exception:
                 fps = 0.0
-        return {
+        return ({
             "codec":  v.get('codec_name') or '',
             "width":  int(v.get('width') or 0),
             "height": int(v.get('height') or 0),
@@ -172,9 +257,13 @@ def _ffprobe_stream0(input_path: str):
             "nb_frames": int(v.get('nb_frames') or 0),
             "size":   int(fmt.get('size') or 0),
             "bit_rate": int(fmt.get('bit_rate') or 0),
-        }
-    except Exception:
-        return {"codec":"","width":0,"height":0,"fps":0.0,"nb_frames":0,"size":0,"bit_rate":0}
+        }, "", False)
+    except Exception as exc:
+        return ({"codec":"","width":0,"height":0,"fps":0.0,"nb_frames":0,"size":0,"bit_rate":0}, f"ffprobe stream parse failed: {exc}", False)
+
+def _ffprobe_stream0(input_path: str):
+    meta, _, _ = _ffprobe_stream0_details(input_path)
+    return meta
 
 def _job_project_root(job_id: str, job=None) -> str:
     if job is None:
@@ -272,6 +361,10 @@ def _reset_job_run_state(job_id: str, job=None):
             'processing_mode_effective': '',
             'processing_mode_reason': '',
             'direct_segment_duration': '',
+            'last_heartbeat_at': 0,
+            'last_heartbeat_stage': '',
+            'last_heartbeat_host': '',
+            'last_heartbeat_note': '',
             'ended_at': 0,
         })
         redis.delete(f"job_done_parts:{job_id}")
@@ -408,6 +501,18 @@ def _source_english_subtitle_streams(src_path: str) -> list[dict]:
             english_streams.append(stream)
     return english_streams
 
+def _subtitle_codec_mkv_copy_safe(codec_name: str) -> bool:
+    codec = str(codec_name or "").strip().lower()
+    return codec in {
+        "ass",
+        "ssa",
+        "subrip",
+        "srt",
+        "webvtt",
+        "hdmv_pgs_subtitle",
+        "dvd_subtitle",
+    }
+
 def _as_bool(value, default=False) -> bool:
     if value is None:
         return default
@@ -482,6 +587,8 @@ def _host_from_endpoint(endpoint: str) -> str:
 def _resolve_processing_mode(job_id: str, job, source_size_b: int) -> Tuple[str, str]:
     input_path = os.path.realpath((job.get("input_path") or "").strip())
     source_root = os.path.realpath(SOURCE_MEDIA_ROOT)
+    if _requires_direct_source_codec(str(job.get("source_codec") or "")):
+        return "direct", "codec_requires_direct_source"
     if (
         str(job.get("source_origin") or "").strip().lower() == "source_media"
         or (input_path and (input_path == source_root or input_path.startswith(source_root + os.sep)))
@@ -663,21 +770,26 @@ def _start_http_once():
 
 
 # -------------------- Tasks --------------------
-LOCK_NAME = "transcode-video-lock"
-
-@huey.task(retries=999999, retry_delay=5)        # keep retrying while another run holds the lock
-@huey.lock_task(LOCK_NAME)     # <- must be the innermost decorator
-def transcode(job_id: str, file_path: str):
+def _transcode_impl(job_id: str, file_path: str):
     """
     Orchestration entrypoint:
       - Kick off stitch(job_id) so the stitcher publishes stitch_host.
       - Run split(job_id, file_path) to segment and dispatch encodes.
     """
     _reset_job_run_state(job_id)
+    _job_heartbeat(job_id, "transcode_start", force=True)
+    redis.hset(_job_key(job_id), mapping={
+        'status': Status.RUNNING.value,
+        'started_at': _now(),
+    })
     # Start stitcher first so encoders have a destination
     stitch(job_id)
     # Perform split/dispatch on this node (master)
     return split(job_id, file_path)
+
+@huey.task(retries=999999, retry_delay=5)
+def transcode(job_id: str, file_path: str):
+    return _transcode_impl(job_id, file_path)
 
 
 @huey.task()
@@ -723,10 +835,33 @@ def split(job_id: str, file_path: str):
             'input_path': src_path,
             'target_height': target_height,
         })
+        _job_heartbeat(job_id, "probe", force=True, note="starting source probe")
 
-        # Probe essentials for UI (cheap)
-        meta     = _ffprobe_stream0(src_path)
-        duration = _ffprobe_duration(src_path)
+        # Probe essentials for UI. Time out instead of letting a wedged source
+        # file pin the whole queue indefinitely.
+        meta, meta_err, meta_timed_out = _ffprobe_stream0_details(src_path)
+        duration, duration_err, duration_timed_out = _ffprobe_duration_details(src_path)
+        if meta_timed_out or duration_timed_out:
+            probe_errors = "; ".join(x for x in (meta_err, duration_err) if x) or "ffprobe timed out"
+            logger.error(f"[{job_id}] Source probe timed out for {src_path}: {probe_errors}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': f"source probe timed out: {probe_errors}",
+                'failed_stage': 'probe',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
+            return {'status': 'FAILED', 'reason': f"source probe timed out: {probe_errors}"}
+        if duration_err:
+            logger.error(f"[{job_id}] Source duration probe failed for {src_path}: {duration_err}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': f"source duration probe failed: {duration_err}",
+                'failed_stage': 'probe',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
+            return {'status': 'FAILED', 'reason': f"source duration probe failed: {duration_err}"}
         codec    = meta.get("codec") or ""
         width    = meta.get("width") or 0
         height   = meta.get("height") or 0
@@ -781,6 +916,7 @@ def split(job_id: str, file_path: str):
             "processing_mode_effective": processing_mode,
             "processing_mode_reason": processing_reason,
         })
+        _job_heartbeat(job_id, "plan", force=True, note=f"mode={processing_mode}")
         logger.info(f"[{job_id}] Processing mode: {processing_mode} ({processing_reason})")
         if processing_mode == "direct" and duration <= 0:
             processing_mode = "split"
@@ -887,6 +1023,7 @@ def split(job_id: str, file_path: str):
             source='worker',
         )
         redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0, 'segmented_chunks': 0, 'segment_progress': 0, 'segment_elapsed': 0})
+        _job_heartbeat(job_id, "segment_start", force=True, note=f"parts={P}")
 
         if processing_mode == "direct":
             total_chunks = 0
@@ -910,6 +1047,7 @@ def split(job_id: str, file_path: str):
                     stage='segment',
                     source='worker',
                 )
+                _job_heartbeat(job_id, "direct_dispatch", force=True, note=f"part={part_idx}/{P}")
                 encode(
                     job_id,
                     part_idx,
@@ -977,7 +1115,8 @@ def split(job_id: str, file_path: str):
             cmd[cmd.index('-f'):cmd.index('-f')] = ['-bsf:v', bsf]
         logger.info(f"[{job_id}] Segment command: {' '.join(cmd)}")
 
-        # Parse ffmpeg stderr for new-chunk openings
+        # Parse ffmpeg stderr for new-chunk openings. Guard against a silent
+        # segmenter so an NFS/read stall cannot leave the queue blocked forever.
         segment_re = re.compile(r"Opening '(.+?/chunk_(\d+)\.ts)' for writing")
 
         if not _is_job_halted(job_id):
@@ -990,6 +1129,7 @@ def split(job_id: str, file_path: str):
         queued_count = 0
 
         segment_stderr_tail = deque(maxlen=120)
+        last_segment_output_at = _now()
         while True:
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] Halted. Terminating segmentation.")
@@ -997,9 +1137,42 @@ def split(job_id: str, file_path: str):
                 process.wait()
                 return {'status': 'ABORTED'}
 
+            if process.stderr is None:
+                break
+
+            ready, _, _ = select.select([process.stderr], [], [], 1.0)
+            if not ready:
+                _job_heartbeat(job_id, "segment_wait")
+                if process.poll() is not None:
+                    break
+                if (_now() - last_segment_output_at) >= SEGMENT_IO_IDLE_TIMEOUT_SEC:
+                    reason = f"ffmpeg segmentation produced no output for {SEGMENT_IO_IDLE_TIMEOUT_SEC}s"
+                    logger.error(f"[{job_id}] {reason}")
+                    try:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                    redis.hset(job_key, mapping={
+                        'status': Status.FAILED.value,
+                        'error': reason,
+                        'failed_stage': 'segment',
+                        'failed_worker': master_host_name,
+                        'ended_at': _now(),
+                    })
+                    return {'status': 'FAILED', 'reason': reason}
+                continue
+
             line = process.stderr.readline()
             if not line:
-                break
+                if process.poll() is not None:
+                    break
+                continue
+            last_segment_output_at = _now()
+            _job_heartbeat(job_id, "segment")
             segment_stderr_tail.append(line.rstrip())
 
             m = segment_re.search(line)
@@ -1149,16 +1322,72 @@ def encode(
     """
     logger.info(f"[{job_id}] Preparing to encode part {idx}")
 
-    worker_name = ENV("HOSTNAME") or socket.gethostname()
+    worker_name = WORKER_NAME
     job_key = _job_key(job_id)
     filename = redis.hget(job_key, "filename") or ""
     title = _job_title({"filename": filename})
     part_t0 = _now()
     def _fail(reason: str, stage: str):
-        # Mark whole job failed and save a useful reason
+        retry_cnt_key = f"job_retry_counts:{job_id}"
+        retry_ts_key = f"job_retry_ts:{job_id}"
+        inflight_key = f"job_retry_inflight:{job_id}"
+        retry_count = 0
+        try:
+            retry_count = int(redis.hincrby(retry_cnt_key, idx, 1))
+            redis.hset(retry_ts_key, idx, _now())
+            redis.srem(inflight_key, idx)
+        except Exception:
+            logger.exception("[%s] failed to update retry accounting for part %s", job_id, idx)
+
+        failure_reason = f"part {idx} ({stage}): {reason}"
+
+        if retry_count <= PART_FAILURE_MAX_RETRIES and not _is_job_halted(job_id):
+            try:
+                redis.hset(job_key, mapping={
+                    'last_part_error': failure_reason,
+                    'last_failed_part': idx,
+                    'last_failed_stage': stage,
+                    'last_failed_worker': worker_name,
+                    'last_failed_at': _now(),
+                    'last_retry_part': idx,
+                    'last_retry_stage': stage,
+                    'last_retry_worker': worker_name,
+                    'last_retry_at': _now(),
+                })
+            except Exception:
+                pass
+            logger.error(
+                "[%s] %s on %s; requeued part (attempt %s/%s)",
+                job_id,
+                failure_reason,
+                worker_name,
+                retry_count,
+                PART_FAILURE_MAX_RETRIES,
+            )
+            emit_activity(
+                f'Retrying "{title}" part {idx} after failure on {worker_name}',
+                job_id=job_id,
+                filename=filename,
+                stage='part_retry',
+                source='worker',
+            )
+            encode(
+                job_id,
+                idx,
+                master_host,
+                v_sel,
+                a_sel,
+                stitch_host=stitch_host,
+                source_path=source_path,
+                source_start_s=source_start_s,
+                source_duration_s=source_duration_s,
+            )
+            return {'status': 'RETRYING', 'reason': failure_reason}
+
+        # If the part repeatedly fails across workers, fail the job with a useful reason.
         mapping = {
             'status': Status.FAILED.value,
-            'error': f"part {idx} ({stage}): {reason}",
+            'error': f"{failure_reason}; retry budget exhausted ({retry_count}/{PART_FAILURE_MAX_RETRIES})",
             'failed_part': idx,
             'failed_stage': stage,
             'failed_worker': worker_name,
@@ -1182,6 +1411,7 @@ def encode(
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode {idx}: halted before start")
             return {'status': 'ABORTED'}
+        _job_heartbeat(job_id, "encode_prepare", force=True, note=f"part={idx}")
 
         import requests
         stage = "resolve-stitcher"
@@ -1190,6 +1420,7 @@ def encode(
         if not stitch_host:
             deadline = _now() + 60
             while _now() < deadline and not stitch_host:
+                _job_heartbeat(job_id, "resolve_stitcher", note=f"part={idx}")
                 stitch_host = redis.hget(job_key, 'stitch_host') or None
                 if stitch_host:
                     break
@@ -1224,6 +1455,7 @@ def encode(
                         for chunk in r.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 f.write(chunk)
+                                _job_heartbeat(job_id, "download", note=f"part={idx}")
                             if _is_job_halted(job_id):
                                 logger.warning(f"[{job_id}] encode {idx}: halted during download")
                                 try:
@@ -1298,6 +1530,7 @@ def encode(
             ]
 
         logger.info(f"[{job_id}] encode {idx}: {' '.join(cmd)}")
+        _job_heartbeat(job_id, "encode_start", force=True, note=f"part={idx}")
 
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode {idx}: halted before encoding part")
@@ -1334,6 +1567,7 @@ def encode(
             # Read progress lines to keep ffmpeg responsive and check halts
             if pr.stderr is not None:
                 for _line in pr.stderr:
+                    _job_heartbeat(job_id, "encode", note=f"part={idx}")
                     line = _line.rstrip("\n")
                     if line:
                         stderr_tail.append(line)
@@ -1366,6 +1600,7 @@ def encode(
         stage = "upload"
         put_url = f"{stitch_host.rstrip('/')}/job/{job_id}/result/{idx}"
         logger.info(f"[{job_id}] PUT result {idx} to {put_url}")
+        _job_heartbeat(job_id, "upload_start", force=True, note=f"part={idx}")
 
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode {idx}: halted before uploading encoded part")
@@ -1383,6 +1618,7 @@ def encode(
             return _fail(f"upload failed: {e}", stage)
 
         logger.info(f"[{job_id}] Uploaded part {idx}")
+        _job_heartbeat(job_id, "upload_complete", force=True, note=f"part={idx}")
         emit_activity(
             f'Encoding "{title}" part {idx} completed in {_elapsed_ms(part_t0)}ms',
             job_id=job_id,
@@ -1465,6 +1701,7 @@ def stitch(job_id: str):
         stage='stitch_start',
         source='worker',
     )
+    _job_heartbeat(job_id, "stitch_start", force=True)
     try:
         _start_http_once()
         stitch_host = f"http://{ENV('HOSTNAME') or socket.gethostname()}:{HTTP_PORT}"
@@ -1487,6 +1724,7 @@ def stitch(job_id: str):
         deadline = _now() + 300
         P = 0
         while _now() < deadline:
+            _job_heartbeat(job_id, "stitch_wait_total")
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] stitch aborted before parts_total")
                 return {'status':'ABORTED'}
@@ -1596,6 +1834,7 @@ def stitch(job_id: str):
             return True
 
         while _now() < wait_deadline:
+            _job_heartbeat(job_id, "stitch_wait_parts")
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] stitch aborted (job halted)")
                 return {'status':'ABORTED'}
@@ -1777,8 +2016,10 @@ def stitch(job_id: str):
                 if not line:
                     if proc.poll() is not None:
                         break
+                    _job_heartbeat(job_id, "stitch_combine")
                     time.sleep(0.05)
                     continue
+                _job_heartbeat(job_id, "stitch_combine", note="ffmpeg-progress")
                 line = line.strip()
                 if line.startswith('out_time_ms='):
                     if _is_job_halted(job_id):
@@ -1823,6 +2064,14 @@ def stitch(job_id: str):
         src_filename = job.get('filename') or os.path.basename(job.get('input_path','') or '')
         src_input_path = (job.get('input_path') or '').strip()
         english_subtitle_streams = _source_english_subtitle_streams(src_input_path)
+        supported_english_subtitle_streams = [
+            s for s in english_subtitle_streams
+            if _subtitle_codec_mkv_copy_safe(s.get("codec_name"))
+        ]
+        unsupported_english_subtitle_streams = [
+            s for s in english_subtitle_streams
+            if not _subtitle_codec_mkv_copy_safe(s.get("codec_name"))
+        ]
         emit_activity(
             f'Writing "{_job_title(job)}"',
             job_id=job_id,
@@ -1830,10 +2079,25 @@ def stitch(job_id: str):
             stage='write',
             source='worker',
         )
-        final_extension = ".mkv" if english_subtitle_streams else ".mp4"
+        final_extension = ".mkv" if supported_english_subtitle_streams else ".mp4"
         final_path = _final_output_path_with_ext(src_filename, final_extension)
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
-        if english_subtitle_streams:
+        subtitle_warning = ""
+        if unsupported_english_subtitle_streams:
+            skipped_codecs = sorted({
+                str(stream.get("codec_name") or "unknown").strip().lower() or "unknown"
+                for stream in unsupported_english_subtitle_streams
+            })
+            subtitle_warning = f"Skipped unsupported English subtitle codecs: {', '.join(skipped_codecs)}"
+            logger.warning(f"[{job_id}] {subtitle_warning}")
+            emit_activity(
+                f'Skipped unsupported English subtitles for "{_job_title(job)}": {", ".join(skipped_codecs)}',
+                job_id=job_id,
+                filename=src_filename,
+                stage='subtitle_warning',
+                source='worker',
+            )
+        if supported_english_subtitle_streams:
             subtitle_mux_path = os.path.join(base_dir, f"job_{job_id}_output_with_subs.mkv")
             subtitle_cmd = [
                 "ffmpeg",
@@ -1850,18 +2114,20 @@ def stitch(job_id: str):
                 "0:v",
                 "-map",
                 "0:a?",
-                "-map",
-                "1:s:m:language:eng?",
-                "-map",
-                "1:s:m:language:en?",
                 "-c:v",
                 "copy",
                 "-c:a",
                 "copy",
                 "-c:s",
                 "copy",
-                subtitle_mux_path,
             ]
+            for stream in supported_english_subtitle_streams:
+                try:
+                    stream_index = int(stream.get("index"))
+                except Exception:
+                    continue
+                subtitle_cmd.extend(["-map", f"1:{stream_index}"])
+            subtitle_cmd.append(subtitle_mux_path)
             logger.info(f"[{job_id}] Subtitle remux cmd: {' '.join(subtitle_cmd)}")
             subtitle_mux = subprocess.run(
                 subtitle_cmd,
@@ -1871,15 +2137,24 @@ def stitch(job_id: str):
             )
             if subtitle_mux.returncode != 0 or not os.path.exists(subtitle_mux_path):
                 err_tail = ((subtitle_mux.stderr or "") or (subtitle_mux.stdout or ""))[-1200:]
-                logger.error(f"[{job_id}] Subtitle remux failed (rc={subtitle_mux.returncode}): {err_tail}")
-                redis.hset(job_key, mapping={
-                    'status': Status.FAILED.value,
-                    'error': f"subtitle remux failed: {err_tail or subtitle_mux.returncode}",
-                    'failed_stage': 'subtitle_mux',
-                    'failed_worker': ENV("HOSTNAME") or socket.gethostname(),
-                })
-                return {'status': 'FAILED', 'reason': 'subtitle remux failed'}
-            shutil.move(subtitle_mux_path, final_path)
+                subtitle_warning = f"subtitle remux failed; output kept without subtitles: {err_tail or subtitle_mux.returncode}"
+                logger.warning(f"[{job_id}] {subtitle_warning}")
+                emit_activity(
+                    f'Finished "{_job_title(job)}" without subtitles after remux failure',
+                    job_id=job_id,
+                    filename=src_filename,
+                    stage='subtitle_warning',
+                    source='worker',
+                )
+                final_path = _final_output_path_with_ext(src_filename, ".mp4")
+                if os.path.exists(subtitle_mux_path):
+                    try:
+                        os.remove(subtitle_mux_path)
+                    except Exception:
+                        pass
+                shutil.move(local_out, final_path)
+            else:
+                shutil.move(subtitle_mux_path, final_path)
         else:
             shutil.move(local_out, final_path)
 
@@ -1926,7 +2201,10 @@ def stitch(job_id: str):
                 'dest_resolution': f"{w}x{h}" if (w and h) else '',
                 'dest_fps': f"{dst_fps:.2f}" if dst_fps else '0',
                 'dest_bitrate_kbps': f"{dst_kbps:.0f}" if dst_kbps>0 else '0',
-                'english_subtitles_kept': '1' if english_subtitle_streams else '0',
+                'english_subtitles_found': str(len(english_subtitle_streams)),
+                'english_subtitles_supported': str(len(supported_english_subtitle_streams)),
+                'english_subtitles_kept': '1' if final_path.endswith('.mkv') and bool(supported_english_subtitle_streams) else '0',
+                'subtitle_warning': subtitle_warning,
             })
         except Exception:
             pass
@@ -2073,6 +2351,7 @@ def stamp(job_id: str):
         'stamp_source': filename or src_path,
         'stamp_tmp': tmp_path,
     })
+    _job_heartbeat(job_id, "stamp_start", force=True)
 
     # ffmpeg command
     cmd = [
@@ -2131,9 +2410,11 @@ def stamp(job_id: str):
             if not line:
                 if proc.poll() is not None:
                     break
+                _job_heartbeat(job_id, "stamp")
                 time.sleep(0.05)
                 continue
 
+            _job_heartbeat(job_id, "stamp", note="ffmpeg-progress")
             line = line.strip()
             if not line:
                 continue

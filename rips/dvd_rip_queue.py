@@ -492,6 +492,36 @@ def choose_main_title(parsed: dict[str, Any], *, min_seconds: int) -> dict[str, 
     return candidates[0]
 
 
+def write_makemkv_probe_diagnostic(
+    *,
+    probe_stdout: str,
+    probe_stderr: str,
+    device: str,
+    source_spec: str,
+    scratch_root: Path,
+) -> Path:
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    device_name = Path(device).name or "unknown-device"
+    diagnostic_path = scratch_root / f"makemkv-info-{device_name}-{timestamp}.log"
+    diagnostic_path.write_text(
+        "\n".join(
+            [
+                f"device={device}",
+                f"source={source_spec}",
+                "",
+                "=== stdout ===",
+                probe_stdout or "",
+                "",
+                "=== stderr ===",
+                probe_stderr or "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return diagnostic_path
+
+
 def parse_makemkv_drive_scan_output(text: str) -> list[dict[str, Any]]:
     drives: list[dict[str, Any]] = []
     for raw_line in text.splitlines():
@@ -1790,7 +1820,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("title", nargs="?", help="Movie title to use for the ripped file; omit to auto-detect")
-    parser.add_argument("--device", default=DEFAULT_DEVICE, help="DVD device path (for logging only)")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Optical device path, e.g. /dev/sr0 or /dev/sr1")
     parser.add_argument(
         "--source",
         default=DEFAULT_SOURCE,
@@ -1946,6 +1976,8 @@ def main() -> int:
         raise SystemExit("--staged-path and --rename-path require an explicit title so the bundle can be renamed.")
 
     watch_root = Path(args.watch_root).expanduser()
+    scratch_root = Path(args.scratch_root).expanduser()
+    staging_root = Path(args.staging_root).expanduser()
     staged_manifest_path: Path | None = None
     staged_mkv_path: Path | None = None
     staged_manifest: dict[str, Any] = {}
@@ -1986,8 +2018,22 @@ def main() -> int:
         parsed = parse_makemkv_robot_output(probe.stdout)
 
         progress("Choosing main title...")
+        titles = list(parsed.get("titles", []))
+        if not titles:
+            diagnostic_path = write_makemkv_probe_diagnostic(
+                probe_stdout=probe.stdout,
+                probe_stderr=probe.stderr,
+                device=args.device,
+                source_spec=source_spec,
+                scratch_root=scratch_root,
+            )
+            raise SystemExit(
+                "MakeMKV did not return any titles for this disc. "
+                f"Saved MakeMKV info output to {diagnostic_path}. "
+                "Inspect that log for drive, disc, AACS, or parser clues."
+            )
         if args.title_index is not None:
-            matching = [title for title in parsed.get("titles", []) if title.get("index") == args.title_index]
+            matching = [title for title in titles if title.get("index") == args.title_index]
             if not matching:
                 raise SystemExit(f"Title index {args.title_index} was not found in MakeMKV output.")
             main_title = matching[0]
@@ -2082,9 +2128,7 @@ def main() -> int:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
 
-    scratch_root = Path(args.scratch_root).expanduser()
     scratch_root.mkdir(parents=True, exist_ok=True)
-    staging_root = Path(args.staging_root).expanduser()
 
     api_result: dict[str, Any] | None = None
     english_subtitles_kept = bool(existing_manifest.get("english_subtitles_kept") or False)

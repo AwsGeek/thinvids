@@ -198,7 +198,16 @@
       <tbody id="job-list"></tbody>
     </table>
 
-    <div id="pagination" class="flex items-center justify-end gap-2 mt-3">
+    <div id="pagination" class="flex flex-wrap items-center justify-end gap-2 mt-3">
+      <label class="flex items-center gap-1 text-sm text-gray-700">
+        Page size
+        <select id="page-size-select" class="border rounded px-2 py-1 text-sm">
+          <option value="10">10</option>
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
       <button id="pg-first" class="px-2 py-1 border rounded text-sm">« First</button>
       <button id="pg-prev"  class="px-2 py-1 border rounded text-sm">‹ Prev</button>
       <span id="pg-status"  class="text-sm text-gray-700 mx-2">Page 1 / 1</span>
@@ -565,8 +574,9 @@
 <script>
   // ---- pager state ----
   const PAGER_KEY = 'thinvids_pager_v1';
+  const ALLOWED_PAGE_SIZES = [10, 25, 50, 100];
   let CURRENT_PAGE = 1;
-  const PAGE_SIZE = 10;
+  let PAGE_SIZE = 10;
   let CURRENT_SORT = 'date';
   let CURRENT_DIR  = 'desc';
   let CURRENT_STATUS = 'ALL';
@@ -757,6 +767,8 @@
       const s = JSON.parse(raw);
       if (s && typeof s === 'object'){
         if (Number.isInteger(s.page) && s.page>0) CURRENT_PAGE = s.page;
+        const pageSize = parseInt(s.page_size, 10);
+        if (ALLOWED_PAGE_SIZES.includes(pageSize)) PAGE_SIZE = pageSize;
         if (typeof s.sort === 'string' && ['date', 'filename', 'status'].includes(s.sort)) CURRENT_SORT = s.sort;
         if (s.dir === 'asc' || s.dir === 'desc') CURRENT_DIR = s.dir;
         if (typeof s.status === 'string') CURRENT_STATUS = s.status.toUpperCase() || 'ALL';
@@ -768,6 +780,7 @@
     try{
       localStorage.setItem(PAGER_KEY, JSON.stringify({
         page: CURRENT_PAGE,
+        page_size: PAGE_SIZE,
         sort: CURRENT_SORT,
         dir: CURRENT_DIR,
         status: CURRENT_STATUS,
@@ -781,7 +794,7 @@
     CURRENT_PAGE = page;
     savePager();
     const status = el('pg-status');
-    if (status) status.textContent = `Page ${page} / ${total_pages}`;
+    if (status) status.textContent = `Page ${page} / ${total_pages} (${meta.total || 0} jobs)`;
     const f = el('pg-first'), p = el('pg-prev'), n = el('pg-next'), l = el('pg-last');
     if (f) f.disabled = page <= 1;
     if (p) p.disabled = page <= 1;
@@ -1178,6 +1191,8 @@
       statusSel.value = CURRENT_STATUS;
     }
     if (searchInput) searchInput.value = CURRENT_QUERY;
+    const pageSizeSel = el('page-size-select');
+    if (pageSizeSel) pageSizeSel.value = String(ALLOWED_PAGE_SIZES.includes(PAGE_SIZE) ? PAGE_SIZE : 10);
 
     safeOn('sort-by', 'change', (e) => {
       const nextSort = (e.target.value || 'date').toLowerCase();
@@ -1208,6 +1223,17 @@
       if (e.key !== 'Enter') return;
       e.preventDefault();
       if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+      fetchJobs();
+    });
+
+    safeOn('page-size-select', 'change', (e) => {
+      const nextSize = parseInt(e.target.value, 10);
+      if (!ALLOWED_PAGE_SIZES.includes(nextSize)) return;
+      PAGE_SIZE = nextSize;
+      CURRENT_PAGE = 1;
+      SELECTED_JOB_IDS.clear();
+      savePager();
+      updateBulkUiState();
       fetchJobs();
     });
 
