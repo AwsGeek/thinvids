@@ -29,6 +29,7 @@
           <th class="px-2 py-1">MAC</th>
           <th class="px-2 py-1">Last Seen</th>
           <th class="px-2 py-1">Status</th>
+          <th class="px-2 py-1">Role</th>
           <th class="px-2 py-1">Quarantine</th>
           <th class="px-2 py-1">Actions</th>
         </tr>
@@ -77,6 +78,7 @@
       <td class="px-2 py-1 cell-status">
         <span class="badge px-2 py-0.5 rounded text-xs"></span>
       </td>
+      <td class="px-2 py-1 cell-role"></td>
       <td class="px-2 py-1 text-sm cell-quarantine"></td>
       <td class="px-2 py-1 cell-actions"></td>
     `;
@@ -94,6 +96,16 @@
     el.className = `badge px-2 py-0.5 rounded text-xs ${
       active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
     }`;
+  }
+
+  function roleBadge(role, disabled) {
+    if (disabled) {
+      return '<span class="px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-500">disabled</span>';
+    }
+    if (role === 'pipeline') {
+      return '<span class="px-2 py-0.5 rounded text-xs bg-indigo-100 text-indigo-700" title="Can run segment, stitch, and encode work">segment/encode/stitch</span>';
+    }
+    return '<span class="px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-700" title="Reserved for encode work">encode</span>';
   }
 
   function setActions(td, hostname, active, disabled) {
@@ -183,6 +195,7 @@
         tr.querySelector('.cell-ip').textContent   = n.ip || '';
         tr.querySelector('.cell-mac').textContent  = n.mac || '';
         tr.querySelector('.cell-last').textContent = tsToStr(n.last_seen_ts);
+        tr.querySelector('.cell-role').innerHTML = roleBadge(n.worker_role || 'encode', !!n.disabled);
         tr.querySelector('.cell-quarantine').textContent = n.disabled ? (n.quarantine_reason || 'disabled') : '';
 
         const badge = tr.querySelector('.cell-status .badge');

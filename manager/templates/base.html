@@ -51,92 +51,128 @@
   <div id="toast-root" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
 
   <!-- Global Settings Modal (shared) -->
-  <div id="global-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 items-center justify-center">
-    <div class="bg-white rounded shadow-xl w-full max-w-lg p-6 relative">
+  <div id="global-settings-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 items-center justify-center p-4">
+    <div class="bg-white rounded shadow-xl w-full max-w-2xl p-5 relative flex flex-col" style="max-height: 88vh;">
       <button id="gs-close" class="absolute top-2 right-2 text-gray-600 hover:text-black">
         <span class="material-icons">close</span>
       </button>
-      <h2 class="text-xl font-semibold mb-4">Global Settings</h2>
+      <h2 class="text-xl font-semibold mb-3 pr-8">Global Settings</h2>
 
-      <form id="global-settings-form" class="space-y-4" onsubmit="return false;">
-        <div class="flex items-center gap-2">
-          <input id="gs-suspend-enabled" type="checkbox" class="h-4 w-4">
-          <label for="gs-suspend-enabled" class="text-sm">Suspend workers when idle</label>
+      <div class="flex gap-1 border-b mb-4 overflow-x-auto">
+        <button type="button" class="gs-tab px-3 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-700 whitespace-nowrap" data-tab="workers">Workers</button>
+        <button type="button" class="gs-tab px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-600 hover:text-gray-900 whitespace-nowrap" data-tab="sources">Sources</button>
+        <button type="button" class="gs-tab px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-600 hover:text-gray-900 whitespace-nowrap" data-tab="encoding">Encoding</button>
+        <button type="button" class="gs-tab px-3 py-2 text-sm font-medium border-b-2 border-transparent text-gray-600 hover:text-gray-900 whitespace-nowrap" data-tab="pipeline">Pipeline</button>
+      </div>
+
+      <form id="global-settings-form" class="flex-1 min-h-0 flex flex-col" onsubmit="return false;">
+        <div class="flex-1 min-h-0 overflow-y-auto pr-1">
+          <section class="gs-panel space-y-4" data-panel="workers">
+            <div class="flex items-center gap-2">
+              <input id="gs-suspend-enabled" type="checkbox" class="h-4 w-4">
+              <label for="gs-suspend-enabled" class="text-sm">Suspend workers when idle</label>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label for="gs-idle-seconds" class="block text-sm font-medium mb-1">Idle time before suspend</label>
+                <input id="gs-idle-seconds" type="number" min="30" step="10" class="border p-2 rounded w-full">
+                <p class="text-xs text-gray-600 mt-1">Seconds. Minimum 30.</p>
+              </div>
+              <div>
+                <label for="gs-idle-cpu-pct-max" class="block text-sm font-medium mb-1">Idle CPU threshold (%)</label>
+                <input id="gs-idle-cpu-pct-max" type="number" min="1" max="100" step="0.5" class="border p-2 rounded w-full">
+                <p class="text-xs text-gray-600 mt-1">Suspend when CPU is at or below this value.</p>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <input id="gs-gc-enabled" type="checkbox" class="h-4 w-4">
+              <label for="gs-gc-enabled" class="text-sm">Garbage collect projects before suspend</label>
+            </div>
+          </section>
+
+          <section class="gs-panel hidden space-y-4" data-panel="sources">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label for="gs-max-source-size-gb" class="block text-sm font-medium mb-1">Max source file size (GiB)</label>
+                <input id="gs-max-source-size-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+                <p class="text-xs text-gray-600 mt-1">Threshold used by the large-file policy.</p>
+              </div>
+              <div>
+                <label for="gs-large-file-behavior" class="block text-sm font-medium mb-1">Large file policy</label>
+                <select id="gs-large-file-behavior" class="border p-2 rounded w-full">
+                  <option value="direct">Use direct source reads for large files</option>
+                  <option value="reject">Reject large files</option>
+                  <option value="nfs">Use NFS scratch for large files</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="space-y-2">
+              <div class="flex items-center gap-2">
+                <input id="gs-av1-check-enabled" type="checkbox" class="h-4 w-4">
+                <label for="gs-av1-check-enabled" class="text-sm">Reject AV1 files</label>
+              </div>
+              <div class="flex items-center gap-2">
+                <input id="gs-use-nfs-for-all-files" type="checkbox" class="h-4 w-4">
+                <label for="gs-use-nfs-for-all-files" class="text-sm">Use NFS scratch for all files</label>
+              </div>
+              <div class="flex items-center gap-2">
+                <input id="gs-use-direct-source-for-all-files" type="checkbox" class="h-4 w-4">
+                <label for="gs-use-direct-source-for-all-files" class="text-sm">Use direct source reads for all files</label>
+              </div>
+              <div class="flex items-center gap-2">
+                <input id="gs-low-disk-direct-enabled" type="checkbox" class="h-4 w-4">
+                <label for="gs-low-disk-direct-enabled" class="text-sm">Auto-switch to direct source when local scratch is low</label>
+              </div>
+            </div>
+
+            <div>
+              <label for="gs-low-disk-min-free-gb" class="block text-sm font-medium mb-1">Low-disk free-space floor (GiB)</label>
+              <input id="gs-low-disk-min-free-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+            </div>
+          </section>
+
+          <section class="gs-panel hidden space-y-4" data-panel="encoding">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label for="gs-target-segment-mb" class="block text-sm font-medium mb-1">Target segment size (MiB)</label>
+                <input id="gs-target-segment-mb" type="number" min="1" step="1" class="border p-2 rounded w-full">
+                <p class="text-xs text-gray-600 mt-1">Used to estimate number of parts from source size.</p>
+              </div>
+              <div>
+                <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
+                <select id="gs-default-target-height" class="border p-2 rounded w-full">
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                </select>
+                <p class="text-xs text-gray-600 mt-1">Used for new jobs unless a per-job target is set.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="gs-panel hidden space-y-4" data-panel="pipeline">
+            <div>
+              <h3 class="text-sm font-semibold text-gray-700 mb-2">Pipeline Scheduling</h3>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label for="gs-effective-max-active-jobs" class="block text-sm font-medium mb-1">Simultaneous start capacity</label>
+                  <input id="gs-effective-max-active-jobs" type="number" min="1" step="1" class="border p-2 rounded w-full bg-gray-100 text-gray-700" readonly>
+                </div>
+                <div>
+                  <label for="gs-pipeline-worker-count" class="block text-sm font-medium mb-1">Pipeline-capable workers</label>
+                  <input id="gs-pipeline-worker-count" type="number" min="2" step="1" class="border p-2 rounded w-full">
+                </div>
+              </div>
+              <p id="gs-pipeline-worker-hint" class="text-xs text-gray-600 mt-1">
+                Needs at least 2 pipeline-capable workers per active job.
+              </p>
+            </div>
+          </section>
         </div>
 
-        <div>
-          <label for="gs-idle-seconds" class="block text-sm font-medium mb-1">Idle time before suspend (seconds)</label>
-          <input id="gs-idle-seconds" type="number" min="30" step="10" class="border p-2 rounded w-full">
-          <p class="text-xs text-gray-600 mt-1">Minimum 30 seconds.</p>
-        </div>
-
-        <div>
-          <label for="gs-idle-cpu-pct-max" class="block text-sm font-medium mb-1">Idle CPU threshold (%)</label>
-          <input id="gs-idle-cpu-pct-max" type="number" min="1" max="100" step="0.5" class="border p-2 rounded w-full">
-          <p class="text-xs text-gray-600 mt-1">Workers can suspend when CPU is at or below this value.</p>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input id="gs-gc-enabled" type="checkbox" class="h-4 w-4">
-          <label for="gs-gc-enabled" class="text-sm">Garbage collect projects before suspend</label>
-        </div>
-
-        <div>
-          <label for="gs-max-source-size-gb" class="block text-sm font-medium mb-1">Max source file size (GiB)</label>
-          <input id="gs-max-source-size-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
-          <p class="text-xs text-gray-600 mt-1">Threshold used by the large-file policy below.</p>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input id="gs-av1-check-enabled" type="checkbox" class="h-4 w-4">
-          <label for="gs-av1-check-enabled" class="text-sm">Reject AV1 files</label>
-        </div>
-
-        <div>
-          <label for="gs-large-file-behavior" class="block text-sm font-medium mb-1">Large file policy</label>
-          <select id="gs-large-file-behavior" class="border p-2 rounded w-full">
-            <option value="direct">Use direct source reads for large files</option>
-            <option value="reject">Reject large files</option>
-            <option value="nfs">Use NFS scratch for large files</option>
-          </select>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input id="gs-use-nfs-for-all-files" type="checkbox" class="h-4 w-4">
-          <label for="gs-use-nfs-for-all-files" class="text-sm">Use NFS scratch for all files</label>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input id="gs-use-direct-source-for-all-files" type="checkbox" class="h-4 w-4">
-          <label for="gs-use-direct-source-for-all-files" class="text-sm">Use direct source reads for all files</label>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input id="gs-low-disk-direct-enabled" type="checkbox" class="h-4 w-4">
-          <label for="gs-low-disk-direct-enabled" class="text-sm">Auto-switch to direct source when local scratch is low</label>
-        </div>
-
-        <div>
-          <label for="gs-low-disk-min-free-gb" class="block text-sm font-medium mb-1">Low-disk free-space floor (GiB)</label>
-          <input id="gs-low-disk-min-free-gb" type="number" min="1" step="1" class="border p-2 rounded w-full">
-        </div>
-
-        <div>
-          <label for="gs-target-segment-mb" class="block text-sm font-medium mb-1">Target segment size (MiB)</label>
-          <input id="gs-target-segment-mb" type="number" min="1" step="1" class="border p-2 rounded w-full">
-          <p class="text-xs text-gray-600 mt-1">Used to estimate number of parts from source file size.</p>
-        </div>
-
-        <div>
-          <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
-          <select id="gs-default-target-height" class="border p-2 rounded w-full">
-            <option value="1080">1080p</option>
-            <option value="720">720p</option>
-          </select>
-          <p class="text-xs text-gray-600 mt-1">Used for new jobs unless a per-job target is set.</p>
-        </div>
-
-        <div class="flex gap-2 pt-2">
+        <div class="flex gap-2 pt-4 mt-4 border-t">
           <button id="gs-save" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
           <button id="gs-cancel" type="button" class="ml-auto bg-gray-200 px-4 py-2 rounded hover:bg-gray-300">Close</button>
         </div>
@@ -164,6 +200,8 @@
       const closeX  = document.getElementById('gs-close');
       const closeBtn= document.getElementById('gs-cancel');
       const saveBtn = document.getElementById('gs-save');
+      const tabButtons = Array.from(document.querySelectorAll('.gs-tab'));
+      const tabPanels = Array.from(document.querySelectorAll('.gs-panel'));
 
       const chkEnabled = document.getElementById('gs-suspend-enabled');
       const numIdle    = document.getElementById('gs-idle-seconds');
@@ -178,6 +216,9 @@
       const numLowDiskMinFree = document.getElementById('gs-low-disk-min-free-gb');
       const numTargetSegment = document.getElementById('gs-target-segment-mb');
       const selTarget  = document.getElementById('gs-default-target-height');
+      const numEffectiveMaxActiveJobs = document.getElementById('gs-effective-max-active-jobs');
+      const numPipelineWorkers = document.getElementById('gs-pipeline-worker-count');
+      const pipelineWorkerHint = document.getElementById('gs-pipeline-worker-hint');
 
       const asBool = (v) => {
         if (v === true || v === false) return v;
@@ -189,8 +230,26 @@
         const n = parseInt(v, 10);
         return n === 720 || n === 1080 ? n : fallback;
       };
+      const syncPipelineWorkerHint = () => {
+        const workers = Math.max(2, parseInt(numPipelineWorkers.value || 4, 10));
+        const derived = Math.max(1, Math.floor(workers / 2));
+        numEffectiveMaxActiveJobs.value = derived;
+        pipelineWorkerHint.textContent = `${workers} pipeline-capable workers can start about ${derived} job${derived === 1 ? '' : 's'} at once. More jobs may run after earlier jobs finish segmentation and release segmenter slots.`;
+      };
+      const showTab = (name) => {
+        tabButtons.forEach((btn) => {
+          const active = btn.dataset.tab === name;
+          btn.classList.toggle('border-blue-600', active);
+          btn.classList.toggle('text-blue-700', active);
+          btn.classList.toggle('border-transparent', !active);
+          btn.classList.toggle('text-gray-600', !active);
+        });
+        tabPanels.forEach((panel) => {
+          panel.classList.toggle('hidden', panel.dataset.panel !== name);
+        });
+      };
 
-      function show(){ modal.classList.remove('hidden'); modal.classList.add('flex'); }
+      function show(){ showTab('workers'); modal.classList.remove('hidden'); modal.classList.add('flex'); }
       function hide(){ modal.classList.add('hidden'); modal.classList.remove('flex'); }
 
       async function load(){
@@ -212,6 +271,9 @@
           numLowDiskMinFree.value = Number(d.low_disk_min_free_gb ?? 20);
           numTargetSegment.value = Number(d.target_segment_mb ?? 10);
           selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
+          numPipelineWorkers.value = Number(d.pipeline_worker_count ?? 4);
+          numEffectiveMaxActiveJobs.value = Number(d.effective_max_active_jobs ?? d.max_active_jobs ?? 2);
+          syncPipelineWorkerHint();
         }catch{ toast('Failed to load global settings', false); }
       }
       async function save(){
@@ -229,7 +291,8 @@
             low_disk_direct_enabled: !!chkLowDiskDirect.checked,
             low_disk_min_free_gb: Math.max(1, Number(numLowDiskMinFree.value || 20)),
             target_segment_mb: Math.max(1, Number(numTargetSegment.value || 10)),
-            default_target_height: asTargetHeight(selTarget.value, 1080)
+            default_target_height: asTargetHeight(selTarget.value, 1080),
+            pipeline_worker_count: Math.max(2, parseInt(numPipelineWorkers.value || 4, 10))
           };
           const r = await fetch('/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},
@@ -242,6 +305,8 @@
       }
 
       openBtn?.addEventListener('click', async ()=>{ await load(); show(); });
+      tabButtons.forEach((btn) => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
+      numPipelineWorkers?.addEventListener('input', syncPipelineWorkerHint);
       closeX?.addEventListener('click', hide);
       closeBtn?.addEventListener('click', hide);
       saveBtn?.addEventListener('click', save);

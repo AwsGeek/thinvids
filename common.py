@@ -14,7 +14,7 @@ import time
 def time_now() -> float:
     return time.time()
 
-from typing import Dict
+from typing import Dict, Optional
 
 import redis
 from redis.retry import Retry
@@ -27,6 +27,8 @@ REDIS_PORT = int(ENV("REDIS_PORT", "6379"))
 REDIS_DB_TASKS = int(ENV("REDIS_DB_TASKS", "0"))  # Huey broker
 REDIS_DB_DATA  = int(ENV("REDIS_DB_DATA",  "1"))  # App/job state
 HUEY_NAME = ENV("HUEY_NAME", "tasks")
+HUEY_PIPELINE_NAME = ENV("HUEY_PIPELINE_NAME", f"{HUEY_NAME}:pipeline")
+HUEY_ENCODE_NAME = ENV("HUEY_ENCODE_NAME", f"{HUEY_NAME}:encode")
 
 @lru_cache(maxsize=None)
 def get_redis() -> redis.Redis:
@@ -45,15 +47,21 @@ def get_redis() -> redis.Redis:
 from huey import RedisHuey
 
 @lru_cache(maxsize=None)
-def get_huey() -> RedisHuey:
+def get_huey(name: Optional[str] = None) -> RedisHuey:
     return RedisHuey(
-        HUEY_NAME,
+        name or HUEY_NAME,
         host=REDIS_HOST,
         port=REDIS_PORT,
         db=REDIS_DB_TASKS,
         retry_on_timeout=True,
         retry=Retry(ExponentialBackoff(cap=10, base=1), retries=8),
     )
+
+def get_pipeline_huey() -> RedisHuey:
+    return get_huey(HUEY_PIPELINE_NAME)
+
+def get_encode_huey() -> RedisHuey:
+    return get_huey(HUEY_ENCODE_NAME)
 
 """
 Provides a string-backed Status enum that is safe to persist to Redis/JSON
@@ -91,7 +99,6 @@ class Status(str, Enum):
 
 # ---------------- Logging setup (shared) ----------------
 import logging, socket, sys
-from typing import Optional
 
 _HOST = socket.gethostname()
 
@@ -177,6 +184,10 @@ DEFAULT_SETTINGS = {
     "target_segment_mb": "10",
     "large_file_behavior": "direct",
     "default_target_height": "1080",
+    "max_active_jobs": "2",
+    "pipeline_worker_count": "4",
+    "pipeline_drain_ratio_to_start_next": "0.75",
+    "pipeline_min_idle_workers_to_start_next": "4",
 }
 
 # ---------------- Global settings fetch (with light caching) ----------------
@@ -212,6 +223,10 @@ def get_settings() -> Dict:
         settings = cached_settings["data"]
 
     return settings
+
+def invalidate_settings_cache() -> None:
+    cached_settings["ts"] = 0
+    cached_settings["data"] = {}
 
 def is_base_job_key(key: str) -> bool:
     key = (key or "").strip()

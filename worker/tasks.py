@@ -26,8 +26,10 @@ from math import ceil
 from typing import List, Tuple, Optional
 from collections import deque
 
-from common import ENV, Status, get_huey, get_redis, get_logging, emit_activity
-huey = get_huey()
+from common import ENV, Status, get_encode_huey, get_pipeline_huey, get_redis, get_logging, emit_activity
+pipeline_huey = get_pipeline_huey()
+encode_huey = get_encode_huey()
+huey = pipeline_huey
 redis = get_redis()
 logger = get_logging("worker")
 WORKER_NAME = ENV("HOSTNAME") or socket.gethostname()
@@ -391,6 +393,36 @@ def _is_job_halted(job_id: str) -> bool:
     s = Status.parse(redis.hget(_job_key(job_id), "status"))
     return s in (Status.FAILED, Status.REJECTED, Status.STOPPED)
 
+def _task_token_is_current(job_id: str, run_token: Optional[str], task_name: str) -> bool:
+    """
+    Ignore stale Huey work from an older dispatch of the same job.
+
+    Huey can legitimately replay unacked tasks after a worker restart. A per-run
+    token keeps those old tasks from spawning split/stitch/encode work after the
+    manager has already reserved a newer run of the job.
+    """
+    token = str(run_token or "").strip()
+    current = str(redis.hget(_job_key(job_id), "pipeline_run_token") or "").strip()
+    if current:
+        if token == current:
+            return True
+        logger.warning(
+            "[%s] %s: stale task ignored (token=%s current=%s)",
+            job_id,
+            task_name,
+            token[:8] or "missing",
+            current[:8],
+        )
+        return False
+    if token:
+        logger.warning(
+            "[%s] %s: tokened task ignored because job has no current token",
+            job_id,
+            task_name,
+        )
+        return False
+    return True
+
 def _normalize_target_height(value) -> int:
     try:
         h = int(value)
@@ -704,7 +736,7 @@ def _start_http_once():
                     filename = job_data.get("filename") or ""
                     put_t0 = _now()
                     _, enc_path = _part_paths(job_id, idx)
-                    tmp_path = enc_path + ".uploading"
+                    tmp_path = f"{enc_path}.{uuid.uuid4().hex}.uploading"
 
                     length = self.headers.get('Content-Length')
                     if length is None:
@@ -745,6 +777,11 @@ def _start_http_once():
                     self.send_response(200)
                     self.end_headers()
                 except Exception as e:
+                    try:
+                        if 'tmp_path' in locals() and tmp_path and os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
                     logger.exception("HTTP PUT error")
                     try:
                         self.send_error(500, f"PUT error: {e}")
@@ -770,12 +807,15 @@ def _start_http_once():
 
 
 # -------------------- Tasks --------------------
-def _transcode_impl(job_id: str, file_path: str):
+def _transcode_impl(job_id: str, file_path: str, run_token: Optional[str] = None):
     """
     Orchestration entrypoint:
       - Kick off stitch(job_id) so the stitcher publishes stitch_host.
       - Run split(job_id, file_path) to segment and dispatch encodes.
     """
+    if not _task_token_is_current(job_id, run_token, "transcode"):
+        return {'status': 'STALE', 'job_id': job_id}
+
     _reset_job_run_state(job_id)
     _job_heartbeat(job_id, "transcode_start", force=True)
     redis.hset(_job_key(job_id), mapping={
@@ -783,17 +823,18 @@ def _transcode_impl(job_id: str, file_path: str):
         'started_at': _now(),
     })
     # Start stitcher first so encoders have a destination
-    stitch(job_id)
+    stitch(job_id, run_token)
     # Perform split/dispatch on this node (master)
-    return split(job_id, file_path)
+    split(job_id, file_path, run_token)
+    return {'status': 'QUEUED', 'job_id': job_id}
 
-@huey.task(retries=999999, retry_delay=5)
-def transcode(job_id: str, file_path: str):
-    return _transcode_impl(job_id, file_path)
+@pipeline_huey.task(retries=999999, retry_delay=5)
+def transcode(job_id: str, file_path: str, run_token: Optional[str] = None):
+    return _transcode_impl(job_id, file_path, run_token)
 
 
-@huey.task()
-def split(job_id: str, file_path: str):
+@pipeline_huey.task()
+def split(job_id: str, file_path: str, run_token: Optional[str] = None):
     """
     Master-side segmentation & dispatch:
       - Start HTTP server (serve parts).
@@ -802,6 +843,9 @@ def split(job_id: str, file_path: str):
       - No waiting or stitching here anymore.
     """
     job_key = _job_key(job_id)
+    if not _task_token_is_current(job_id, run_token, "split"):
+        return {'status': 'STALE', 'job_id': job_id}
+
     job = redis.hgetall(job_key)
     title = _job_title(job)
 
@@ -1032,6 +1076,8 @@ def split(job_id: str, file_path: str):
                 if _is_job_halted(job_id):
                     logger.warning(f"[{job_id}] Halted while scheduling direct-source parts.")
                     return {'status': 'ABORTED'}
+                if not _task_token_is_current(job_id, run_token, "split"):
+                    return {'status': 'STALE', 'job_id': job_id}
 
                 start_s, part_duration = _direct_source_plan_for_part(duration, segment_duration_hint, part_idx)
                 if start_s is None:
@@ -1057,6 +1103,7 @@ def split(job_id: str, file_path: str):
                     source_path=src_path,
                     source_start_s=start_s,
                     source_duration_s=part_duration,
+                    run_token=run_token,
                 )
                 prog = int((part_idx / max(1, P)) * 100)
                 if part_idx < P:
@@ -1224,7 +1271,9 @@ def split(job_id: str, file_path: str):
                             stage='segment',
                             source='worker',
                         )
-                        encode(job_id, part_idx, master_url, v_sel, a_sel)
+                        if not _task_token_is_current(job_id, run_token, "split"):
+                            return {'status': 'STALE', 'job_id': job_id}
+                        encode(job_id, part_idx, master_url, v_sel, a_sel, run_token=run_token)
 
                 previous_chunk_path = chunk_path
                 previous_chunk_index = chunk_index
@@ -1268,7 +1317,9 @@ def split(job_id: str, file_path: str):
                     stage='segment',
                     source='worker',
                 )
-                encode(job_id, part_idx, master_url, v_sel, a_sel)
+                if not _task_token_is_current(job_id, run_token, "split"):
+                    return {'status': 'STALE', 'job_id': job_id}
+                encode(job_id, part_idx, master_url, v_sel, a_sel, run_token=run_token)
                 total_chunks = part_idx
 
         if total_chunks <= 0:
@@ -1300,7 +1351,7 @@ def split(job_id: str, file_path: str):
         return {'status': 'FAILED', 'error': str(e)}
 
 
-@huey.task()
+@encode_huey.task()
 def encode(
     job_id: str,
     idx: int,
@@ -1311,6 +1362,7 @@ def encode(
     source_path: Optional[str] = None,
     source_start_s: Optional[float] = None,
     source_duration_s: Optional[float] = None,
+    run_token: Optional[str] = None,
 ):
     """
     Worker task:
@@ -1324,6 +1376,9 @@ def encode(
 
     worker_name = WORKER_NAME
     job_key = _job_key(job_id)
+    if not _task_token_is_current(job_id, run_token, "encode"):
+        return {'status': 'STALE', 'job_id': job_id, 'idx': idx}
+
     filename = redis.hget(job_key, "filename") or ""
     title = _job_title({"filename": filename})
     part_t0 = _now()
@@ -1381,6 +1436,7 @@ def encode(
                 source_path=source_path,
                 source_start_s=source_start_s,
                 source_duration_s=source_duration_s,
+                run_token=run_token,
             )
             return {'status': 'RETRYING', 'reason': failure_reason}
 
@@ -1682,8 +1738,8 @@ def encode(
 
 
 
-@huey.task()
-def stitch(job_id: str):
+@pipeline_huey.task()
+def stitch(job_id: str, run_token: Optional[str] = None):
     """
     Stitcher node:
       - Serves PUTs for encoded parts and advertises stitch_host.
@@ -1691,6 +1747,9 @@ def stitch(job_id: str):
       - On persistent misses/timeouts -> fail. On success -> concat-copy to final.
     """
     job_key = _job_key(job_id)
+    if not _task_token_is_current(job_id, run_token, "stitch"):
+        return {'status': 'STALE', 'job_id': job_id}
+
     stitch_stage_t0 = _now()
     initial_job = redis.hgetall(job_key) or {}
     title = _job_title(initial_job)
@@ -1784,6 +1843,8 @@ def stitch(job_id: str):
 
         # Helper: schedule (re)encode conservatively
         def _retry_part(idx: int):
+            if not _task_token_is_current(job_id, run_token, "stitch"):
+                return False
             job = redis.hgetall(job_key) or {}
             master_host = job.get('master_host') or stitch_host
             source_path = (job.get('input_path') or '').strip()
@@ -1822,9 +1883,10 @@ def stitch(job_id: str):
                     source_path=source_path,
                     source_start_s=start_s,
                     source_duration_s=part_dur,
+                    run_token=run_token,
                 )
             else:
-                encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host)
+                encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host, run_token=run_token)
 
             now_ts = _now()
             pipe = redis.pipeline()
@@ -1838,6 +1900,8 @@ def stitch(job_id: str):
             if _is_job_halted(job_id):
                 logger.warning(f"[{job_id}] stitch aborted (job halted)")
                 return {'status':'ABORTED'}
+            if not _task_token_is_current(job_id, run_token, "stitch"):
+                return {'status': 'STALE', 'job_id': job_id}
 
             ready = _ready_set()
             done_fs = len(ready)
@@ -2247,8 +2311,8 @@ def stitch(job_id: str):
         redis.hset(job_key, 'status', Status.FAILED.value)
         return {'status': 'FAILED', 'error': str(e)}
 
-@huey.task()
-def stamp(job_id: str):
+@pipeline_huey.task()
+def stamp(job_id: str, run_token: Optional[str] = None):
     """
     Software re-encode with frame numbers burned-in for visual verification.
 
@@ -2264,6 +2328,9 @@ def stamp(job_id: str):
     """
 
     job_key = _job_key(job_id)
+    if not _task_token_is_current(job_id, run_token, "stamp"):
+        return {'status': 'STALE', 'job_id': job_id}
+
     job = redis.hgetall(job_key) or {}
 
     # --------- helpers ----------

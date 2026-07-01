@@ -28,6 +28,7 @@ from common import (
     get_redis,
     get_logging,
     get_settings as _get_settings,
+    invalidate_settings_cache,
     is_base_job_key,
     emit_activity,
     fetch_activity,
@@ -101,6 +102,52 @@ def get_active_nodes():
     return result
 
 
+def _assign_pipeline_node_roles(settings: dict | None = None) -> dict[str, str]:
+    """
+    Publish advisory runtime worker roles.
+
+    Until the Huey queue split lands, these roles provide operator visibility and
+    let the manager account for the future pipeline capacity model.
+    """
+    runtime = _pipeline_runtime_settings(settings)
+    enabled_nodes = [n for n in get_all_nodes() if not n.get("disabled")]
+    enabled_nodes.sort(key=lambda n: _natural_key(n["hostname"]))
+
+    pipeline_hosts = {
+        n["hostname"]
+        for n in enabled_nodes[:runtime["pipeline_worker_count"]]
+        if n.get("hostname")
+    }
+    roles = {
+        n["hostname"]: ("pipeline" if n["hostname"] in pipeline_hosts else "encode")
+        for n in enabled_nodes
+        if n.get("hostname")
+    }
+
+    try:
+        existing = redis_client.hkeys(PIPELINE_NODE_ROLES_KEY) or []
+        pipe = redis_client.pipeline()
+        if existing:
+            stale = [host for host in existing if host not in roles]
+            if stale:
+                pipe.hdel(PIPELINE_NODE_ROLES_KEY, *stale)
+        if roles:
+            pipe.hset(PIPELINE_NODE_ROLES_KEY, mapping=roles)
+        pipe.hset(PIPELINE_NODE_ROLES_META_KEY, mapping={
+            "updated_at": str(time.time()),
+            "max_active_jobs": str(runtime["max_active_jobs"]),
+            "effective_max_active_jobs": str(runtime["effective_max_active_jobs"]),
+            "active_job_limit_enforced": "0",
+            "pipeline_worker_count": str(runtime["pipeline_worker_count"]),
+            "pipeline_required_for_max_active": str(runtime["max_active_jobs"] * 2),
+        })
+        pipe.execute()
+    except Exception:
+        logger.exception("failed to publish pipeline node roles")
+
+    return roles
+
+
 def _ensure_one_worker_awake():
     active = get_active_nodes()
     if active:
@@ -142,11 +189,10 @@ PIPELINE_QUEUE_ACTION_STAMP = "STAMP"
 PIPELINE_ACTIVE_JOB_KEY = "pipeline:active_job"
 PIPELINE_ACTIVE_JOBS_KEY = "pipeline:active_jobs"
 PIPELINE_SCHED_LOCK_KEY = "pipeline:scheduler:lock"
+PIPELINE_NODE_ROLES_KEY = "pipeline:node_roles"
+PIPELINE_NODE_ROLES_META_KEY = "pipeline:node_roles:meta"
 PIPELINE_SCHED_LOCK_TTL_SEC = max(5, int(os.getenv("PIPELINE_SCHED_LOCK_TTL_SEC", "30")))
 PIPELINE_SCHED_POLL_SEC = max(0.5, float(os.getenv("PIPELINE_SCHED_POLL_SEC", "2")))
-PIPELINE_MAX_ACTIVE_JOBS = max(1, int(os.getenv("PIPELINE_MAX_ACTIVE_JOBS", "2")))
-PIPELINE_DRAIN_RATIO_TO_START_NEXT = min(1.0, max(0.0, float(os.getenv("PIPELINE_DRAIN_RATIO_TO_START_NEXT", "0.75"))))
-PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT = max(1, int(os.getenv("PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT", "4")))
 JOB_WATCHDOG_ENABLED = str(os.getenv("JOB_WATCHDOG_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
 JOB_WATCHDOG_POLL_SEC = max(2.0, float(os.getenv("JOB_WATCHDOG_POLL_SEC", "15")))
 JOB_STARTING_STALL_SEC = max(30, int(os.getenv("JOB_STARTING_STALL_SEC", "300")))
@@ -159,6 +205,41 @@ _JOB_WATCHDOG_STARTED = False
 _JOB_WATCHDOG_GUARD = threading.Lock()
 _JOB_INDEX_SCAN_TS = 0.0
 _JOB_INDEX_SCAN_GUARD = threading.Lock()
+
+def _pipeline_runtime_settings(settings: dict | None = None) -> dict:
+    settings = settings or (_get_settings() or {})
+    pipeline_worker_count = max(
+        2,
+        _int_or(
+            settings.get("pipeline_worker_count"),
+            int(os.getenv("PIPELINE_WORKER_COUNT", "4")),
+        ),
+    )
+    effective_max_active_jobs = max(1, pipeline_worker_count // 2)
+    drain_ratio = min(
+        1.0,
+        max(
+            0.0,
+            _as_float(
+                settings.get("pipeline_drain_ratio_to_start_next"),
+                float(os.getenv("PIPELINE_DRAIN_RATIO_TO_START_NEXT", "0.75")),
+            ),
+        ),
+    )
+    min_idle_workers = max(
+        1,
+        _int_or(
+            settings.get("pipeline_min_idle_workers_to_start_next"),
+            int(os.getenv("PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT", "4")),
+        ),
+    )
+    return {
+        "max_active_jobs": effective_max_active_jobs,
+        "effective_max_active_jobs": effective_max_active_jobs,
+        "pipeline_worker_count": pipeline_worker_count,
+        "pipeline_drain_ratio_to_start_next": drain_ratio,
+        "pipeline_min_idle_workers_to_start_next": min_idle_workers,
+    }
 
 def normalize_target_height(value, default: int = DEFAULT_TARGET_HEIGHT) -> int:
     try:
@@ -210,12 +291,16 @@ def _wait_for_workers(min_count: int, timeout_sec: int, on_tick=None) -> List[st
         time.sleep(1)
     return best
 
-def _launch_after_warmup(job_key: str, job_id: str, filename: str):
+def _launch_after_warmup(job_key: str, job_id: str, filename: str, run_token: str):
     """
     Wake the cluster, wait for heartbeats when needed, store audit + parts_hint, then start transcode.
     """
     try:
         warmup_started_at = time.time()
+        job = redis_client.hgetall(job_key) or {}
+        if run_token and job.get('pipeline_run_token') != run_token:
+            logger.info("[%s] warmup skipped for stale pipeline token", job_id)
+            return
         redis_client.hset(job_key, mapping={
             'last_heartbeat_at': str(warmup_started_at),
             'last_heartbeat_stage': 'warmup_start',
@@ -254,6 +339,9 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
         parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
 
         job = redis_client.hgetall(job_key) or {}
+        if run_token and job.get('pipeline_run_token') != run_token:
+            logger.info("[%s] launch skipped for stale pipeline token", job_id)
+            return
         input_path = (job.get("input_path") or "").strip()
         source_path = input_path or os.path.join(WATCH_ROOT, filename.lstrip('/'))
 
@@ -275,7 +363,7 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str):
             'last_heartbeat_note': 'launching transcode task',
             'manager_warmup_completed_at': str(time.time()),
         })
-        result = transcode(job_id, source_path)
+        result = transcode(job_id, source_path, run_token)
         redis_client.hset(job_key, mapping={
             'manager_launch_submitted_at': str(time.time()),
             'manager_launch_task_id': str(getattr(result, 'id', '') or ''),
@@ -333,6 +421,9 @@ def _load_global_settings():
     settings.setdefault("low_disk_min_free_gb", "20")
     settings.setdefault("target_segment_mb", "10")
     settings.setdefault("large_file_behavior", "direct")
+    settings.setdefault("pipeline_worker_count", "4")
+    settings.setdefault("pipeline_drain_ratio_to_start_next", "0.75")
+    settings.setdefault("pipeline_min_idle_workers_to_start_next", "4")
     return settings
 
 def _display_title(filename):
@@ -963,7 +1054,23 @@ def _active_job_encode_done_ratio(job: dict) -> float:
         return 0.0
     return min(1.0, max(0.0, float(done) / float(total)))
 
-def _active_job_is_shareable(job: dict) -> bool:
+def _active_job_pipeline_slots(job: dict) -> int:
+    try:
+        status = Status.parse((job or {}).get("status"))
+    except Exception:
+        return 1
+    if status in {Status.STARTING, Status.STAMPING}:
+        return 2 if status == Status.STARTING else 1
+
+    segment_progress = _int_or((job or {}).get("segment_progress"), 0)
+    parts_total = _int_or((job or {}).get("parts_total"), 0)
+    if status == Status.RUNNING and parts_total > 0 and segment_progress >= 100:
+        # The segmenter/master has returned to the pool; only the stitcher is held.
+        return 1
+    return 2
+
+def _active_job_is_shareable(job: dict, settings: dict | None = None) -> bool:
+    runtime = _pipeline_runtime_settings(settings)
     try:
         status = Status.parse((job or {}).get("status"))
     except Exception:
@@ -976,36 +1083,53 @@ def _active_job_is_shareable(job: dict) -> bool:
     if parts_total <= 0 or segment_progress < 100:
         return False
 
-    return _active_job_encode_done_ratio(job) >= PIPELINE_DRAIN_RATIO_TO_START_NEXT
+    return _active_job_encode_done_ratio(job) >= runtime["pipeline_drain_ratio_to_start_next"]
 
 def _can_dispatch_next_job_locked(active_jobs: list[dict]) -> tuple[bool, str]:
+    runtime = _pipeline_runtime_settings()
     if not active_jobs:
         return (True, "no_active_jobs")
-    if len(active_jobs) >= PIPELINE_MAX_ACTIVE_JOBS:
-        return (False, "max_active_jobs")
-    if any(not _active_job_is_shareable(job) for job in active_jobs):
+    if any(not _active_job_is_shareable(job, runtime) for job in active_jobs):
         return (False, "active_job_not_shareable")
 
-    active_workers = len(get_active_nodes())
+    roles = _assign_pipeline_node_roles(runtime)
+    active_nodes = get_active_nodes()
+    active_workers = len(active_nodes)
     if active_workers <= 0:
         return (False, "no_active_workers")
 
-    reserved_pipeline_nodes = len(active_jobs) * 2
+    active_pipeline_workers = sum(
+        1
+        for node in active_nodes
+        if roles.get(node["hostname"]) == "pipeline"
+    )
+    used_pipeline_slots = sum(_active_job_pipeline_slots(job) for job in active_jobs)
+    needed_pipeline_workers = used_pipeline_slots + 2
+    if active_pipeline_workers < needed_pipeline_workers:
+        return (
+            False,
+            "insufficient_pipeline_workers "
+            f"active_pipeline={active_pipeline_workers} used={used_pipeline_slots} need={needed_pipeline_workers} "
+            f"configured={runtime['pipeline_worker_count']}",
+        )
+
+    reserved_pipeline_nodes = used_pipeline_slots
     encoder_capacity = max(0, active_workers - reserved_pipeline_nodes)
     remaining = sum(_active_job_encode_remaining(job) for job in active_jobs)
     idle_estimate = max(0, encoder_capacity - remaining)
-    if idle_estimate < PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT:
+    if idle_estimate < runtime["pipeline_min_idle_workers_to_start_next"]:
         return (
             False,
             "insufficient_idle_workers "
-            f"idle={idle_estimate} need={PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT} "
+            f"idle={idle_estimate} need={runtime['pipeline_min_idle_workers_to_start_next']} "
             f"encoder_capacity={encoder_capacity} reserved_pipeline_nodes={reserved_pipeline_nodes}",
         )
 
     return (
         True,
         f"idle_workers={idle_estimate} remaining_encode_parts={remaining} "
-        f"encoder_capacity={encoder_capacity} reserved_pipeline_nodes={reserved_pipeline_nodes}",
+        f"encoder_capacity={encoder_capacity} reserved_pipeline_nodes={reserved_pipeline_nodes} "
+        f"active_pipeline_workers={active_pipeline_workers} used_pipeline_slots={used_pipeline_slots}",
     )
 
 def _acquire_pipeline_sched_lock():
@@ -1023,6 +1147,8 @@ def _release_pipeline_sched_lock(token: str):
 
 def _reserve_next_waiting_job_locked():
     active_jobs = _active_pipeline_jobs_locked()
+    runtime = _pipeline_runtime_settings()
+    _assign_pipeline_node_roles(runtime)
 
     keys = _job_index_keys()
     if not keys:
@@ -1078,8 +1204,6 @@ def _reserve_next_waiting_job_locked():
     for _, _, active_job_id, active_job in active_candidates:
         if active_job_id in known_active_ids:
             continue
-        if len(active_jobs) >= PIPELINE_MAX_ACTIVE_JOBS:
-            break
         redis_client.sadd(PIPELINE_ACTIVE_JOBS_KEY, active_job_id)
         active_job["job_id"] = active_job.get("job_id") or active_job_id
         active_jobs.append(active_job)
@@ -1107,10 +1231,12 @@ def _reserve_next_waiting_job_locked():
 
     started_at = _float_or(job.get('started_at'), 0.0)
     next_attempt = _int_or(job.get('queue_dispatch_attempts'), 0) + 1
+    run_token = uuid.uuid4().hex
     mapping = {
         'status': Status.STAMPING.value if action == PIPELINE_QUEUE_ACTION_STAMP else Status.STARTING.value,
         'queue_reserved_at': str(time.time()),
         'queue_dispatch_attempts': str(next_attempt),
+        'pipeline_run_token': run_token,
         'last_heartbeat_at': str(time.time()),
         'last_heartbeat_stage': 'stamp_dispatch' if action == PIPELINE_QUEUE_ACTION_STAMP else 'dispatch',
         'last_heartbeat_host': 'manager',
@@ -1129,6 +1255,7 @@ def _reserve_next_waiting_job_locked():
         'job_key': job_key,
         'filename': filename,
         'action': action,
+        'run_token': run_token,
         'capacity_reason': capacity_reason,
     }
 
@@ -1140,11 +1267,12 @@ def _launch_reserved_job(reserved):
     job_key = reserved['job_key']
     filename = reserved['filename']
     action = reserved['action']
+    run_token = reserved.get('run_token') or ''
 
     try:
         if action == PIPELINE_QUEUE_ACTION_STAMP:
             _ensure_one_worker_awake()
-            stamp(job_id)
+            stamp(job_id, run_token)
         else:
             emit_activity(
                 f'Started "{_display_title(filename)}"',
@@ -1153,7 +1281,7 @@ def _launch_reserved_job(reserved):
                 stage='start',
                 source='manager',
             )
-            _launch_after_warmup(job_key, job_id, filename)
+            _launch_after_warmup(job_key, job_id, filename, run_token)
     except Exception as e:
         logger.exception("[%s] reserved launch failed", job_id)
         try:
@@ -1533,6 +1661,7 @@ def nodes_data():
     """
     all_nodes = get_all_nodes()
     active_hosts = set(n["hostname"] for n in get_active_nodes())
+    roles = _assign_pipeline_node_roles()
 
     def last_seen(host):
         try:
@@ -1558,6 +1687,7 @@ def nodes_data():
             "last_seen_ts": last_seen(host),
             "active": (host in active_hosts) and not n.get("disabled"),
             "disabled": bool(n.get("disabled")),
+            "worker_role": roles.get(host, "disabled" if n.get("disabled") else "encode"),
             "quarantine_reason": quarantine.get("reason") or "",
             "quarantined_at": _float_or(quarantine.get("quarantined_at"), 0.0),
         })
@@ -1647,6 +1777,14 @@ def get_settings():
         settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
         DEFAULT_TARGET_HEIGHT
     )
+    runtime = _pipeline_runtime_settings(settings)
+    out["max_active_jobs"] = runtime["max_active_jobs"]
+    out["effective_max_active_jobs"] = runtime["effective_max_active_jobs"]
+    out["active_job_limit_enforced"] = False
+    out["pipeline_worker_count"] = runtime["pipeline_worker_count"]
+    out["pipeline_required_for_max_active"] = runtime["max_active_jobs"] * 2
+    out["pipeline_drain_ratio_to_start_next"] = runtime["pipeline_drain_ratio_to_start_next"]
+    out["pipeline_min_idle_workers_to_start_next"] = runtime["pipeline_min_idle_workers_to_start_next"]
     return jsonify(out)
 
 @app.post("/settings")
@@ -1666,10 +1804,12 @@ def post_global_settings():
         "low_disk_min_free_gb": number (>=1),
         "target_segment_mb": number (>0),
         "large_file_behavior": "reject"|"nfs"|"direct",
-        "default_target_height": 720|1080
+        "default_target_height": 720|1080,
+        "pipeline_worker_count": int (>=2)
     }
     """
     payload = request.get_json(silent=True) or {}
+    current_settings = _get_settings() or {}
     try:
         suspend_enabled = _as_bool(payload.get("suspend_enabled", False), False)
         suspend_gc_enabled = _as_bool(payload.get("suspend_gc_enabled", False), False)
@@ -1698,10 +1838,29 @@ def post_global_settings():
             payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
             DEFAULT_TARGET_HEIGHT
         )
+        pipeline_worker_count = max(2, int(payload.get("pipeline_worker_count", current_settings.get("pipeline_worker_count", 4))))
+        effective_max_active_jobs = max(1, pipeline_worker_count // 2)
+        pipeline_drain_ratio = min(
+            1.0,
+            max(0.0, _as_float(
+                payload.get(
+                    "pipeline_drain_ratio_to_start_next",
+                    current_settings.get("pipeline_drain_ratio_to_start_next", 0.75),
+                ),
+                0.75,
+            )),
+        )
+        pipeline_min_idle_workers = max(
+            1,
+            int(payload.get(
+                "pipeline_min_idle_workers_to_start_next",
+                current_settings.get("pipeline_min_idle_workers_to_start_next", 4),
+            )),
+        )
     except Exception:
         return jsonify({"error": "invalid payload"}), 400
 
-    redis_client.hset(GLOBAL_SETTINGS_KEY, mapping={
+    settings_mapping = {
         "suspend_enabled": "1" if suspend_enabled else "0",
         "suspend_idle_sec": str(idle),
         "suspend_idle_cpu_pct_max": str(idle_cpu_pct_max),
@@ -1715,22 +1874,22 @@ def post_global_settings():
         "target_segment_mb": str(target_segment_mb),
         "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
-    })
+        "max_active_jobs": str(effective_max_active_jobs),
+        "effective_max_active_jobs": str(effective_max_active_jobs),
+        "active_job_limit_enforced": "0",
+        "pipeline_worker_count": str(pipeline_worker_count),
+        "pipeline_drain_ratio_to_start_next": str(pipeline_drain_ratio),
+        "pipeline_min_idle_workers_to_start_next": str(pipeline_min_idle_workers),
+    }
+    redis_client.hset(GLOBAL_SETTINGS_KEY, mapping=settings_mapping)
     # Backward-compatible mirror for legacy readers.
-    redis_client.hset("settings:global", mapping={
-        "suspend_enabled": "1" if suspend_enabled else "0",
-        "suspend_idle_sec": str(idle),
-        "suspend_idle_cpu_pct_max": str(idle_cpu_pct_max),
-        "suspend_gc_enabled": "1" if suspend_gc_enabled else "0",
-        "max_source_file_size_gb": str(max_size_gb),
-        "av1_check_enabled": "1" if av1_check_enabled else "0",
-        "use_nfs_for_all_files": "1" if use_nfs_for_all_files else "0",
-        "use_direct_source_for_all_files": "1" if use_direct_source_for_all_files else "0",
-        "low_disk_direct_enabled": "1" if low_disk_direct_enabled else "0",
-        "low_disk_min_free_gb": str(low_disk_min_free_gb),
-        "target_segment_mb": str(target_segment_mb),
-        "large_file_behavior": large_file_behavior,
-        "default_target_height": str(default_target_height),
+    redis_client.hset("settings:global", mapping=settings_mapping)
+    invalidate_settings_cache()
+    _assign_pipeline_node_roles({
+        **settings_mapping,
+        "max_active_jobs": str(effective_max_active_jobs),
+        "effective_max_active_jobs": str(effective_max_active_jobs),
+        "pipeline_worker_count": str(pipeline_worker_count),
     })
 
     return jsonify({
@@ -1747,6 +1906,13 @@ def post_global_settings():
         "target_segment_mb": target_segment_mb,
         "large_file_behavior": large_file_behavior,
         "default_target_height": default_target_height,
+        "max_active_jobs": effective_max_active_jobs,
+        "effective_max_active_jobs": effective_max_active_jobs,
+        "active_job_limit_enforced": False,
+        "pipeline_worker_count": pipeline_worker_count,
+        "pipeline_required_for_max_active": effective_max_active_jobs * 2,
+        "pipeline_drain_ratio_to_start_next": pipeline_drain_ratio,
+        "pipeline_min_idle_workers_to_start_next": pipeline_min_idle_workers,
     })
 
 # ------------------------ Jobs API -------------------------

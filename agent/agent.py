@@ -33,6 +33,10 @@ KEY      = f"metrics:node:{HOSTNAME}"
 
 # Global settings key (controller-managed)
 GLOBAL_SETTINGS_KEY = "global:settings"
+PIPELINE_NODE_ROLES_KEY = "pipeline:node_roles"
+ROLE_SYNC_INTERVAL_SEC = max(5, int(os.getenv("ROLE_SYNC_INTERVAL_SEC", "10")))
+ENCODE_SERVICE = os.getenv("ENCODE_SERVICE", "thinman-worker-encode.service")
+PIPELINE_SERVICE = os.getenv("PIPELINE_SERVICE", "thinman-worker-pipeline.service")
 
 # ---------------- GPU sampling helpers ----------------
 def _extract_video_busy(sample: dict):
@@ -310,6 +314,43 @@ def _get_global_suspend_settings():
 
     return suspend_enabled, idle_sec, idle_cpu_pct_max, gc_before
 
+def _service_is_active(service_name: str) -> bool:
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def _set_service_state(service_name: str, should_run: bool) -> None:
+    active = _service_is_active(service_name)
+    if should_run == active:
+        return
+    action = "start" if should_run else "stop"
+    try:
+        subprocess.run(["systemctl", action, service_name], check=False)
+        logger.info("Role sync: %s %s", action, service_name)
+    except Exception as e:
+        logger.warning("Role sync failed to %s %s: %s", action, service_name, e)
+
+def _sync_worker_role_services() -> str:
+    try:
+        role = (redis_client.hget(PIPELINE_NODE_ROLES_KEY, HOSTNAME) or "encode").strip().lower()
+    except Exception as e:
+        logger.warning("Failed to read worker role: %s", e)
+        role = "encode"
+    if role not in {"pipeline", "encode"}:
+        role = "encode"
+
+    # Encode capacity is always available. Pipeline capacity is reserved for
+    # manager-selected segment/stitch-capable workers.
+    _set_service_state(ENCODE_SERVICE, True)
+    _set_service_state(PIPELINE_SERVICE, role == "pipeline")
+    return role
+
 
 # ---------------- Main loop: unified metrics + heartbeat (1 Hz) ----------------
 def main():
@@ -320,6 +361,8 @@ def main():
     node_ip, node_mac = _detect_ip_and_mac()
     next_ident_refresh = 0.0  # refresh immediately on first loop
     next_mac_publish   = 0.0  # publish nodes:mac immediately on first loop
+    next_role_sync = 0.0
+    worker_role = "encode"
 
     # Idle detection state
     idle_since = None
@@ -346,6 +389,10 @@ def main():
             next_mac_publish = time.time() + 3600  # refresh hourly
 
         # ---- Collect metrics (acts as heartbeat too) ----
+        if time.time() >= next_role_sync:
+            worker_role = _sync_worker_role_services()
+            next_role_sync = time.time() + ROLE_SYNC_INTERVAL_SEC
+
         cpu = psutil.cpu_percent(interval=None)
         vm = psutil.virtual_memory()
         mem_percent = vm.percent
@@ -378,6 +425,7 @@ def main():
             "disk": disk_percent,   # <--- NEW metric key (percent used)
             "rx_bps": rx_bps,
             "tx_bps": tx_bps,
+            "worker_role": worker_role,
         }
 
         # Single write/update per second; TTL makes liveness easy to detect
