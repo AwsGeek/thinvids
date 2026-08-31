@@ -1,0 +1,82 @@
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: thinvids-manager:local
+    container_name: thinvids_manager
+    hostname: swarm4-thinvids-manager
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - thinvids.env
+    volumes:
+      - watch_nfs:/watch
+      - library_nfs:/library
+      - config_nfs:/config
+      - source_media_nfs:/source_media:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+    command: ["gunicorn", "-w", "2", "-t", "120", "-b", "0.0.0.0:5005", "app:app"]
+
+  housekeeping:
+    image: thinvids-manager:local
+    container_name: thinvids_housekeeping
+    hostname: swarm4-thinvids-housekeeping
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - manager
+    env_file:
+      - thinvids.env
+    volumes:
+      - watch_nfs:/watch
+      - library_nfs:/library
+      - config_nfs:/config
+      - source_media_nfs:/source_media:ro
+    command: ["python", "housekeeping.py"]
+
+  watcher:
+    image: thinvids-manager:local
+    container_name: thinvids_watcher
+    hostname: swarm4-thinvids-watcher
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - manager
+    env_file:
+      - thinvids.env
+    volumes:
+      - watch_nfs:/watch
+      - config_nfs:/config
+      - source_media_nfs:/source_media:ro
+    command: ["python", "watcher.py"]
+
+volumes:
+  watch_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nfsvers=3,tcp,hard,timeo=600,retrans=2,nolock
+      device: :/volume1/shared/projects/media/archive
+
+  library_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nfsvers=3,tcp,hard,timeo=600,retrans=2,nolock
+      device: :/volume1/shared/projects/media/library
+
+  config_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.0.5,nfsvers=3,tcp,hard,timeo=600,retrans=2,nolock
+      device: :/volume1/shared/projects/transcoder/config
+
+  source_media_nfs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=swarm2,nfsvers=4,ro,soft,timeo=5,retrans=1
+      device: :/home/jerry/media/data/media

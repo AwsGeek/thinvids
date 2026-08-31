@@ -142,12 +142,25 @@
                 <p class="text-xs text-gray-600 mt-1">Used to estimate number of parts from source size.</p>
               </div>
               <div>
+                <label for="gs-min-segment-count" class="block text-sm font-medium mb-1">Minimum segments</label>
+                <input id="gs-min-segment-count" type="number" min="1" step="1" class="border p-2 rounded w-full">
+                <p class="text-xs text-gray-600 mt-1">Keeps progress granular and makes part counts independent of live worker count.</p>
+              </div>
+              <div>
                 <label for="gs-default-target-height" class="block text-sm font-medium mb-1">Default output resolution</label>
                 <select id="gs-default-target-height" class="border p-2 rounded w-full">
                   <option value="1080">1080p</option>
                   <option value="720">720p</option>
                 </select>
                 <p class="text-xs text-gray-600 mt-1">Used for new jobs unless a per-job target is set.</p>
+              </div>
+              <div>
+                <label for="gs-video-encoder" class="block text-sm font-medium mb-1">Default video encoder</label>
+                <select id="gs-video-encoder" class="border p-2 rounded w-full">
+                  <option value="h264">H264 / AVC</option>
+                  <option value="h265">H265 / HEVC</option>
+                </select>
+                <p class="text-xs text-gray-600 mt-1">Used for new jobs unless overridden in job settings.</p>
               </div>
             </div>
           </section>
@@ -157,16 +170,22 @@
               <h3 class="text-sm font-semibold text-gray-700 mb-2">Pipeline Scheduling</h3>
               <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
-                  <label for="gs-effective-max-active-jobs" class="block text-sm font-medium mb-1">Simultaneous start capacity</label>
-                  <input id="gs-effective-max-active-jobs" type="number" min="1" step="1" class="border p-2 rounded w-full bg-gray-100 text-gray-700" readonly>
+                  <label for="gs-max-active-jobs" class="block text-sm font-medium mb-1">Pipeline job slots</label>
+                  <input id="gs-max-active-jobs" type="number" min="1" step="1" class="border p-2 rounded w-full">
+                  <p class="text-xs text-gray-600 mt-1">Maximum active jobs. Each slot reserves one segmenter and one stitcher.</p>
                 </div>
                 <div>
-                  <label for="gs-pipeline-worker-count" class="block text-sm font-medium mb-1">Pipeline-capable workers</label>
-                  <input id="gs-pipeline-worker-count" type="number" min="2" step="1" class="border p-2 rounded w-full">
+                  <label for="gs-max-active-large-jobs" class="block text-sm font-medium mb-1">Large job slots</label>
+                  <input id="gs-max-active-large-jobs" type="number" min="0" step="1" class="border p-2 rounded w-full">
+                  <p class="text-xs text-gray-600 mt-1">Defaults to 1 so regular jobs can continue while one long job runs.</p>
+                </div>
+                <div>
+                  <label for="gs-pipeline-worker-count" class="block text-sm font-medium mb-1">Reserved pipeline workers</label>
+                  <input id="gs-pipeline-worker-count" type="number" min="2" step="1" class="border p-2 rounded w-full bg-gray-100 text-gray-700" readonly>
                 </div>
               </div>
               <p id="gs-pipeline-worker-hint" class="text-xs text-gray-600 mt-1">
-                Needs at least 2 pipeline-capable workers per active job.
+                Active job slots reserve 2 pipeline-capable workers each for the full job.
               </p>
             </div>
           </section>
@@ -215,8 +234,11 @@
       const chkLowDiskDirect = document.getElementById('gs-low-disk-direct-enabled');
       const numLowDiskMinFree = document.getElementById('gs-low-disk-min-free-gb');
       const numTargetSegment = document.getElementById('gs-target-segment-mb');
+      const numMinSegmentCount = document.getElementById('gs-min-segment-count');
       const selTarget  = document.getElementById('gs-default-target-height');
-      const numEffectiveMaxActiveJobs = document.getElementById('gs-effective-max-active-jobs');
+      const selVideoEncoder = document.getElementById('gs-video-encoder');
+      const numMaxActiveJobs = document.getElementById('gs-max-active-jobs');
+      const numMaxActiveLargeJobs = document.getElementById('gs-max-active-large-jobs');
       const numPipelineWorkers = document.getElementById('gs-pipeline-worker-count');
       const pipelineWorkerHint = document.getElementById('gs-pipeline-worker-hint');
 
@@ -231,10 +253,11 @@
         return n === 720 || n === 1080 ? n : fallback;
       };
       const syncPipelineWorkerHint = () => {
-        const workers = Math.max(2, parseInt(numPipelineWorkers.value || 4, 10));
-        const derived = Math.max(1, Math.floor(workers / 2));
-        numEffectiveMaxActiveJobs.value = derived;
-        pipelineWorkerHint.textContent = `${workers} pipeline-capable workers can start about ${derived} job${derived === 1 ? '' : 's'} at once. More jobs may run after earlier jobs finish segmentation and release segmenter slots.`;
+        const slots = Math.max(1, parseInt(numMaxActiveJobs.value || 2, 10));
+        const largeSlots = Math.max(0, parseInt(numMaxActiveLargeJobs.value || 1, 10));
+        const workers = Math.max(2, slots * 2);
+        numPipelineWorkers.value = workers;
+        pipelineWorkerHint.textContent = `${slots} active job slot${slots === 1 ? '' : 's'} reserve ${workers} pipeline worker${workers === 1 ? '' : 's'} total. Large jobs active at once: ${largeSlots}.`;
       };
       const showTab = (name) => {
         tabButtons.forEach((btn) => {
@@ -270,9 +293,12 @@
           chkLowDiskDirect.checked = asBool(d.low_disk_direct_enabled ?? true);
           numLowDiskMinFree.value = Number(d.low_disk_min_free_gb ?? 20);
           numTargetSegment.value = Number(d.target_segment_mb ?? 10);
+          numMinSegmentCount.value = Math.max(1, parseInt(d.min_segment_count ?? 100, 10));
           selTarget.value = String(asTargetHeight(d.default_target_height, 1080));
+          selVideoEncoder.value = ['h264', 'h265'].includes(String(d.video_encoder || 'h265')) ? String(d.video_encoder || 'h265') : 'h265';
+          numMaxActiveJobs.value = Math.max(1, parseInt(d.max_active_jobs ?? 2, 10));
+          numMaxActiveLargeJobs.value = Math.max(0, parseInt(d.max_active_large_jobs ?? 1, 10));
           numPipelineWorkers.value = Number(d.pipeline_worker_count ?? 4);
-          numEffectiveMaxActiveJobs.value = Number(d.effective_max_active_jobs ?? d.max_active_jobs ?? 2);
           syncPipelineWorkerHint();
         }catch{ toast('Failed to load global settings', false); }
       }
@@ -291,8 +317,11 @@
             low_disk_direct_enabled: !!chkLowDiskDirect.checked,
             low_disk_min_free_gb: Math.max(1, Number(numLowDiskMinFree.value || 20)),
             target_segment_mb: Math.max(1, Number(numTargetSegment.value || 10)),
+            min_segment_count: Math.max(1, parseInt(numMinSegmentCount.value || 100, 10)),
             default_target_height: asTargetHeight(selTarget.value, 1080),
-            pipeline_worker_count: Math.max(2, parseInt(numPipelineWorkers.value || 4, 10))
+            video_encoder: ['h264', 'h265'].includes(selVideoEncoder.value) ? selVideoEncoder.value : 'h265',
+            max_active_jobs: Math.max(1, parseInt(numMaxActiveJobs.value || 2, 10)),
+            max_active_large_jobs: Math.max(0, parseInt(numMaxActiveLargeJobs.value || 1, 10))
           };
           const r = await fetch('/settings', {
             method:'POST', headers:{'Content-Type':'application/json'},
@@ -306,7 +335,8 @@
 
       openBtn?.addEventListener('click', async ()=>{ await load(); show(); });
       tabButtons.forEach((btn) => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
-      numPipelineWorkers?.addEventListener('input', syncPipelineWorkerHint);
+      numMaxActiveJobs?.addEventListener('input', syncPipelineWorkerHint);
+      numMaxActiveLargeJobs?.addEventListener('input', syncPipelineWorkerHint);
       closeX?.addEventListener('click', hide);
       closeBtn?.addEventListener('click', hide);
       saveBtn?.addEventListener('click', save);

@@ -1,0 +1,10 @@
+.git
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+rips/dvd_title_cache.json
+rips/*.probe.json

@@ -17,7 +17,7 @@ import threading
 import fcntl
 
 # import backend task planner
-from tasks import transcode, stamp
+from tasks import enqueue_split_on_host, enqueue_stamp_on_host
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -33,18 +33,54 @@ from common import (
     emit_activity,
     fetch_activity,
     fetch_job_activity,
+    normalize_video_encoder,
 )
 huey = get_huey()
 redis_client = get_redis()
 logger = get_logging("manager")
 
-DIRECT_SOURCE_REQUIRED_CODECS = {"vc1", "vc-1", "wmv3"}
+DIRECT_SOURCE_REQUIRED_CODECS = {"vc1", "vc-1", "wmv3", "av1", "av01"}
+DIRECT_SOURCE_REQUIRED_AUDIO_CODECS = {"truehd", "mlp", "flac", "alac"}
 DISABLED_NODES_KEY = "nodes:disabled"
+
+def _audio_codec_requires_direct_source(codec: str) -> bool:
+    codec = str(codec or "").strip().lower()
+    return codec.startswith("pcm_") or codec in DIRECT_SOURCE_REQUIRED_AUDIO_CODECS
+
+def _selected_audio_codec_from_details(video_details: dict) -> str:
+    try:
+        selected = int(video_details.get("selected_a_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads(video_details.get("streams_json") or "{}")
+    except Exception:
+        streams = {}
+    audio_streams = streams.get("audio") or []
+    if 0 <= selected < len(audio_streams):
+        return str((audio_streams[selected] or {}).get("codec") or "").strip().lower()
+    return ""
+
+def _audio_requires_direct_source(video_details: dict) -> bool:
+    return _audio_codec_requires_direct_source(_selected_audio_codec_from_details(video_details))
+
+def _details_has_selected_audio(video_details: dict) -> bool:
+    try:
+        selected = int(video_details.get("selected_a_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads(video_details.get("streams_json") or "{}")
+    except Exception:
+        streams = {}
+    audio_streams = streams.get("audio") or []
+    return 0 <= selected < len(audio_streams)
 
 # ------------------------ Node discovery (fast path) ------------------------
 
 # Nodes are considered "active" if their last metrics timestamp is within this window
 ACTIVE_WINDOW_SEC = int(os.getenv("ACTIVE_WINDOW_SEC", "5"))
+PIPELINE_MAX_DISK_USED_PCT = max(1.0, min(99.0, float(os.getenv("PIPELINE_MAX_DISK_USED_PCT", "90"))))
 
 def get_all_nodes():
     """
@@ -102,6 +138,107 @@ def get_active_nodes():
     return result
 
 
+def _inhibit_worker_suspend(reason: str = "pipeline activity", ttl_sec: int | None = None) -> float:
+    ttl = max(30, int(ttl_sec or SUSPEND_INHIBIT_TTL_SEC))
+    now_ts = time.time()
+    until_ts = now_ts + ttl
+    try:
+        redis_client.hset(SUSPEND_INHIBIT_KEY, mapping={
+            "until": str(until_ts),
+            "updated_at": str(now_ts),
+            "reason": str(reason or "pipeline activity"),
+        })
+        redis_client.expire(SUSPEND_INHIBIT_KEY, ttl + 30)
+    except Exception:
+        logger.exception("failed to publish suspend inhibit lease")
+    return until_ts
+
+
+def _wake_all_nodes_throttled(reason: str = "pipeline activity", *, force: bool = False) -> dict:
+    now_ts = time.time()
+    if not force:
+        try:
+            last = _float_or(redis_client.get(WAKE_ALL_LAST_KEY), 0.0)
+            if last > 0 and (now_ts - last) < WAKE_ALL_THROTTLE_SEC:
+                return {
+                    "status": "skipped",
+                    "reason": "throttled",
+                    "last_at": last,
+                    "age_sec": max(0, int(now_ts - last)),
+                    "status_code": 200,
+                }
+        except Exception:
+            pass
+    result = _wake_all_nodes()
+    try:
+        redis_client.set(WAKE_ALL_LAST_KEY, str(now_ts), ex=max(WAKE_ALL_THROTTLE_SEC * 3, 60))
+    except Exception:
+        pass
+    logger.info("Wake All requested for %s: %s", reason, result)
+    return result
+
+
+def _pipeline_role_hostnames(settings: dict | None = None) -> list[str]:
+    roles = _assign_pipeline_node_roles(settings)
+    return sorted(
+        [host for host, role in roles.items() if role == "pipeline"],
+        key=_natural_key,
+    )
+
+
+def _ready_pipeline_hostnames(*, since_ts: float = 0.0, settings: dict | None = None) -> list[str]:
+    pipeline_hosts = _pipeline_role_hostnames(settings)
+    if not pipeline_hosts:
+        return []
+
+    cutoff = int(time.time()) - ACTIVE_WINDOW_SEC
+    pipe = redis_client.pipeline()
+    for host in pipeline_hosts:
+        pipe.hgetall(f"metrics:node:{host}")
+    try:
+        metrics = pipe.execute()
+    except Exception:
+        logger.exception("failed to read pipeline worker metrics")
+        return []
+
+    ready: list[tuple[float, str]] = []
+    for host, data in zip(pipeline_hosts, metrics):
+        data = data or {}
+        try:
+            ts = float(data.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        if ts < cutoff or (since_ts > 0 and ts < since_ts):
+            continue
+
+        role = (data.get("worker_role") or "pipeline").strip().lower()
+        if role != "pipeline":
+            continue
+
+        # Newer agents publish this explicit service signal. Older agents are
+        # accepted only when their post-wake metrics confirm pipeline role.
+        service_active = data.get("pipeline_service_active")
+        if service_active is not None and not _as_bool(service_active, False):
+            continue
+
+        try:
+            disk_used_pct = float(data.get("disk") or 0)
+        except Exception:
+            disk_used_pct = 0.0
+        if disk_used_pct >= PIPELINE_MAX_DISK_USED_PCT:
+            logger.warning(
+                "pipeline worker %s skipped: disk %.1f%% >= %.1f%%",
+                host,
+                disk_used_pct,
+                PIPELINE_MAX_DISK_USED_PCT,
+            )
+            continue
+
+        ready.append((disk_used_pct, host))
+    ready.sort(key=lambda row: (row[0], _natural_key(row[1])))
+    return [host for _, host in ready]
+
+
 def _assign_pipeline_node_roles(settings: dict | None = None) -> dict[str, str]:
     """
     Publish advisory runtime worker roles.
@@ -136,8 +273,9 @@ def _assign_pipeline_node_roles(settings: dict | None = None) -> dict[str, str]:
         pipe.hset(PIPELINE_NODE_ROLES_META_KEY, mapping={
             "updated_at": str(time.time()),
             "max_active_jobs": str(runtime["max_active_jobs"]),
+            "max_active_large_jobs": str(runtime["max_active_large_jobs"]),
             "effective_max_active_jobs": str(runtime["effective_max_active_jobs"]),
-            "active_job_limit_enforced": "0",
+            "active_job_limit_enforced": "1",
             "pipeline_worker_count": str(runtime["pipeline_worker_count"]),
             "pipeline_required_for_max_active": str(runtime["max_active_jobs"] * 2),
         })
@@ -149,6 +287,7 @@ def _assign_pipeline_node_roles(settings: dict | None = None) -> dict[str, str]:
 
 
 def _ensure_one_worker_awake():
+    _prepare_workers_for_pipeline_activity("worker wake request")
     active = get_active_nodes()
     if active:
         return
@@ -180,6 +319,8 @@ SOURCE_MEDIA_ROOT = os.getenv("SOURCE_MEDIA_ROOT", "/source_media")
 CONFIG_ROOT = os.getenv("CONFIG_ROOT", "/config")
 PROCESSED_FILE = os.getenv("PROCESSED_FILE", os.path.join(CONFIG_ROOT, "processed.log"))
 WATCHER_SERVICE = os.getenv("WATCHER_SERVICE", "thinvids_watcher.service")
+WATCHER_CONTROL_MODE = os.getenv("WATCHER_CONTROL_MODE", "systemd").strip().lower()
+WATCHER_CONTAINER = os.getenv("WATCHER_CONTAINER", "thinvids_watcher")
 WATCHER_ENV_FILE = os.getenv("WATCHER_ENV_FILE", os.path.join(CONFIG_ROOT, "watcher.env"))
 VIDEO_EXTS = {".mkv", ".mp4"}
 LOCAL_PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/projects")
@@ -191,14 +332,25 @@ PIPELINE_ACTIVE_JOBS_KEY = "pipeline:active_jobs"
 PIPELINE_SCHED_LOCK_KEY = "pipeline:scheduler:lock"
 PIPELINE_NODE_ROLES_KEY = "pipeline:node_roles"
 PIPELINE_NODE_ROLES_META_KEY = "pipeline:node_roles:meta"
+SUSPEND_INHIBIT_KEY = "cluster:suspend_inhibit"
+WAKE_ALL_LAST_KEY = "cluster:wake_all:last_at"
 PIPELINE_SCHED_LOCK_TTL_SEC = max(5, int(os.getenv("PIPELINE_SCHED_LOCK_TTL_SEC", "30")))
 PIPELINE_SCHED_POLL_SEC = max(0.5, float(os.getenv("PIPELINE_SCHED_POLL_SEC", "2")))
+SUSPEND_INHIBIT_TTL_SEC = max(60, int(os.getenv("SUSPEND_INHIBIT_TTL_SEC", "600")))
+WAKE_ALL_THROTTLE_SEC = max(1, int(os.getenv("WAKE_ALL_THROTTLE_SEC", "20")))
+PIPELINE_WORKERS_PER_JOB = max(1, int(os.getenv("PIPELINE_WORKERS_PER_JOB", "2")))
+PIPELINE_WAKE_SETTLE_SEC = max(0, int(os.getenv("PIPELINE_WAKE_SETTLE_SEC", "15")))
 JOB_WATCHDOG_ENABLED = str(os.getenv("JOB_WATCHDOG_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
 JOB_WATCHDOG_POLL_SEC = max(2.0, float(os.getenv("JOB_WATCHDOG_POLL_SEC", "15")))
 JOB_STARTING_STALL_SEC = max(30, int(os.getenv("JOB_STARTING_STALL_SEC", "300")))
+JOB_STARTING_MAX_RETRIES = max(1, int(os.getenv("JOB_STARTING_MAX_RETRIES", "3")))
 JOB_RUNNING_STALL_SEC = max(60, int(os.getenv("JOB_RUNNING_STALL_SEC", "900")))
 JOB_STAMPING_STALL_SEC = max(60, int(os.getenv("JOB_STAMPING_STALL_SEC", "900")))
+JOB_STITCH_WAIT_TOTAL_STALL_SEC = max(60, int(os.getenv("JOB_STITCH_WAIT_TOTAL_STALL_SEC", "360")))
+JOB_POST_ENCODE_STITCH_STALL_SEC = max(30, int(os.getenv("JOB_POST_ENCODE_STITCH_STALL_SEC", "120")))
 JOB_INDEX_REINDEX_SEC = max(15.0, float(os.getenv("JOB_INDEX_REINDEX_SEC", "60")))
+JOBS_BY_DATE_KEY = "jobs:by_date"
+JOBS_BY_DATE_REINDEX_LOCK_KEY = "jobs:by_date:reindex_lock"
 _PIPELINE_SCHED_STARTED = False
 _PIPELINE_SCHED_GUARD = threading.Lock()
 _JOB_WATCHDOG_STARTED = False
@@ -208,37 +360,28 @@ _JOB_INDEX_SCAN_GUARD = threading.Lock()
 
 def _pipeline_runtime_settings(settings: dict | None = None) -> dict:
     settings = settings or (_get_settings() or {})
-    pipeline_worker_count = max(
-        2,
-        _int_or(
-            settings.get("pipeline_worker_count"),
-            int(os.getenv("PIPELINE_WORKER_COUNT", "4")),
-        ),
-    )
-    effective_max_active_jobs = max(1, pipeline_worker_count // 2)
-    drain_ratio = min(
-        1.0,
-        max(
-            0.0,
-            _as_float(
-                settings.get("pipeline_drain_ratio_to_start_next"),
-                float(os.getenv("PIPELINE_DRAIN_RATIO_TO_START_NEXT", "0.75")),
-            ),
-        ),
-    )
-    min_idle_workers = max(
+    max_active_jobs = max(
         1,
         _int_or(
-            settings.get("pipeline_min_idle_workers_to_start_next"),
-            int(os.getenv("PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT", "4")),
+            settings.get("max_active_jobs"),
+            int(os.getenv("MAX_ACTIVE_JOBS", "2")),
         ),
     )
+    max_active_large_jobs = max(
+        0,
+        _int_or(
+            settings.get("max_active_large_jobs"),
+            int(os.getenv("MAX_ACTIVE_LARGE_JOBS", "1")),
+        ),
+    )
+    # Keep the model simple and explicit: each active job owns one segmenter
+    # and one stitcher for the whole run.
+    pipeline_worker_count = max(2, max_active_jobs * PIPELINE_WORKERS_PER_JOB)
     return {
-        "max_active_jobs": effective_max_active_jobs,
-        "effective_max_active_jobs": effective_max_active_jobs,
+        "max_active_jobs": max_active_jobs,
+        "max_active_large_jobs": max_active_large_jobs,
+        "effective_max_active_jobs": max_active_jobs,
         "pipeline_worker_count": pipeline_worker_count,
-        "pipeline_drain_ratio_to_start_next": drain_ratio,
-        "pipeline_min_idle_workers_to_start_next": min_idle_workers,
     }
 
 def normalize_target_height(value, default: int = DEFAULT_TARGET_HEIGHT) -> int:
@@ -291,6 +434,50 @@ def _wait_for_workers(min_count: int, timeout_sec: int, on_tick=None) -> List[st
         time.sleep(1)
     return best
 
+
+def _wait_for_pipeline_workers(
+    *,
+    min_count: int,
+    desired_count: int,
+    timeout_sec: int,
+    since_ts: float,
+    required_hosts: list[str] | None = None,
+    on_tick=None,
+) -> list[str]:
+    deadline = time.time() + max(0, int(timeout_sec))
+    best: list[str] = []
+    desired = max(min_count, desired_count)
+    min_ready_at = 0.0
+    required = {_host_short(host) for host in (required_hosts or []) if _host_short(host)}
+    while time.time() < deadline:
+        cur = _ready_pipeline_hostnames(since_ts=since_ts)
+        if required:
+            cur = [host for host in cur if _host_short(host) in required]
+        if on_tick:
+            try:
+                on_tick(cur, best, deadline)
+            except Exception:
+                pass
+        if len(cur) >= desired:
+            return cur
+        if len(cur) >= min_count:
+            if min_ready_at <= 0:
+                min_ready_at = time.time()
+            if PIPELINE_WAKE_SETTLE_SEC <= 0 or (time.time() - min_ready_at) >= PIPELINE_WAKE_SETTLE_SEC:
+                return cur
+        if len(cur) > len(best):
+            best = cur
+        time.sleep(1)
+    return best
+
+
+def _prepare_workers_for_pipeline_activity(reason: str, *, force_wake: bool = False) -> None:
+    _inhibit_worker_suspend(reason)
+    try:
+        _wake_all_nodes_throttled(reason, force=force_wake)
+    except Exception as e:
+        logger.warning("wake all failed during %s: %s", reason, e)
+
 def _launch_after_warmup(job_key: str, job_id: str, filename: str, run_token: str):
     """
     Wake the cluster, wait for heartbeats when needed, store audit + parts_hint, then start transcode.
@@ -309,31 +496,52 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str, run_token: st
             'manager_warmup_started_at': str(warmup_started_at),
         })
 
-        # Best-effort WOL
-        try:
-            _wake_all_nodes()
-        except Exception as e:
-            logger.warning("_wake_all_nodes() raised: %s", e)
+        runtime = _pipeline_runtime_settings()
+        reserved_hosts = [
+            _host_short(job.get("reserved_segment_host") or ""),
+            _host_short(job.get("reserved_stitch_host") or ""),
+        ]
+        reserved_hosts = [host for host in reserved_hosts if host]
+        pipeline_hosts = reserved_hosts or _pipeline_role_hostnames(runtime)
+        if not pipeline_hosts:
+            raise RuntimeError("no enabled pipeline workers are configured")
+        min_pipeline = min(len(pipeline_hosts), PIPELINE_WORKERS_PER_JOB)
+        desired_pipeline = min_pipeline if reserved_hosts else min(len(pipeline_hosts), runtime["pipeline_worker_count"])
 
-        # If workers are already active, don't wait the full warmup window.
-        existing = _current_active_hostnames()
-        if existing:
-            seen = existing
-        else:
-            # Target at most what's realistically available
-            total_known = max(1, len(get_all_nodes()))
-            wanted = max(1, min(MIN_WARMUP_WORKERS, total_known))
-            def _warmup_tick(current, best, deadline):
-                redis_client.hset(job_key, mapping={
-                    'last_heartbeat_at': str(time.time()),
-                    'last_heartbeat_stage': 'warmup_wait',
-                    'last_heartbeat_host': 'manager',
-                    'last_heartbeat_note': (
-                        f"active={len(current)} best={max(len(best), len(current))} "
-                        f"wanted={wanted} remaining={max(0, int(deadline - time.time()))}s"
-                    ),
-                })
-            seen = _wait_for_workers(wanted, CLUSTER_WARMUP_SEC, on_tick=_warmup_tick)
+        # Best-effort WOL for every enabled node. Do this even when some nodes
+        # appear active, because stale pre-suspend metrics are not launch proof.
+        _prepare_workers_for_pipeline_activity(f"launch {job_id}", force_wake=True)
+
+        def _warmup_tick(current, best, deadline):
+            _inhibit_worker_suspend(f"warmup {job_id}")
+            redis_client.hset(job_key, mapping={
+                'last_heartbeat_at': str(time.time()),
+                'last_heartbeat_stage': 'warmup_wait',
+                'last_heartbeat_host': 'manager',
+                'last_heartbeat_note': (
+                    f"pipeline_ready={len(current)} best={max(len(best), len(current))} "
+                    f"min={min_pipeline} desired={desired_pipeline} "
+                    f"reserved={','.join(reserved_hosts) or 'none'} "
+                    f"remaining={max(0, int(deadline - time.time()))}s"
+                ),
+            })
+
+        pipeline_ready = _wait_for_pipeline_workers(
+            min_count=min_pipeline,
+            desired_count=desired_pipeline,
+            timeout_sec=CLUSTER_WARMUP_SEC,
+            since_ts=warmup_started_at,
+            required_hosts=reserved_hosts,
+            on_tick=_warmup_tick,
+        )
+        if len(pipeline_ready) < min_pipeline:
+            raise RuntimeError(
+                "insufficient fresh pipeline workers after wake: "
+                f"ready={len(pipeline_ready)} min={min_pipeline} desired={desired_pipeline} "
+                f"pipeline_hosts={','.join(pipeline_hosts)}"
+            )
+
+        seen = _current_active_hostnames()
 
         # Compute parts hint
         parts_hint = max(MIN_PARTS, min(MAX_PARTS, max(0, len(seen)) * PARTS_PER_WORKER))
@@ -363,7 +571,10 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str, run_token: st
             'last_heartbeat_note': 'launching transcode task',
             'manager_warmup_completed_at': str(time.time()),
         })
-        result = transcode(job_id, source_path, run_token)
+        reserved_segment_host = _host_short(job.get("reserved_segment_host") or "")
+        if not reserved_segment_host:
+            raise RuntimeError("reserved segment host missing")
+        result = enqueue_split_on_host(reserved_segment_host, job_id, source_path, run_token)
         redis_client.hset(job_key, mapping={
             'manager_launch_submitted_at': str(time.time()),
             'manager_launch_task_id': str(getattr(result, 'id', '') or ''),
@@ -371,7 +582,11 @@ def _launch_after_warmup(job_key: str, job_id: str, filename: str, run_token: st
     except Exception as e:
         logger.exception("[%s] launch_after_warmup failed", job_id)
         try:
-            redis_client.hset(job_key, mapping={'status': Status.FAILED.value, 'error': str(e)})
+            redis_client.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': str(e),
+                'pipeline_run_token': '',
+            })
             _clear_active_job_refs(job_id)
         except Exception:
             pass
@@ -420,10 +635,12 @@ def _load_global_settings():
     settings.setdefault("low_disk_direct_enabled", "1")
     settings.setdefault("low_disk_min_free_gb", "20")
     settings.setdefault("target_segment_mb", "10")
+    settings.setdefault("min_segment_count", "100")
     settings.setdefault("large_file_behavior", "direct")
+    settings.setdefault("max_active_jobs", "2")
+    settings.setdefault("max_active_large_jobs", "1")
     settings.setdefault("pipeline_worker_count", "4")
-    settings.setdefault("pipeline_drain_ratio_to_start_next", "0.75")
-    settings.setdefault("pipeline_min_idle_workers_to_start_next", "4")
+    settings.setdefault("video_encoder", "h265")
     return settings
 
 def _display_title(filename):
@@ -593,7 +810,81 @@ def _parse_systemd_environment(raw: str):
             env[key] = value
     return env
 
+def _docker_client():
+    try:
+        import docker
+    except Exception as exc:
+        raise RuntimeError("Docker SDK is not available in this manager container") from exc
+    return docker.from_env()
+
+def _docker_container_env(container):
+    env = {}
+    try:
+        raw_env = ((container.attrs or {}).get("Config") or {}).get("Env") or []
+    except Exception:
+        raw_env = []
+    for item in raw_env:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        env[key] = value
+    return env
+
+def _read_watcher_container():
+    try:
+        client = _docker_client()
+        container = client.containers.get(WATCHER_CONTAINER)
+        try:
+            container.reload()
+        except Exception:
+            pass
+        attrs = container.attrs or {}
+        state = attrs.get("State") or {}
+        status = container.status or state.get("Status") or "unknown"
+        started_at = state.get("StartedAt") or ""
+        finished_at = state.get("FinishedAt") or ""
+        restart_count = attrs.get("RestartCount", 0)
+        return {
+            "service_name": WATCHER_CONTAINER,
+            "hostname": socket.gethostname(),
+            "control_mode": "docker",
+            "systemctl": {"returncode": 0, "stdout": "", "stderr": ""},
+            "enabled": "compose",
+            "active": "active" if status == "running" else status,
+            "properties": {
+                "ActiveState": "active" if status == "running" else status,
+                "SubState": status,
+                "LoadState": "loaded",
+                "UnitFileState": "compose",
+                "MainPID": str(state.get("Pid") or ""),
+                "ExecMainPID": str(state.get("Pid") or ""),
+                "ExecMainStatus": str(state.get("ExitCode") or ""),
+                "NRestarts": str(restart_count),
+                "ActiveEnterTimestamp": started_at,
+                "InactiveEnterTimestamp": finished_at,
+                "ContainerId": container.id,
+                "ContainerName": container.name,
+                "Image": str(attrs.get("Config", {}).get("Image") or ""),
+            },
+            "environment": _docker_container_env(container),
+        }
+    except Exception as exc:
+        return {
+            "service_name": WATCHER_CONTAINER,
+            "hostname": socket.gethostname(),
+            "control_mode": "docker",
+            "systemctl": {"returncode": 1, "stdout": "", "stderr": str(exc)},
+            "enabled": "unknown",
+            "active": "unknown",
+            "properties": {},
+            "environment": {},
+            "error": str(exc),
+        }
+
 def _read_watcher_service():
+    if WATCHER_CONTROL_MODE == "docker":
+        return _read_watcher_container()
+
     systemctl = shutil.which("systemctl") or "/bin/systemctl"
     props = [
         "ActiveState",
@@ -627,6 +918,7 @@ def _read_watcher_service():
     return {
         "service_name": WATCHER_SERVICE,
         "hostname": socket.gethostname(),
+        "control_mode": "systemd",
         "systemctl": _command_result_payload(result),
         "enabled": (enabled.stdout or "").strip() if enabled.returncode == 0 else "unknown",
         "active": (active.stdout or "").strip() if active.returncode == 0 else data.get("ActiveState", "unknown"),
@@ -684,6 +976,15 @@ def _watcher_activity(limit=80):
         limit = max(1, min(250, int(limit)))
     except Exception:
         limit = 80
+    if WATCHER_CONTROL_MODE == "docker":
+        try:
+            client = _docker_client()
+            container = client.containers.get(WATCHER_CONTAINER)
+            raw = container.logs(tail=limit, timestamps=True).decode("utf-8", errors="replace")
+            return {"lines": [line for line in raw.splitlines() if line.strip()], "error": ""}
+        except Exception as exc:
+            return {"lines": [], "error": str(exc)}
+
     journalctl = shutil.which("journalctl")
     if not journalctl:
         return {"lines": [], "error": "journalctl is not available on this host"}
@@ -794,6 +1095,24 @@ def _control_watcher(action: str):
     action = str(action or "").strip().lower()
     if action not in WATCHER_ALLOWED_ACTIONS:
         raise ValueError("Action must be start, stop, or restart.")
+    if WATCHER_CONTROL_MODE == "docker":
+        try:
+            client = _docker_client()
+            container = client.containers.get(WATCHER_CONTAINER)
+            if action == "start":
+                container.start()
+            elif action == "stop":
+                container.stop(timeout=30)
+            else:
+                container.restart(timeout=30)
+            return {
+                "returncode": 0,
+                "stdout": f"{action} sent to Docker container {WATCHER_CONTAINER}",
+                "stderr": "",
+            }
+        except Exception as exc:
+            return {"returncode": 1, "stdout": "", "stderr": str(exc)}
+
     systemctl = shutil.which("systemctl") or "/bin/systemctl"
     sudo = shutil.which("sudo")
     cmd = [systemctl, action, WATCHER_SERVICE]
@@ -824,6 +1143,78 @@ def _job_source_path(filename: str, input_path: str = "") -> str:
     if input_path:
         return _safe_existing_input_path(input_path)
     return _watch_abs_path(filename)
+
+def _rel_path_under(root_path: str, path: str) -> str:
+    root = os.path.realpath(root_path)
+    real = os.path.realpath(path)
+    if real == root:
+        return ""
+    if not real.startswith(root + os.sep):
+        raise ValueError("Path is not under root")
+    return os.path.relpath(real, root).replace("\\", "/")
+
+def _without_incoming_prefix(rel_path: str) -> str:
+    rel = _safe_watch_rel_path(rel_path)
+    incoming = ".incoming/"
+    if rel.startswith(incoming):
+        return rel[len(incoming):]
+    marker = "/" + incoming
+    if marker in rel:
+        return rel.replace(marker, "/", 1)
+    return rel
+
+def _resolve_restart_source(filename: str, input_path: str = "") -> tuple[str, str]:
+    """
+    Resolve a restart source from the current job fields.
+
+    Older watcher jobs can retain a temporary .incoming path even after Sonarr or
+    Radarr has moved the file into its final watch location. Prefer valid explicit
+    input_path values, but if the staging path is gone, fall back to the final
+    watch-relative path before deciding the job cannot be restarted.
+    """
+    candidates: list[tuple[str, str]] = []
+
+    raw_input = str(input_path or "").strip()
+    if raw_input:
+        candidates.append((filename, raw_input))
+        try:
+            watch_rel = _rel_path_under(WATCH_ROOT, raw_input)
+            final_rel = _without_incoming_prefix(watch_rel)
+            if final_rel != watch_rel:
+                candidates.append((final_rel, _watch_abs_path(final_rel)))
+        except Exception:
+            pass
+
+    safe_filename = _safe_watch_rel_path(filename)
+    if safe_filename:
+        candidates.append((safe_filename, _watch_abs_path(safe_filename)))
+        final_filename = _without_incoming_prefix(safe_filename)
+        if final_filename != safe_filename:
+            candidates.append((final_filename, _watch_abs_path(final_filename)))
+
+    seen = set()
+    missing = []
+    for candidate_filename, candidate_path in candidates:
+        key = (candidate_filename, candidate_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            resolved_path = _safe_existing_input_path(candidate_path)
+        except FileNotFoundError:
+            missing.append(candidate_path)
+            continue
+        except Exception:
+            continue
+
+        if _source_origin_for_path(resolved_path) == "watch":
+            resolved_filename = _rel_path_under(WATCH_ROOT, resolved_path)
+        else:
+            resolved_filename = _safe_watch_rel_path(candidate_filename)
+        return resolved_filename, resolved_path
+
+    detail = f"; checked: {', '.join(missing[:4])}" if missing else ""
+    raise FileNotFoundError(f"restart source file not found for {filename!r}{detail}")
 
 def _file_signature(path: str) -> str:
     st = os.stat(path)
@@ -895,6 +1286,8 @@ def _evaluate_job_policy(video_details, settings):
     scratch_root = NFS_PROJECT_ROOT if use_nfs_for_all_files else LOCAL_PROJECT_ROOT
 
     if source_codec in DIRECT_SOURCE_REQUIRED_CODECS:
+        return (None, None, scratch_mode, scratch_root, "direct")
+    if _details_has_selected_audio(video_details):
         return (None, None, scratch_mode, scratch_root, "direct")
 
     max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
@@ -982,7 +1375,6 @@ def _clear_active_job_refs(job_id: str):
         redis_client.srem(PIPELINE_ACTIVE_JOBS_KEY, job_id)
     except Exception:
         pass
-
 def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
     now = time.time()
     redis_client.hset(job_key, mapping={
@@ -992,6 +1384,14 @@ def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
         'started_at': str(started_at),
         'queue_dispatch_attempts': '0',
         'queue_reserved_at': '0',
+        'pipeline_run_token': '',
+        'run_state_reset_token': '',
+        'master_host': '',
+        'stitch_host': '',
+        'stitch_enqueued_at': '',
+        'manager_launch_enqueued_at': '',
+        'manager_launch_submitted_at': '',
+        'manager_launch_task_id': '',
         'last_heartbeat_at': str(now),
         'last_heartbeat_stage': 'queue',
         'last_heartbeat_host': 'manager',
@@ -999,6 +1399,7 @@ def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
     })
     try:
         job = redis_client.hgetall(job_key) or {}
+        _index_job_for_listing(job_key, job)
         job_id = (job.get('job_id') or (job_key.split(':', 1)[1] if ':' in job_key else '')).strip()
         filename = job.get('filename') or ''
         emit_activity(
@@ -1010,6 +1411,7 @@ def _queue_job_for_dispatch(job_key: str, action: str, started_at: float):
         )
     except Exception:
         pass
+    _invalidate_jobs_cache()
 
 def _active_pipeline_jobs_locked() -> list[dict]:
     active_ids = set(redis_client.smembers(PIPELINE_ACTIVE_JOBS_KEY) or [])
@@ -1040,96 +1442,114 @@ def _active_pipeline_jobs_locked() -> list[dict]:
 
     return active_jobs
 
-def _active_job_encode_remaining(job: dict) -> int:
-    total = _int_or((job or {}).get("parts_total"), 0)
-    done = _int_or((job or {}).get("parts_done"), 0)
-    if total <= 0:
-        return 0
-    return max(0, total - done)
+def _host_short(value: str) -> str:
+    return str(value or "").strip().lower().split(".", 1)[0]
 
-def _active_job_encode_done_ratio(job: dict) -> float:
-    total = _int_or((job or {}).get("parts_total"), 0)
-    done = _int_or((job or {}).get("parts_done"), 0)
-    if total <= 0:
-        return 0.0
-    return min(1.0, max(0.0, float(done) / float(total)))
+def _active_job_reserved_pipeline_hosts(job: dict) -> set[str]:
+    job = job or {}
+    hosts = {
+        _host_short(job.get("reserved_segment_host") or ""),
+        _host_short(job.get("reserved_stitch_host") or ""),
+    }
+    if not any(hosts):
+        # Legacy/in-flight jobs created before explicit reservations still need
+        # to occupy capacity. Infer from observed master/stitch endpoints.
+        hosts = {
+            _host_short(_host_from_endpoint(job.get("master_host") or "")),
+            _host_short(_host_from_endpoint(job.get("stitch_host") or "")),
+        }
+    return {host for host in hosts if host}
 
-def _active_job_pipeline_slots(job: dict) -> int:
-    try:
-        status = Status.parse((job or {}).get("status"))
-    except Exception:
-        return 1
-    if status in {Status.STARTING, Status.STAMPING}:
-        return 2 if status == Status.STARTING else 1
+def _reserved_pipeline_hosts_for_active_jobs(active_jobs: list[dict]) -> set[str]:
+    reserved: set[str] = set()
+    for job in active_jobs:
+        reserved.update(_active_job_reserved_pipeline_hosts(job))
+    return reserved
 
-    segment_progress = _int_or((job or {}).get("segment_progress"), 0)
-    parts_total = _int_or((job or {}).get("parts_total"), 0)
-    if status == Status.RUNNING and parts_total > 0 and segment_progress >= 100:
-        # The segmenter/master has returned to the pool; only the stitcher is held.
-        return 1
-    return 2
+def _select_pipeline_reservation_hosts(active_jobs: list[dict], runtime: dict) -> list[str]:
+    ready_hosts = [_host_short(h) for h in _ready_pipeline_hostnames(settings=runtime)]
+    reserved_hosts = _reserved_pipeline_hosts_for_active_jobs(active_jobs)
+    available = [host for host in ready_hosts if host and host not in reserved_hosts]
+    return available[:PIPELINE_WORKERS_PER_JOB]
 
-def _active_job_is_shareable(job: dict, settings: dict | None = None) -> bool:
-    runtime = _pipeline_runtime_settings(settings)
-    try:
-        status = Status.parse((job or {}).get("status"))
-    except Exception:
-        return False
-    if status != Status.RUNNING:
-        return False
+def _is_long_running_pipeline_job(job: dict, settings: dict | None = None) -> bool:
+    job = job or {}
+    settings = settings or _load_global_settings()
 
-    segment_progress = _int_or((job or {}).get("segment_progress"), 0)
-    parts_total = _int_or((job or {}).get("parts_total"), 0)
-    if parts_total <= 0 or segment_progress < 100:
-        return False
+    scratch_mode = str(job.get("scratch_mode") or "").strip().lower()
+    scratch_root = str(job.get("scratch_root_effective") or job.get("scratch_root") or "").strip()
+    processing_mode = str(job.get("processing_mode_effective") or job.get("processing_mode") or "").strip().lower()
+    if scratch_mode == "nfs" or scratch_root == NFS_PROJECT_ROOT:
+        return True
 
-    return _active_job_encode_done_ratio(job) >= runtime["pipeline_drain_ratio_to_start_next"]
+    source_size = _as_int(job.get("source_file_size"), 0)
+    max_source_file_size_gb = _as_float(settings.get("max_source_file_size_gb", 15), 15.0)
+    max_source_bytes = int(max_source_file_size_gb * 1024 * 1024 * 1024)
+    if max_source_bytes > 0 and source_size > max_source_bytes:
+        return True
 
-def _can_dispatch_next_job_locked(active_jobs: list[dict]) -> tuple[bool, str]:
+    # Split jobs with very high part counts tend to hold pipeline resources for
+    # a long time even if size metadata is imperfect.
+    effective_parts = _int_or(job.get("effective_parts") or job.get("parts_total"), 0)
+    return processing_mode == "split" and effective_parts >= 300
+
+def _can_dispatch_next_job_locked(active_jobs: list[dict], candidate_job: dict | None = None) -> tuple[bool, str]:
     runtime = _pipeline_runtime_settings()
-    if not active_jobs:
-        return (True, "no_active_jobs")
-    if any(not _active_job_is_shareable(job, runtime) for job in active_jobs):
-        return (False, "active_job_not_shareable")
-
     roles = _assign_pipeline_node_roles(runtime)
     active_nodes = get_active_nodes()
     active_workers = len(active_nodes)
     if active_workers <= 0:
         return (False, "no_active_workers")
 
-    active_pipeline_workers = sum(
-        1
-        for node in active_nodes
-        if roles.get(node["hostname"]) == "pipeline"
-    )
-    used_pipeline_slots = sum(_active_job_pipeline_slots(job) for job in active_jobs)
-    needed_pipeline_workers = used_pipeline_slots + 2
-    if active_pipeline_workers < needed_pipeline_workers:
+    if len(active_jobs) >= runtime["max_active_jobs"]:
+        return (
+            False,
+            f"max_active_jobs_reached active={len(active_jobs)} limit={runtime['max_active_jobs']}",
+        )
+
+    if candidate_job and _is_long_running_pipeline_job(candidate_job, runtime):
+        active_long_jobs = [
+            (job.get("job_id") or "").strip()
+            for job in active_jobs
+            if _is_long_running_pipeline_job(job, runtime)
+        ]
+        if len(active_long_jobs) >= runtime["max_active_large_jobs"]:
+            return (
+                False,
+                "max_active_large_jobs_reached "
+                f"active_long={','.join(active_long_jobs)} "
+                f"limit={runtime['max_active_large_jobs']} "
+                f"candidate={(candidate_job.get('job_id') or '').strip()}",
+            )
+
+    active_pipeline_hosts = _ready_pipeline_hostnames(settings=runtime)
+    active_pipeline_workers = len(active_pipeline_hosts)
+    reserved_pipeline_hosts = _reserved_pipeline_hosts_for_active_jobs(active_jobs)
+    available_pipeline_hosts = [
+        _host_short(host)
+        for host in active_pipeline_hosts
+        if _host_short(host) not in reserved_pipeline_hosts
+    ]
+    if len(available_pipeline_hosts) < PIPELINE_WORKERS_PER_JOB:
         return (
             False,
             "insufficient_pipeline_workers "
-            f"active_pipeline={active_pipeline_workers} used={used_pipeline_slots} need={needed_pipeline_workers} "
+            f"active_pipeline={active_pipeline_workers} reserved={len(reserved_pipeline_hosts)} "
+            f"available={len(available_pipeline_hosts)} need={PIPELINE_WORKERS_PER_JOB} "
             f"configured={runtime['pipeline_worker_count']}",
         )
 
-    reserved_pipeline_nodes = used_pipeline_slots
+    reserved_pipeline_nodes = len(reserved_pipeline_hosts)
     encoder_capacity = max(0, active_workers - reserved_pipeline_nodes)
-    remaining = sum(_active_job_encode_remaining(job) for job in active_jobs)
-    idle_estimate = max(0, encoder_capacity - remaining)
-    if idle_estimate < runtime["pipeline_min_idle_workers_to_start_next"]:
-        return (
-            False,
-            "insufficient_idle_workers "
-            f"idle={idle_estimate} need={runtime['pipeline_min_idle_workers_to_start_next']} "
-            f"encoder_capacity={encoder_capacity} reserved_pipeline_nodes={reserved_pipeline_nodes}",
-        )
 
     return (
         True,
-        f"idle_workers={idle_estimate} remaining_encode_parts={remaining} "
+        f"pipeline_slots_available active_pipeline={active_pipeline_workers} "
+        f"reserved_pipeline_hosts={','.join(sorted(reserved_pipeline_hosts))} "
+        f"available_pipeline_hosts={','.join(available_pipeline_hosts)} "
         f"encoder_capacity={encoder_capacity} reserved_pipeline_nodes={reserved_pipeline_nodes} "
-        f"active_pipeline_workers={active_pipeline_workers} used_pipeline_slots={used_pipeline_slots}",
+        f"active_jobs={len(active_jobs)} max_active_jobs={runtime['max_active_jobs']} "
+        f"ready_pipeline={','.join(active_pipeline_hosts)}",
     )
 
 def _acquire_pipeline_sched_lock():
@@ -1212,22 +1632,55 @@ def _reserve_next_waiting_job_locked():
     if not candidates:
         return None
 
-    can_dispatch, capacity_reason = _can_dispatch_next_job_locked(active_jobs)
-    if not can_dispatch:
-        now_ts = time.time()
-        for _, _, waiting_job_id, waiting_job_key, _, _, _ in candidates:
+    _prepare_workers_for_pipeline_activity("waiting job dispatch")
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    selected = None
+    blocked_reasons: list[tuple[str, str, str]] = []
+    for _, _, candidate_job_id, candidate_job_key, candidate_filename, candidate_action, candidate_job in candidates:
+        can_dispatch, capacity_reason = _can_dispatch_next_job_locked(active_jobs, candidate_job)
+        if can_dispatch:
+            selected = (
+                candidate_job_id,
+                candidate_job_key,
+                candidate_filename,
+                candidate_action,
+                candidate_job,
+            )
+            break
+        blocked_reasons.append((candidate_job_id, candidate_job_key, capacity_reason))
+
+    now_ts = time.time()
+    if blocked_reasons:
+        for blocked_job_id, blocked_job_key, capacity_reason in blocked_reasons:
             try:
-                redis_client.hset(waiting_job_key, mapping={
+                redis_client.hset(blocked_job_key, mapping={
                     "queue_blocked_reason": capacity_reason,
                     "queue_blocked_active_jobs": str(len(active_jobs)),
                     "queue_blocked_at": str(now_ts),
                 })
             except Exception:
                 pass
+
+    if selected is None:
         return None
 
-    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-    _, _, job_id, job_key, filename, action, job = candidates[0]
+    job_id, job_key, filename, action, job = selected
+    reserved_hosts = _select_pipeline_reservation_hosts(active_jobs, runtime)
+    if len(reserved_hosts) < PIPELINE_WORKERS_PER_JOB:
+        try:
+            redis_client.hset(job_key, mapping={
+                "queue_blocked_reason": (
+                    "insufficient_pipeline_workers "
+                    f"available={len(reserved_hosts)} need={PIPELINE_WORKERS_PER_JOB}"
+                ),
+                "queue_blocked_active_jobs": str(len(active_jobs)),
+                "queue_blocked_at": str(time.time()),
+            })
+        except Exception:
+            pass
+        return None
+    reserved_segment_host = reserved_hosts[0]
+    reserved_stitch_host = reserved_hosts[1] if len(reserved_hosts) > 1 else reserved_hosts[0]
 
     started_at = _float_or(job.get('started_at'), 0.0)
     next_attempt = _int_or(job.get('queue_dispatch_attempts'), 0) + 1
@@ -1237,6 +1690,10 @@ def _reserve_next_waiting_job_locked():
         'queue_reserved_at': str(time.time()),
         'queue_dispatch_attempts': str(next_attempt),
         'pipeline_run_token': run_token,
+        'run_state_reset_token': '',
+        'master_host': '',
+        'stitch_host': '',
+        'stitch_enqueued_at': '',
         'last_heartbeat_at': str(time.time()),
         'last_heartbeat_stage': 'stamp_dispatch' if action == PIPELINE_QUEUE_ACTION_STAMP else 'dispatch',
         'last_heartbeat_host': 'manager',
@@ -1244,6 +1701,10 @@ def _reserve_next_waiting_job_locked():
         'queue_blocked_reason': '',
         'queue_blocked_active_jobs': '',
         'queue_blocked_at': '',
+        'reserved_segment_host': reserved_segment_host,
+        'reserved_stitch_host': reserved_stitch_host,
+        'pipeline_reserved_hosts_json': json.dumps(reserved_hosts),
+        'pipeline_reserved_at': str(time.time()),
     }
     if started_at <= 0:
         mapping['started_at'] = str(time.time())
@@ -1257,6 +1718,7 @@ def _reserve_next_waiting_job_locked():
         'action': action,
         'run_token': run_token,
         'capacity_reason': capacity_reason,
+        'reserved_hosts': reserved_hosts,
     }
 
 def _launch_reserved_job(reserved):
@@ -1272,7 +1734,11 @@ def _launch_reserved_job(reserved):
     try:
         if action == PIPELINE_QUEUE_ACTION_STAMP:
             _ensure_one_worker_awake()
-            stamp(job_id, run_token)
+            job = redis_client.hgetall(job_key) or {}
+            reserved_segment_host = _host_short(job.get("reserved_segment_host") or "")
+            if not reserved_segment_host:
+                raise RuntimeError("reserved segment host missing")
+            enqueue_stamp_on_host(reserved_segment_host, job_id, run_token)
         else:
             emit_activity(
                 f'Started "{_display_title(filename)}"',
@@ -1289,6 +1755,7 @@ def _launch_reserved_job(reserved):
                 'status': Status.FAILED.value,
                 'error': str(e),
                 'ended_at': time.time(),
+                'pipeline_run_token': '',
             })
         except Exception:
             pass
@@ -1376,7 +1843,15 @@ def _normalize_existing_job_watchdog_state_locked() -> bool:
 
     return changed
 
-def _fail_stalled_job_locked(job_key: str, job: dict, status: Status, now_ts: float) -> bool:
+def _fail_stalled_job_locked(
+    job_key: str,
+    job: dict,
+    status: Status,
+    now_ts: float,
+    *,
+    reason_override: str = "",
+    failed_stage_override: str = "watchdog",
+) -> bool:
     job_id = (job.get('job_id') or (job_key.split(':', 1)[1] if ':' in job_key else '')).strip()
     filename = (job.get('filename') or '').strip()
     if not job_id or not filename:
@@ -1391,14 +1866,15 @@ def _fail_stalled_job_locked(job_key: str, job: dict, status: Status, now_ts: fl
         or _host_from_endpoint(job.get("master_host") or "")
         or "unknown"
     )
-    reason = f"watchdog detected stalled job: no heartbeat for {stale_for}s during {heartbeat_stage}"
+    reason = reason_override or f"watchdog detected stalled job: no heartbeat for {stale_for}s during {heartbeat_stage}"
 
     redis_client.hset(job_key, mapping={
         "status": Status.FAILED.value,
         "error": reason,
-        "failed_stage": "watchdog",
+        "failed_stage": failed_stage_override,
         "failed_worker": heartbeat_host,
         "ended_at": str(now_ts),
+        "pipeline_run_token": "",
         "stalled_stage": heartbeat_stage,
         "stalled_detected_at": str(now_ts),
     })
@@ -1408,14 +1884,153 @@ def _fail_stalled_job_locked(job_key: str, job: dict, status: Status, now_ts: fl
     except Exception:
         pass
     emit_activity(
-        f'Failed stalled job "{_display_title(filename)}" after {stale_for}s without heartbeat ({heartbeat_stage})',
+        f'Failed stalled job "{_display_title(filename)}": {reason}',
         job_id=job_id,
         filename=filename,
-        stage='watchdog',
+        stage=failed_stage_override,
         source='manager',
     )
     logger.warning("[%s] %s (host=%s)", job_id, reason, heartbeat_host)
     return True
+
+def _requeue_stalled_starting_job_locked(job_key: str, job: dict, now_ts: float) -> bool:
+    job_id = (job.get('job_id') or (job_key.split(':', 1)[1] if ':' in job_key else '')).strip()
+    filename = (job.get('filename') or '').strip()
+    if not job_id or not filename:
+        return False
+
+    heartbeat_at = _float_or(job.get("last_heartbeat_at"), 0.0)
+    reference_at = heartbeat_at or _float_or(job.get("started_at"), _float_or(job.get("created_at"), now_ts))
+    stale_for = max(0, int(now_ts - reference_at))
+    attempts = _int_or(job.get("queue_dispatch_attempts"), 0)
+    heartbeat_stage = (job.get("last_heartbeat_stage") or Status.STARTING.value.lower()).strip()
+
+    if attempts >= JOB_STARTING_MAX_RETRIES:
+        reason = (
+            f"starting stalled after {attempts} dispatch attempt(s): "
+            f"no heartbeat for {stale_for}s during {heartbeat_stage}"
+        )
+        return _fail_stalled_job_locked(
+            job_key,
+            job,
+            Status.STARTING,
+            now_ts,
+            reason_override=reason,
+            failed_stage_override="starting_watchdog",
+        )
+
+    reason = (
+        f"starting stalled; requeued dispatch attempt {attempts + 1}/"
+        f"{JOB_STARTING_MAX_RETRIES} after {stale_for}s during {heartbeat_stage}"
+    )
+    redis_client.hset(job_key, mapping={
+        "status": Status.WAITING.value,
+        "queue_action": (job.get("queue_action") or PIPELINE_QUEUE_ACTION_TRANSCODE).strip().upper(),
+        "waiting_at": str(now_ts),
+        "queue_reserved_at": "0",
+        "pipeline_run_token": "",
+        "run_state_reset_token": "",
+        "master_host": "",
+        "stitch_host": "",
+        "stitch_enqueued_at": "",
+        "manager_launch_enqueued_at": "",
+        "manager_launch_submitted_at": "",
+        "manager_launch_task_id": "",
+        "queue_blocked_reason": "",
+        "queue_blocked_active_jobs": "",
+        "queue_blocked_at": "",
+        "reserved_segment_host": "",
+        "reserved_stitch_host": "",
+        "pipeline_reserved_hosts_json": "",
+        "pipeline_reserved_at": "",
+        "last_heartbeat_at": str(now_ts),
+        "last_heartbeat_stage": "queue",
+        "last_heartbeat_host": "manager",
+        "last_heartbeat_note": reason,
+        "error": "",
+        "failed_stage": "",
+        "failed_worker": "",
+        "ended_at": "0",
+    })
+    _clear_active_job_refs(job_id)
+    emit_activity(
+        f'Requeued stalled launch "{_display_title(filename)}": {reason}',
+        job_id=job_id,
+        filename=filename,
+        stage="starting_requeue",
+        source="manager",
+    )
+    logger.warning("[%s] %s", job_id, reason)
+    return True
+
+def _semantic_stall_for_job(job: dict, status: Status, now_ts: float) -> tuple[bool, str, str]:
+    if status != Status.RUNNING:
+        return (False, "", "")
+
+    heartbeat_stage = (job.get("last_heartbeat_stage") or "").strip()
+    heartbeat_at = _float_or(job.get("last_heartbeat_at"), 0.0)
+    started_at = _float_or(job.get("started_at"), _float_or(job.get("created_at"), 0.0))
+    parts_total = _int_or(job.get("parts_total"), 0)
+    parts_done = _int_or(job.get("parts_done"), 0)
+    segment_progress = _int_or(job.get("segment_progress"), 0)
+    encode_progress = _int_or(job.get("encode_progress"), 0)
+    combine_progress = _int_or(job.get("combine_progress"), 0)
+    combine_started = _float_or(job.get("combine_started"), 0.0)
+
+    if (
+        heartbeat_stage == "stitch_wait_total"
+        and parts_total <= 0
+        and started_at > 0
+        and (now_ts - started_at) >= JOB_STITCH_WAIT_TOTAL_STALL_SEC
+    ):
+        return (
+            True,
+            (
+                "stitcher waited for parts_total without any split/segment progress "
+                f"for {int(now_ts - started_at)}s"
+            ),
+            "stitch_wait_total",
+        )
+
+    if (
+        parts_total > 0
+        and parts_done >= parts_total
+        and encode_progress >= 100
+        and segment_progress >= 100
+        and combine_progress <= 0
+        and heartbeat_stage not in {"stitch_combine", "stitch_sequential"}
+        and heartbeat_at > 0
+        and (now_ts - heartbeat_at) >= JOB_POST_ENCODE_STITCH_STALL_SEC
+    ):
+        return (
+            True,
+            (
+                "all encoded parts are uploaded, but final stitch/combine did not start "
+                f"for {int(now_ts - heartbeat_at)}s"
+            ),
+            "stitch_no_combine",
+        )
+
+    if (
+        parts_total > 0
+        and parts_done >= parts_total
+        and encode_progress >= 100
+        and segment_progress >= 100
+        and combine_started > 0
+        and 0 < combine_progress < 100
+        and heartbeat_at > 0
+        and (now_ts - heartbeat_at) >= max(300, JOB_POST_ENCODE_STITCH_STALL_SEC)
+    ):
+        return (
+            True,
+            (
+                "final stitch/combine started but stopped reporting progress "
+                f"for {int(now_ts - heartbeat_at)}s"
+            ),
+            "stitch_combine_stalled",
+        )
+
+    return (False, "", "")
 
 def _check_for_stalled_jobs_locked() -> bool:
     now_ts = time.time()
@@ -1439,6 +2054,19 @@ def _check_for_stalled_jobs_locked() -> bool:
         if status not in {Status.STARTING, Status.RUNNING, Status.STAMPING}:
             continue
 
+        sem_stalled, sem_reason, sem_stage = _semantic_stall_for_job(job, status, now_ts)
+        if sem_stalled:
+            if _fail_stalled_job_locked(
+                job_key,
+                job,
+                status,
+                now_ts,
+                reason_override=sem_reason,
+                failed_stage_override=sem_stage,
+            ):
+                changed = True
+            continue
+
         timeout_sec = _job_stall_timeout_for_status(status)
         if timeout_sec <= 0:
             continue
@@ -1452,7 +2080,10 @@ def _check_for_stalled_jobs_locked() -> bool:
             continue
 
         if (now_ts - reference_at) >= timeout_sec:
-            if _fail_stalled_job_locked(job_key, job, status, now_ts):
+            if status == Status.STARTING:
+                if _requeue_stalled_starting_job_locked(job_key, job, now_ts):
+                    changed = True
+            elif _fail_stalled_job_locked(job_key, job, status, now_ts):
                 changed = True
     return changed
 
@@ -1509,7 +2140,6 @@ def _start_job_watchdog():
         thread.start()
         _JOB_WATCHDOG_STARTED = True
         logger.info("Job watchdog started (poll=%.1fs)", JOB_WATCHDOG_POLL_SEC)
-
 
 def start_background_services():
     _start_pipeline_scheduler()
@@ -1644,7 +2274,120 @@ def browse_list():
 # -------------------- tiny in-process caches --------------------
 # (shield front-end polling from re-hitting Redis every time)
 _metrics_cache = (0.0, None)  # (ts, payload dict)
-_jobs_cache    = (0.0, None)  # (ts, list of job dicts)
+JOBS_CACHE_VERSION_KEY = "jobs:cache_version"
+_jobs_cache    = (0.0, "", None)  # (ts, version, list of job dicts)
+
+def _jobs_cache_version() -> str:
+    try:
+        return str(redis_client.get(JOBS_CACHE_VERSION_KEY) or "0")
+    except Exception:
+        return "0"
+
+def _invalidate_jobs_cache() -> None:
+    global _jobs_cache
+    _jobs_cache = (0.0, "", None)
+    try:
+        redis_client.incr(JOBS_CACHE_VERSION_KEY)
+    except Exception:
+        pass
+
+def _job_date_score(job_data: dict) -> float:
+    return max(
+        _float_or((job_data or {}).get("started_at"), 0.0),
+        _float_or((job_data or {}).get("created_at"), 0.0),
+    )
+
+def _index_job_for_listing(job_key: str, job_data: dict | None = None) -> None:
+    if not is_base_job_key(job_key):
+        return
+    try:
+        if job_data is None:
+            job_data = redis_client.hgetall(job_key) or {}
+        redis_client.sadd("jobs:all", job_key)
+        redis_client.zadd(JOBS_BY_DATE_KEY, {job_key: _job_date_score(job_data)})
+    except Exception:
+        pass
+
+def _rebuild_jobs_by_date_index() -> int:
+    keys = _job_index_keys()
+    if not keys:
+        try:
+            redis_client.delete(JOBS_BY_DATE_KEY)
+        except Exception:
+            pass
+        return 0
+
+    pipe = redis_client.pipeline()
+    for key in keys:
+        pipe.hgetall(key)
+    rows = pipe.execute()
+
+    mapping = {}
+    valid_keys = []
+    for key, job_data in zip(keys, rows):
+        if not job_data:
+            continue
+        valid_keys.append(key)
+        mapping[key] = _job_date_score(job_data)
+
+    pipe = redis_client.pipeline()
+    pipe.delete(JOBS_BY_DATE_KEY)
+    if mapping:
+        pipe.zadd(JOBS_BY_DATE_KEY, mapping)
+    pipe.execute()
+    return len(valid_keys)
+
+def _ensure_jobs_by_date_index() -> None:
+    try:
+        indexed = int(redis_client.zcard(JOBS_BY_DATE_KEY) or 0)
+        known = int(redis_client.scard("jobs:all") or 0)
+        if indexed and indexed >= known:
+            return
+
+        token = uuid.uuid4().hex
+        if not redis_client.set(JOBS_BY_DATE_REINDEX_LOCK_KEY, token, nx=True, ex=60):
+            return
+        try:
+            _rebuild_jobs_by_date_index()
+        finally:
+            if redis_client.get(JOBS_BY_DATE_REINDEX_LOCK_KEY) == token:
+                redis_client.delete(JOBS_BY_DATE_REINDEX_LOCK_KEY)
+    except Exception:
+        pass
+
+def _job_api_payload(job_key: str, job_data: dict, nowf: float | None = None) -> dict:
+    nowf = time.time() if nowf is None else nowf
+    job_id = (job_key.split(':', 1)[1]) if ':' in job_key else job_key
+    started = _float_or(job_data.get('started_at'), 0.0)
+    ended = _float_or(job_data.get('ended_at'), 0.0)
+    created = _float_or(job_data.get('created_at'), 0.0)
+    elapsed = 0
+
+    raw_status = str(job_data.get('status') or '').strip().upper()
+    if raw_status == 'COMPLETED':
+        status = Status.DONE
+    else:
+        try:
+            status = Status.parse(raw_status)
+        except Exception:
+            status = None
+
+    if status in [Status.RUNNING, Status.WAITING, Status.STARTING]:
+        elapsed = nowf - started
+    elif ended:
+        elapsed = ended - started
+
+    return {
+        'job_id': job_id,
+        **job_data,
+        'segment_progress': int(job_data.get('segment_progress', '0') or 0),
+        'encode_progress': int(job_data.get('encode_progress', '0') or 0),
+        'combine_progress': int(job_data.get('combine_progress', '0') or 0),
+        'elapsed': elapsed,
+        'started': started,
+        'created': created,
+        'stitched_chunks': int(job_data.get('stitched_chunks', '0') or 0),
+    }
 
 # --- Nodes page & data ---
 def _resolve_ip(hostname: str) -> str:
@@ -1770,6 +2513,7 @@ def get_settings():
     out["target_segment_mb"] = _as_float(settings.get("target_segment_mb", 10), 10.0)
     if out["target_segment_mb"] <= 0:
         out["target_segment_mb"] = 10.0
+    out["min_segment_count"] = max(1, _int_or(settings.get("min_segment_count"), 100))
     out["large_file_behavior"] = str(settings.get("large_file_behavior", "direct") or "direct").strip().lower()
     if out["large_file_behavior"] not in ("reject", "nfs", "direct"):
         out["large_file_behavior"] = "reject"
@@ -1777,14 +2521,14 @@ def get_settings():
         settings.get("default_target_height", DEFAULT_TARGET_HEIGHT),
         DEFAULT_TARGET_HEIGHT
     )
+    out["video_encoder"] = normalize_video_encoder(settings.get("video_encoder", "h265"), "h265")
     runtime = _pipeline_runtime_settings(settings)
     out["max_active_jobs"] = runtime["max_active_jobs"]
+    out["max_active_large_jobs"] = runtime["max_active_large_jobs"]
     out["effective_max_active_jobs"] = runtime["effective_max_active_jobs"]
-    out["active_job_limit_enforced"] = False
+    out["active_job_limit_enforced"] = True
     out["pipeline_worker_count"] = runtime["pipeline_worker_count"]
     out["pipeline_required_for_max_active"] = runtime["max_active_jobs"] * 2
-    out["pipeline_drain_ratio_to_start_next"] = runtime["pipeline_drain_ratio_to_start_next"]
-    out["pipeline_min_idle_workers_to_start_next"] = runtime["pipeline_min_idle_workers_to_start_next"]
     return jsonify(out)
 
 @app.post("/settings")
@@ -1803,9 +2547,12 @@ def post_global_settings():
         "low_disk_direct_enabled": bool,
         "low_disk_min_free_gb": number (>=1),
         "target_segment_mb": number (>0),
+        "min_segment_count": int (>=1),
         "large_file_behavior": "reject"|"nfs"|"direct",
         "default_target_height": 720|1080,
-        "pipeline_worker_count": int (>=2)
+        "video_encoder": "h264"|"h265",
+        "max_active_jobs": int (>=1),
+        "max_active_large_jobs": int (>=0)
     }
     """
     payload = request.get_json(silent=True) or {}
@@ -1831,6 +2578,7 @@ def post_global_settings():
         target_segment_mb = _as_float(payload.get("target_segment_mb", 10), 10.0)
         if target_segment_mb <= 0:
             target_segment_mb = 10.0
+        min_segment_count = max(1, int(payload.get("min_segment_count", current_settings.get("min_segment_count", 100))))
         large_file_behavior = str(payload.get("large_file_behavior", "direct") or "direct").strip().lower()
         if large_file_behavior not in ("reject", "nfs", "direct"):
             large_file_behavior = "reject"
@@ -1838,25 +2586,17 @@ def post_global_settings():
             payload.get("default_target_height", DEFAULT_TARGET_HEIGHT),
             DEFAULT_TARGET_HEIGHT
         )
-        pipeline_worker_count = max(2, int(payload.get("pipeline_worker_count", current_settings.get("pipeline_worker_count", 4))))
-        effective_max_active_jobs = max(1, pipeline_worker_count // 2)
-        pipeline_drain_ratio = min(
-            1.0,
-            max(0.0, _as_float(
-                payload.get(
-                    "pipeline_drain_ratio_to_start_next",
-                    current_settings.get("pipeline_drain_ratio_to_start_next", 0.75),
-                ),
-                0.75,
-            )),
+        video_encoder = normalize_video_encoder(
+            payload.get("video_encoder", current_settings.get("video_encoder", "h265")),
+            "h265",
         )
-        pipeline_min_idle_workers = max(
-            1,
-            int(payload.get(
-                "pipeline_min_idle_workers_to_start_next",
-                current_settings.get("pipeline_min_idle_workers_to_start_next", 4),
-            )),
+        max_active_jobs = max(1, int(payload.get("max_active_jobs", current_settings.get("max_active_jobs", 2))))
+        max_active_large_jobs = max(
+            0,
+            int(payload.get("max_active_large_jobs", current_settings.get("max_active_large_jobs", 1))),
         )
+        pipeline_worker_count = max(2, max_active_jobs * PIPELINE_WORKERS_PER_JOB)
+        effective_max_active_jobs = max_active_jobs
     except Exception:
         return jsonify({"error": "invalid payload"}), 400
 
@@ -1872,14 +2612,15 @@ def post_global_settings():
         "low_disk_direct_enabled": "1" if low_disk_direct_enabled else "0",
         "low_disk_min_free_gb": str(low_disk_min_free_gb),
         "target_segment_mb": str(target_segment_mb),
+        "min_segment_count": str(min_segment_count),
         "large_file_behavior": large_file_behavior,
         "default_target_height": str(default_target_height),
+        "video_encoder": video_encoder,
         "max_active_jobs": str(effective_max_active_jobs),
+        "max_active_large_jobs": str(max_active_large_jobs),
         "effective_max_active_jobs": str(effective_max_active_jobs),
-        "active_job_limit_enforced": "0",
+        "active_job_limit_enforced": "1",
         "pipeline_worker_count": str(pipeline_worker_count),
-        "pipeline_drain_ratio_to_start_next": str(pipeline_drain_ratio),
-        "pipeline_min_idle_workers_to_start_next": str(pipeline_min_idle_workers),
     }
     redis_client.hset(GLOBAL_SETTINGS_KEY, mapping=settings_mapping)
     # Backward-compatible mirror for legacy readers.
@@ -1888,6 +2629,7 @@ def post_global_settings():
     _assign_pipeline_node_roles({
         **settings_mapping,
         "max_active_jobs": str(effective_max_active_jobs),
+        "max_active_large_jobs": str(max_active_large_jobs),
         "effective_max_active_jobs": str(effective_max_active_jobs),
         "pipeline_worker_count": str(pipeline_worker_count),
     })
@@ -1904,15 +2646,16 @@ def post_global_settings():
         "low_disk_direct_enabled": low_disk_direct_enabled,
         "low_disk_min_free_gb": low_disk_min_free_gb,
         "target_segment_mb": target_segment_mb,
+        "min_segment_count": min_segment_count,
         "large_file_behavior": large_file_behavior,
         "default_target_height": default_target_height,
+        "video_encoder": video_encoder,
         "max_active_jobs": effective_max_active_jobs,
+        "max_active_large_jobs": max_active_large_jobs,
         "effective_max_active_jobs": effective_max_active_jobs,
-        "active_job_limit_enforced": False,
+        "active_job_limit_enforced": True,
         "pipeline_worker_count": pipeline_worker_count,
         "pipeline_required_for_max_active": effective_max_active_jobs * 2,
-        "pipeline_drain_ratio_to_start_next": pipeline_drain_ratio,
-        "pipeline_min_idle_workers_to_start_next": pipeline_min_idle_workers,
     })
 
 # ------------------------ Jobs API -------------------------
@@ -1922,15 +2665,80 @@ def list_jobs():
     Fast jobs listing:
       - Maintains `jobs:all` set as index of job keys.
       - Auto-seeds from keyspace once if the set is empty (to include existing jobs).
-      - Pipelines HGETALL for all jobs, with a 0.5s in-process cache.
+      - Uses a Redis date index for the default dashboard page, falling back to
+        all-job hydration only for filtered or non-date-sorted views.
     """
     global _jobs_cache
 
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except Exception:
+        page = 1
+    allowed_page_sizes = {10, 25, 50, 100}
+    try:
+        page_size = int(request.args.get('page_size', 10))
+    except Exception:
+        page_size = 10
+    if page_size not in allowed_page_sizes:
+        page_size = 10
+
+    sort_by = (request.args.get('sort_by') or 'status').lower()
+    sort_dir = (request.args.get('sort_dir') or ('asc' if sort_by == 'status' else 'desc')).lower()
+    status_filter = (request.args.get('status') or '').strip().upper()
+    name_query = (request.args.get('q') or '').strip().lower()
+    reverse = (sort_dir != 'asc')
+
+    if sort_by == 'date' and not name_query and (not status_filter or status_filter == 'ALL'):
+        _ensure_jobs_by_date_index()
+        try:
+            total = int(redis_client.zcard(JOBS_BY_DATE_KEY) or 0)
+        except Exception:
+            total = 0
+        if total > 0:
+            total_pages = max(1, ceil(total / page_size))
+            page = min(max(1, page), total_pages)
+            start = (page - 1) * page_size
+            stop = start + page_size - 1
+            if reverse:
+                page_keys = redis_client.zrevrange(JOBS_BY_DATE_KEY, start, stop)
+            else:
+                page_keys = redis_client.zrange(JOBS_BY_DATE_KEY, start, stop)
+
+            pipe = redis_client.pipeline()
+            for key in page_keys:
+                pipe.hgetall(key)
+            rows = pipe.execute()
+
+            nowf = time.time()
+            items = []
+            stale_keys = []
+            for key, job_data in zip(page_keys, rows):
+                if not job_data:
+                    stale_keys.append(key)
+                    continue
+                items.append(_job_api_payload(key, job_data, nowf))
+
+            if stale_keys:
+                try:
+                    redis_client.zrem(JOBS_BY_DATE_KEY, *stale_keys)
+                    redis_client.srem("jobs:all", *stale_keys)
+                except Exception:
+                    pass
+
+            return jsonify({
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'total_pages': total_pages,
+                'items': items,
+            })
+
     now = time.time()
-    ts, cached_list = _jobs_cache
+    ts, cached_version, cached_list = _jobs_cache
+    cache_version = _jobs_cache_version()
 
     # refresh cache if stale
-    if cached_list is None or (now - ts) >= 0.5:
+    if cached_list is None or cached_version != cache_version or (now - ts) >= 0.5:
         raw_keys = list(redis_client.smembers("jobs:all") or [])
         keys = [k for k in raw_keys if is_base_job_key(k)]
         invalid_keys = [k for k in raw_keys if not is_base_job_key(k)]
@@ -1966,74 +2774,22 @@ def list_jobs():
                     pass
                 continue
 
-            job_id = (k.split(':', 1)[1]) if ':' in k else k
-            started = float(job_data.get('started_at', '0') or 0)
-            ended   = float(job_data.get('ended_at', '0') or 0)
-            created = float(job_data.get('created_at', '0') or 0)
-            nowf    = time.time()
-            elapsed = 0
+            jobs.append(_job_api_payload(k, job_data, time.time()))
 
-            raw_status = str(job_data.get('status') or '').strip().upper()
-            if raw_status == 'COMPLETED':
-                status = Status.DONE
-            else:
-                try:
-                    status = Status.parse(raw_status)
-                except Exception:
-                    status = None
-
-            if status in [Status.RUNNING, Status.WAITING, Status.STARTING]:
-                elapsed = nowf - started
-            elif ended:
-                elapsed = ended - started
-            
-
-
-            jobs.append({
-                'job_id': job_id,
-                **job_data,
-                'segment_progress': int(job_data.get('segment_progress', '0') or 0),
-                'encode_progress':  int(job_data.get('encode_progress',  '0') or 0),
-                'combine_progress': int(job_data.get('combine_progress', '0') or 0),
-                'elapsed': elapsed,
-                'started': started,
-                'created': created,
-                'stitched_chunks': int(job_data.get('stitched_chunks', '0') or 0),
-            })
-
-        _jobs_cache = (now, jobs)
+        _jobs_cache = (now, cache_version, jobs)
         jobs_list = jobs
     else:
         jobs_list = cached_list
 
-    # ---- sorting/paging (retain your existing behavior) ----
-    try:
-        page = max(1, int(request.args.get('page', 1)))
-    except Exception:
-        page = 1
-    allowed_page_sizes = {10, 25, 50, 100}
-    try:
-        page_size = int(request.args.get('page_size', 10))
-    except Exception:
-        page_size = 10
-    if page_size not in allowed_page_sizes:
-        page_size = 10
-
-    sort_by = (request.args.get('sort_by') or 'date').lower()
-    sort_dir = (request.args.get('sort_dir') or 'desc').lower()
-    status_filter = (request.args.get('status') or '').strip().upper()
-    name_query = (request.args.get('q') or '').strip().lower()
-    reverse = (sort_dir != 'asc')
-
     status_order = {
-        'READY': 0,
+        'RUNNING': 0,
         'STARTING': 1,
-        'WAITING': 2,
-        'RUNNING': 3,
-        'STAMPING': 4,
+        'STAMPING': 2,
+        'WAITING': 3,
+        'READY': 4,
         'STOPPED': 5,
-        'FAILED': 6,
-        'REJECTED': 7,
+        'REJECTED': 6,
+        'FAILED': 7,
         'DONE': 8,
         'COMPLETED': 8,
     }
@@ -2068,16 +2824,17 @@ def list_jobs():
         filename = os.path.basename(job.get('filename') or '').lower()
         started = float(job.get('started') or 0)
         created = float(job.get('created') or 0)
+        date_key = max(started, created)
         encode = int(job.get('encode_progress') or 0)
 
         if sort_by == 'filename':
             return (filename,)
         elif sort_by == 'status':
-            return (status_order.get(s, 99), filename)
+            return (status_order.get(s, 98), -date_key, filename)
         elif sort_by == 'encode':
             return (encode, started, filename)
         else:  # 'date'
-            return max(started, created)
+            return date_key
 
     jobs_sorted = sorted(filtered_jobs, key=sort_key, reverse=reverse)
 
@@ -2190,12 +2947,34 @@ def get_video_details(job_id: str, file_path: str):
             L.startswith('en-')  # e.g., en-us, en-gb
         )
 
-    a_sel = 0
-    # Prefer first English audio stream; fallback to 0
-    for i, a in enumerate(audio_streams):
-        if _is_english(a.get('language', '')):
-            a_sel = i
-            break
+    def _audio_default_score(a: dict) -> int:
+        codec = str(a.get('codec') or '').strip().lower()
+        lang = str(a.get('language') or '').strip()
+        title = str(a.get('title') or '').strip().lower()
+        english = _is_english(lang) or 'english' in title or 'eng' in title
+        if not english:
+            return 100
+        # Prefer broadly compatible English AC3. TrueHD/DTS are intentionally
+        # ranked low because they have caused troublesome transcode paths.
+        codec_rank = {
+            'ac3': 0,
+            'eac3': 1,
+            'aac': 2,
+            'opus': 3,
+            'mp3': 4,
+            'truehd': 20,
+            'dts': 21,
+            'dca': 21,
+        }.get(codec, 10)
+        return codec_rank
+
+    if audio_streams:
+        a_sel = min(
+            range(len(audio_streams)),
+            key=lambda i: (_audio_default_score(audio_streams[i]), i),
+        )
+    else:
+        a_sel = 0
 
     pv = video_streams[0] if video_streams else {}
     fps = float(pv.get('fps', 0) or 0)
@@ -2254,6 +3033,7 @@ def add_job():
         data.get('target_height', default_target_height),
         default_target_height
     )
+    video_encoder = normalize_video_encoder(data.get('video_encoder', global_settings.get('video_encoder', 'h265')), 'h265')
 
     auto_start_global = _as_bool(global_settings.get('auto_start', '1'), True)
     auto_start_effective = (auto_start_global and not force_paused)
@@ -2283,6 +3063,7 @@ def add_job():
         'serialize_pipeline': '1' if serialize_global else '0',
         'software_encode': '0',  # per-job default: disabled
         'target_height': target_height,
+        'video_encoder': video_encoder,
         'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE if auto_start_effective else '',
         'waiting_at': now if auto_start_effective else '0',
         # placeholders (worker fills in)
@@ -2319,6 +3100,7 @@ def add_job():
         source_origin == "source_media"
         and processing_mode == "direct"
         and str(video_details.get("source_codec") or "").strip().lower() not in DIRECT_SOURCE_REQUIRED_CODECS
+        and not _details_has_selected_audio(video_details)
     ):
         processing_mode = "split"
         job_settings.update({
@@ -2368,6 +3150,8 @@ def add_job():
 
     # index the job for fast listing
     redis_client.sadd("jobs:all", job_key)
+    _index_job_for_listing(job_key, job_settings)
+    _invalidate_jobs_cache()
 
     watcher_mark_warning = None
     if mark_watcher_processed:
@@ -2380,6 +3164,7 @@ def add_job():
     if auto_start_effective and not rejection_reason:
         _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, _float_or(now, time.time()))
         dispatch_next_waiting_job()
+        _invalidate_jobs_cache()
 
     if rejection_reason:
         payload = {
@@ -2435,6 +3220,7 @@ def copy_job():
     frame_src = src.get('software_encode', '0')
     default_target_height = get_default_target_height()
     target_height = normalize_target_height(src.get('target_height', default_target_height), default_target_height)
+    video_encoder = normalize_video_encoder(src.get('video_encoder', globals_map.get('video_encoder', 'h265')), 'h265')
 
     new_job_id = str(uuid.uuid4())
     now = time.time()
@@ -2454,6 +3240,7 @@ def copy_job():
         'serialize_pipeline': '1' if str(serialize_src) in ('1','true','True') else '0',
         'software_encode': '1' if str(frame_src) in ('1','true','True') else '0',
         'target_height': target_height,
+        'video_encoder': video_encoder,
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'scratch_mode': src.get('scratch_mode', 'local'),
@@ -2473,6 +3260,8 @@ def copy_job():
         redis_client.sadd("jobs:all", new_key)
     except Exception:
         pass
+    _index_job_for_listing(new_key, new_job)
+    _invalidate_jobs_cache()
 
     logger.info(f"[{new_job_id}] Copied from {source_job_id} with filename={filename}, "
                 f"segment_duration={segment_duration}, number_parts={number_parts} (PAUSED)")
@@ -2496,6 +3285,7 @@ def start_job(job_id):
     now = time.time()
     _queue_job_for_dispatch(job_key, PIPELINE_QUEUE_ACTION_TRANSCODE, now)
     dispatch_next_waiting_job()
+    _invalidate_jobs_cache()
     return jsonify({'status': 'queued'}), 200
 
 @app.post('/restart_job/<job_id>')
@@ -2512,21 +3302,18 @@ def restart_job(job_id):
     if not filename:
         return jsonify({'status': 'invalid', 'message': 'Missing filename'}), 400
 
-    # Remove working directory (best-effort)
-    job_dir = job.get('job_dir', '')
-    logger.info(f"[{job_id}] Cleaning job dir {job_dir!r}")
-    if job_dir and os.path.exists(job_dir):
-        try:
-            shutil.rmtree(job_dir)
-        except Exception as e:
-            logger.warning(f"[{job_id}] Failed to delete job directory {job_dir}: {e}")
-
-    # Remove ONLY per-job subkeys (chunks, progress shards, etc), keep the base hash
-    for key in redis_client.scan_iter(f"{job_key}:*"):
-        try:
-            redis_client.delete(key)
-        except Exception:
-            pass
+    # Keep restart fast: the worker clears per-run files at transcode start.
+    # Avoid Redis SCAN here because bulk restart calls this endpoint many times.
+    try:
+        redis_client.delete(
+            f"job_done_parts:{job_id}",
+            f"job_retry_counts:{job_id}",
+            f"job_retry_ts:{job_id}",
+            f"job_missing_first_seen:{job_id}",
+            f"job_retry_inflight:{job_id}",
+        )
+    except Exception:
+        pass
 
     # Carry over settings (with sane fallbacks)
     globals_map = _load_global_settings()
@@ -2542,54 +3329,39 @@ def restart_job(job_id):
     frame_val        = job.get('software_encode', '0')
     default_target_height = get_default_target_height()
     target_height    = normalize_target_height(job.get('target_height', default_target_height), default_target_height)
+    video_encoder    = normalize_video_encoder(job.get('video_encoder', globals_map.get('video_encoder', 'h265')), 'h265')
     selected_v_stream= job.get('selected_v_stream', 0)
     selected_a_stream= job.get('selected_a_stream', 0)
-    source_updates = {}
-    global_settings = _load_global_settings()
     input_path = (job.get('input_path') or '').strip()
     try:
-        full_path = _job_source_path(filename, input_path)
-    except Exception:
-        full_path = os.path.join(WATCH_ROOT, filename.lstrip('/'))
-    try:
-        video_details = get_video_details(job_id, full_path)
-        source_updates = {
-            'source_file_size': video_details.get('source_file_size', 0),
-            'source_duration': video_details.get('source_duration', '0'),
-            'source_codec': video_details.get('source_codec', ''),
-            'source_resolution': video_details.get('source_resolution', ''),
-            'source_fps': video_details.get('source_fps', '0'),
-            'source_bitrate_kbps': video_details.get('source_bitrate_kbps', '0'),
-            'total_frames': video_details.get('total_frames', 0),
-        }
+        filename, full_path = _resolve_restart_source(filename, input_path)
     except Exception as e:
-        logger.warning(f"[{job_id}] Probe failed during restart validation: {e}")
-        source_updates = {
-            'source_file_size': job.get('source_file_size', 0),
-            'source_duration': job.get('source_duration', '0'),
-            'source_codec': job.get('source_codec', ''),
-            'source_resolution': job.get('source_resolution', ''),
-            'source_fps': job.get('source_fps', '0'),
-            'source_bitrate_kbps': job.get('source_bitrate_kbps', '0'),
-            'total_frames': job.get('total_frames', 0),
-        }
+        message = str(e)
+        logger.warning(f"[{job_id}] Restart source validation failed: {message}")
+        redis_client.hset(job_key, mapping={
+            'status': Status.FAILED.value,
+            'error': message,
+            'failed_stage': 'restart_source',
+            'failed_worker': 'manager',
+            'ended_at': str(time.time()),
+            'pipeline_run_token': '',
+        })
+        _clear_active_job_refs(job_id)
+        _invalidate_jobs_cache()
+        return jsonify({'status': 'invalid', 'message': message}), 400
 
-    rejection_reason, rejection_message, scratch_mode, scratch_root, processing_mode = _evaluate_job_policy(source_updates, global_settings)
-    source_origin = _source_origin_for_path(input_path or full_path)
-    source_codec = str(source_updates.get("source_codec") or "").strip().lower()
-    source_media_forces_split = (
-        source_origin == "source_media"
-        and processing_mode == "direct"
-        and source_codec not in DIRECT_SOURCE_REQUIRED_CODECS
-    )
-    if source_media_forces_split:
-        processing_mode = "split"
+    source_origin = _source_origin_for_path(full_path)
+    scratch_mode = str(job.get('scratch_mode') or 'local').strip().lower()
+    scratch_root = job.get('scratch_root') or (NFS_PROJECT_ROOT if scratch_mode == 'nfs' else LOCAL_PROJECT_ROOT)
+    processing_mode = str(job.get('processing_mode') or 'split').strip().lower()
+    if processing_mode not in ('split', 'direct'):
+        processing_mode = 'split'
 
     now = time.time()
     new_fields = {
         'job_id': job_id,
         'filename': filename,
-        'input_path': input_path or full_path,
+        'input_path': full_path,
         'source_origin': source_origin,
         'status': Status.WAITING.value,
         'started_at': str(now),
@@ -2603,6 +3375,7 @@ def restart_job(job_id):
         'serialize_pipeline': '1' if str(serialize_val) in ('1', 'true', 'True') else '0',
         'software_encode': '1' if str(frame_val) in ('1', 'true', 'True') else '0',
         'target_height': target_height,
+        'video_encoder': video_encoder,
         'selected_v_stream': selected_v_stream,
         'selected_a_stream': selected_a_stream,
         'total_chunks': 0,
@@ -2621,34 +3394,52 @@ def restart_job(job_id):
         'combine_elapsed': 0,
         'combine_progress': 0,
         'elapsed': 0,
-        'streams_json': job.get('streams_json'),
+        'audio_status': '',
+        'audio_progress': 0,
+        'audio_elapsed': 0,
+        'audio_path': '',
+        'audio_error': '',
+        'audio_mux_sync_mode': '',
+        'audio_mux_video_frame_count': '',
+        'audio_mux_source_frame_count': '',
+        'audio_mux_frame_count_delta': '',
+        'audio_mux_frame_count_tolerance': '',
+        'audio_mux_frame_count_error': '',
+        'audio_mux_video_frame_details_json': '',
+        'audio_mux_video_itsscale': '',
+        'audio_mux_target_duration': '',
+        'audio_mux_sync_correction_sec': '',
+        'video_duration_before_audio_mux': '',
+        'stitch_expected_video_duration': '',
+        'segment_manifest_count': '',
+        'segment_manifest_path': '',
+        'preserve_project_dir': '0',
+        'preserve_project_dir_reason': '',
+        'streams_json': job.get('streams_json') or '',
         'scratch_mode': scratch_mode,
         'scratch_root': scratch_root,
         'processing_mode': processing_mode,
         'processing_mode_effective': '',
-        'processing_mode_reason': 'source_media_forces_split' if source_media_forces_split else '',
+        'processing_mode_reason': '',
         'queue_action': PIPELINE_QUEUE_ACTION_TRANSCODE,
+        'queue_dispatch_attempts': '0',
+        'queue_reserved_at': '0',
+        'pipeline_run_token': '',
+        'run_state_reset_token': '',
+        'master_host': '',
+        'stitch_host': '',
+        'stitch_enqueued_at': '',
+        'manager_launch_enqueued_at': '',
+        'manager_launch_submitted_at': '',
+        'manager_launch_task_id': '',
+        'queue_blocked_reason': '',
+        'queue_blocked_active_jobs': '',
+        'queue_blocked_at': '',
         'waiting_at': str(now),
+        'rejected_reason': '',
+        'rejected_at': '',
 
     }
-    new_fields.update(source_updates)
-    if rejection_reason:
-        new_fields.update({
-            'status': Status.REJECTED.value,
-            'started_at': '0',
-            'queue_action': '',
-            'waiting_at': '0',
-            'error': rejection_message,
-            'rejected_reason': rejection_reason,
-            'rejected_at': str(now),
-        })
-        emit_activity(
-            f'Rejected "{_display_title(filename)}": {rejection_message}',
-            job_id=job_id,
-            filename=filename,
-            stage='rejected',
-            source='manager',
-        )
 
     # Overwrite base hash in one go (no delete -> no set race)
     redis_client.hset(job_key, mapping=new_fields)
@@ -2658,11 +3449,11 @@ def restart_job(job_id):
         redis_client.sadd("jobs:all", job_key)
     except Exception:
         pass
-
-    if rejection_reason:
-        return jsonify({'status': 'rejected', 'reason': rejection_reason, 'message': rejection_message}), 200
+    _index_job_for_listing(job_key, new_fields)
+    _invalidate_jobs_cache()
 
     dispatch_next_waiting_job()
+    _invalidate_jobs_cache()
     return jsonify({'status': 'queued'}), 200
 
 
@@ -2676,10 +3467,15 @@ def stop_job(job_id):
     if not redis_client.exists(job_key):
         return jsonify({'status': 'not found'}), 404
 
-    redis_client.hset(job_key, mapping={'status': Status.STOPPED.value, 'ended_at': time.time()})
+    redis_client.hset(job_key, mapping={
+        'status': Status.STOPPED.value,
+        'ended_at': time.time(),
+        'pipeline_run_token': '',
+    })
     huey.revoke_by_id(job_id)
     _clear_active_job_refs(job_id)
     dispatch_next_waiting_job()
+    _invalidate_jobs_cache()
     return jsonify({'status': 'stopped'}), 200
 
 @app.delete('/delete_job/<job_id>')
@@ -2703,11 +3499,13 @@ def delete_job(job_id):
     # remove from the jobs index
     try:
         redis_client.srem("jobs:all", job_key)
+        redis_client.zrem(JOBS_BY_DATE_KEY, job_key)
     except Exception:
         pass
 
     _clear_active_job_refs(job_id)
     dispatch_next_waiting_job()
+    _invalidate_jobs_cache()
 
     if job_dir and os.path.exists(job_dir):
         try:
@@ -2766,6 +3564,7 @@ def job_settings(job_id):
             'serialize_pipeline': job.get('serialize_pipeline', '0'),
             'software_encode': job.get('software_encode', '0'),
             'target_height': normalize_target_height(job.get('target_height', default_target_height), default_target_height),
+            'video_encoder': normalize_video_encoder(job.get('video_encoder', _get_settings().get('video_encoder', 'h265')), 'h265'),
             'streams': streams_json,
             'selected_v_stream': job.get('selected_v_stream', '0'),
             'selected_a_stream': job.get('selected_a_stream', '0'),
@@ -2789,6 +3588,10 @@ def job_settings(job_id):
             data.get('target_height', job.get('target_height', default_target_height)),
             default_target_height
         )
+        video_encoder = normalize_video_encoder(
+            data.get('video_encoder', job.get('video_encoder', _get_settings().get('video_encoder', 'h265'))),
+            'h264',
+        )
         v_sel = data.get('selected_v_stream', job.get('selected_v_stream', 0))
         a_sel = data.get('selected_a_stream', job.get('selected_a_stream', 0))
 
@@ -2803,8 +3606,10 @@ def job_settings(job_id):
             'serialize_pipeline': '1' if serialize_pipeline else '0',
             'software_encode': '1' if software_encode else '0',
             'target_height': target_height,
+            'video_encoder': video_encoder,
         }
         redis_client.hset(job_key, mapping=mapping)
+        _invalidate_jobs_cache()
 
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
@@ -2893,6 +3698,9 @@ def nodes_enable(hostname):
 WOL_BROADCASTS = [x.strip() for x in os.getenv("WOL_BROADCASTS", "255.255.255.255").split(",") if x.strip()]
 WOL_PORT = int(os.getenv("WOL_PORT", "9"))
 WOL_REPEATS = max(1, int(os.getenv("WOL_REPEATS", "3")))
+MANAGER_SSH_USER = os.getenv("MANAGER_SSH_USER", "jerry").strip()
+MANAGER_SSH_KEY_PATH = os.getenv("MANAGER_SSH_KEY_PATH", "/root/.ssh/id_ed25519").strip()
+MANAGER_SSH_KNOWN_HOSTS = os.getenv("MANAGER_SSH_KNOWN_HOSTS", "/tmp/thinvids_known_hosts").strip()
 
 def _mac_bytes(mac: str) -> bytes:
     """
@@ -2964,19 +3772,31 @@ def _reboot_one_node(hostname: str) -> dict:
         return {"host": host, "ok": False, "error": "missing hostname"}
     if host == socket.gethostname():
         return {"host": host, "ok": False, "error": "refusing to reboot manager host"}
+    nodes = {node["hostname"]: node for node in get_all_nodes()}
+    node = nodes.get(host)
+    if not node:
+        return {"host": host, "ok": False, "error": f"unknown node {host}"}
+    if node.get("disabled"):
+        return {"host": host, "ok": False, "error": f"{host} is disabled; enable it before rebooting."}
 
     ssh = shutil.which("ssh") or "/usr/bin/ssh"
+    ssh_target = f"{MANAGER_SSH_USER}@{host}" if MANAGER_SSH_USER else host
     cmd = [
         ssh,
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=5",
         "-o", "StrictHostKeyChecking=accept-new",
-        host,
+        "-o", f"UserKnownHostsFile={MANAGER_SSH_KNOWN_HOSTS}",
+    ]
+    if MANAGER_SSH_KEY_PATH:
+        cmd.extend(["-i", MANAGER_SSH_KEY_PATH])
+    cmd.extend([
+        ssh_target,
         "sudo",
         "-n",
         "systemctl",
         "reboot",
-    ]
+    ])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except subprocess.TimeoutExpired:
@@ -3050,6 +3870,19 @@ def nodes_reboot_all():
         logger.exception("Reboot All failed")
         return jsonify({'error': str(e)}), 500
 
+@app.post('/nodes/reboot/<hostname>')
+def nodes_reboot_one(hostname):
+    """
+    Reboot a single enabled worker node via SSH.
+    """
+    try:
+        payload = _reboot_one_node(hostname)
+        status_code = 200 if payload.get("ok") else 400
+        return jsonify(payload), status_code
+    except Exception as e:
+        logger.exception("Reboot failed for %s", hostname)
+        return jsonify({'error': str(e)}), 500
+
 @app.post('/stamp_job/<job_id>')
 def stamp_job(job_id):
     job_key = f"job:{job_id}"
@@ -3081,4 +3914,5 @@ def stamp_job(job_id):
         'encode_elapsed': 0,
     })
     dispatch_next_waiting_job()
+    _invalidate_jobs_cache()
     return jsonify({'status':'queued'}), 202

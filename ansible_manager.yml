@@ -25,8 +25,6 @@
     huey_name: thinvids_tasks
     master_http_port: 8000
     pipeline_max_active_jobs: 2
-    pipeline_drain_ratio_to_start_next: "0.75"
-    pipeline_min_idle_workers_to_start_next: 4
 
     # Manager HTTP port
     manager_http_port: 5005
@@ -293,8 +291,6 @@
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           Environment=PIPELINE_MAX_ACTIVE_JOBS={{ pipeline_max_active_jobs }}
-          Environment=PIPELINE_DRAIN_RATIO_TO_START_NEXT={{ pipeline_drain_ratio_to_start_next }}
-          Environment=PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT={{ pipeline_min_idle_workers_to_start_next }}
           ExecStart={{ app_root }}/venv/bin/gunicorn -w 2 -t 120 -b 0.0.0.0:{{ manager_http_port }} app:app
           Restart=always
           RestartSec=2
@@ -338,8 +334,6 @@
           Environment=NFS_PROJECT_ROOT={{ nfs_project_root }}
           Environment=MASTER_HTTP_PORT={{ master_http_port }}
           Environment=PIPELINE_MAX_ACTIVE_JOBS={{ pipeline_max_active_jobs }}
-          Environment=PIPELINE_DRAIN_RATIO_TO_START_NEXT={{ pipeline_drain_ratio_to_start_next }}
-          Environment=PIPELINE_MIN_IDLE_WORKERS_TO_START_NEXT={{ pipeline_min_idle_workers_to_start_next }}
           ExecStart={{ app_root }}/venv/bin/python housekeeping.py
           Restart=always
           RestartSec=2

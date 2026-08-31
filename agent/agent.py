@@ -23,10 +23,11 @@ IDLE_CPU_PCT_MAX          = float(os.getenv("IDLE_CPU_PCT_MAX", "15"))       # <
 IDLE_GPU_PCT_MAX          = float(os.getenv("IDLE_GPU_PCT_MAX", "10"))       # <= 10% GPU considered idle
 MIN_UPTIME_BEFORE_SUSPEND = int(os.getenv("MIN_UPTIME_BEFORE_SUSPEND", "300"))# don't suspend within 5 minutes of boot
 
-# Garbage collection (local default: off). Global setting can enable per controller.
-GC_BASE_DIR = os.getenv("GC_BASE_DIR", "/opt/jerry/current")
-GC_INTERVAL_SEC = max(60, int(os.getenv("GC_INTERVAL_SEC", "900")))
-GC_MIN_AGE_SEC = max(300, int(os.getenv("GC_MIN_AGE_SEC", "21600")))
+# Garbage collection for local Thinvids scratch.
+GC_BASE_DIR = os.getenv("GC_BASE_DIR", os.getenv("PROJECT_ROOT", "/projects"))
+GC_INTERVAL_SEC = max(60, int(os.getenv("GC_INTERVAL_SEC", "300")))
+GC_MIN_AGE_SEC = max(300, int(os.getenv("GC_MIN_AGE_SEC", "1800")))
+GC_PRESSURE_DISK_USED_PCT = max(1.0, min(99.0, float(os.getenv("GC_PRESSURE_DISK_USED_PCT", "85"))))
 
 HOSTNAME = os.getenv("HOSTNAME", socket.gethostname())  # e.g. thinman07
 KEY      = f"metrics:node:{HOSTNAME}"
@@ -34,6 +35,7 @@ KEY      = f"metrics:node:{HOSTNAME}"
 # Global settings key (controller-managed)
 GLOBAL_SETTINGS_KEY = "global:settings"
 PIPELINE_NODE_ROLES_KEY = "pipeline:node_roles"
+SUSPEND_INHIBIT_KEY = "cluster:suspend_inhibit"
 ROLE_SYNC_INTERVAL_SEC = max(5, int(os.getenv("ROLE_SYNC_INTERVAL_SEC", "10")))
 ENCODE_SERVICE = os.getenv("ENCODE_SERVICE", "thinman-worker-encode.service")
 PIPELINE_SERVICE = os.getenv("PIPELINE_SERVICE", "thinman-worker-pipeline.service")
@@ -208,30 +210,33 @@ def _uptime_seconds() -> float:
 # ---------------- Garbage collection of stale projects ----------------
 _GUID_RE = re.compile(r"^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
 
-def _active_job_ids() -> set[str]:
+def _active_job_ids() -> set[str] | None:
     active = set()
     try:
-        job_ids = redis_client.smembers("jobs:index") or set()
+        job_keys = redis_client.smembers("jobs:all") or set()
     except Exception as e:
-        logger.warning("GC: failed to read jobs:index: %s", e)
-        return active
+        logger.warning("GC: failed to read jobs:all: %s", e)
+        return None
 
-    if not job_ids:
+    if not job_keys:
         return active
 
     pipe = redis_client.pipeline()
     ordered = []
-    for job_id in job_ids:
-        jid = str(job_id or "").strip()
-        if not jid:
+    for job_key in job_keys:
+        raw = str(job_key or "").strip()
+        if not raw.startswith("job:"):
+            continue
+        jid = raw.split(":", 1)[1]
+        if not jid or ":" in jid:
             continue
         ordered.append(jid)
-        pipe.hget(f"job:{jid}", "status")
+        pipe.hget(raw, "status")
     try:
         statuses = pipe.execute()
     except Exception as e:
         logger.warning("GC: failed to fetch job statuses: %s", e)
-        return active
+        return None
 
     for job_id, status_raw in zip(ordered, statuses):
         try:
@@ -241,6 +246,22 @@ def _active_job_ids() -> set[str]:
         if status in {"STARTING", "WAITING", "RUNNING", "STAMPING"}:
             active.add(job_id)
     return active
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    try:
+        for root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            for name in files:
+                fpath = os.path.join(root, name)
+                try:
+                    if not os.path.islink(fpath):
+                        total += os.path.getsize(fpath)
+                except OSError:
+                    pass
+    except Exception:
+        return 0
+    return total
 
 
 def remove_stale_projects(base_dir: str, *, min_age_sec: int = GC_MIN_AGE_SEC):
@@ -258,8 +279,18 @@ def remove_stale_projects(base_dir: str, *, min_age_sec: int = GC_MIN_AGE_SEC):
         return
 
     now = time.time()
+    pressure_mode = False
+    try:
+        disk_used_pct = float(psutil.disk_usage(base_dir).percent)
+        pressure_mode = disk_used_pct >= GC_PRESSURE_DISK_USED_PCT
+    except Exception:
+        disk_used_pct = 0.0
     active_jobs = _active_job_ids()
+    if active_jobs is None:
+        logger.warning("GC: skipping %s because active job state is unavailable", base_dir)
+        return
     removed = 0
+    removed_bytes = 0
     skipped_active = 0
     skipped_recent = 0
     for name in entries:
@@ -276,10 +307,11 @@ def remove_stale_projects(base_dir: str, *, min_age_sec: int = GC_MIN_AGE_SEC):
         except Exception as e:
             logger.warning("GC: stat failed for %s: %s", path, e)
             continue
-        if age_sec < float(min_age_sec):
+        if not pressure_mode and age_sec < float(min_age_sec):
             skipped_recent += 1
             continue
         try:
+            removed_bytes += _dir_size_bytes(path)
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
         except Exception as e:
@@ -287,12 +319,16 @@ def remove_stale_projects(base_dir: str, *, min_age_sec: int = GC_MIN_AGE_SEC):
 
     if removed or skipped_active or skipped_recent:
         logger.info(
-            "GC: base=%s removed=%d skipped_active=%d skipped_recent=%d min_age_sec=%d",
+            "GC: base=%s removed=%d removed_mb=%.1f skipped_active=%d skipped_recent=%d min_age_sec=%d pressure=%s disk_used_pct=%.1f threshold_pct=%.1f",
             base_dir,
             removed,
+            removed_bytes / (1024 * 1024),
             skipped_active,
             skipped_recent,
             int(min_age_sec),
+            "1" if pressure_mode else "0",
+            disk_used_pct,
+            GC_PRESSURE_DISK_USED_PCT,
         )
 
 def _get_global_suspend_settings():
@@ -313,6 +349,20 @@ def _get_global_suspend_settings():
     gc_before = as_bool(settings.get("suspend_gc_enabled"), False)
 
     return suspend_enabled, idle_sec, idle_cpu_pct_max, gc_before
+
+def _manager_suspend_inhibit():
+    try:
+        data = redis_client.hgetall(SUSPEND_INHIBIT_KEY) or {}
+    except Exception as e:
+        logger.warning("Failed to read suspend inhibit lease: %s", e)
+        return False, 0.0, ""
+
+    try:
+        until_ts = float(data.get("until") or 0)
+    except Exception:
+        until_ts = 0.0
+    reason = str(data.get("reason") or "").strip()
+    return until_ts > time.time(), until_ts, reason
 
 def _service_is_active(service_name: str) -> bool:
     try:
@@ -363,6 +413,8 @@ def main():
     next_mac_publish   = 0.0  # publish nodes:mac immediately on first loop
     next_role_sync = 0.0
     worker_role = "encode"
+    encode_service_active = False
+    pipeline_service_active = False
 
     # Idle detection state
     idle_since = None
@@ -391,6 +443,8 @@ def main():
         # ---- Collect metrics (acts as heartbeat too) ----
         if time.time() >= next_role_sync:
             worker_role = _sync_worker_role_services()
+            encode_service_active = _service_is_active(ENCODE_SERVICE)
+            pipeline_service_active = _service_is_active(PIPELINE_SERVICE)
             next_role_sync = time.time() + ROLE_SYNC_INTERVAL_SEC
 
         cpu = psutil.cpu_percent(interval=None)
@@ -405,6 +459,7 @@ def main():
 
         gpu = sample_gpu_percent()
         gpu_val = -1.0 if gpu is None else float(gpu)
+        suspend_inhibited, suspend_inhibited_until, suspend_inhibit_reason = _manager_suspend_inhibit()
 
         # Network deltas -> bytes/sec
         now_net = psutil.net_io_counters()
@@ -426,6 +481,11 @@ def main():
             "rx_bps": rx_bps,
             "tx_bps": tx_bps,
             "worker_role": worker_role,
+            "encode_service_active": "1" if encode_service_active else "0",
+            "pipeline_service_active": "1" if pipeline_service_active else "0",
+            "suspend_inhibited": "1" if suspend_inhibited else "0",
+            "suspend_inhibited_until": suspend_inhibited_until,
+            "suspend_inhibit_reason": suspend_inhibit_reason,
         }
 
         # Single write/update per second; TTL makes liveness easy to detect
@@ -447,7 +507,7 @@ def main():
         g_suspend_enabled, g_idle_sec, g_idle_cpu_pct_max, g_gc_enabled = _get_global_suspend_settings()
 
         # Determine effective enable/threshold (global must allow it; local can further restrict)
-        effective_suspend_enabled = bool(g_suspend_enabled)
+        effective_suspend_enabled = bool(g_suspend_enabled) and not suspend_inhibited
         effective_idle_threshold  = int(g_idle_sec)
 
         # Consider idle if CPU and GPU are both below thresholds (GPU may be absent)
@@ -457,7 +517,15 @@ def main():
 
         now = time.time()
 
-        if is_idle and effective_suspend_enabled:
+        if suspend_inhibited:
+            if idle_since is not None:
+                logger.info(
+                    "Suspend countdown cancelled by manager inhibit: reason=%s until=%.0f",
+                    suspend_inhibit_reason or "pipeline activity",
+                    suspend_inhibited_until,
+                )
+            idle_since = None
+        elif is_idle and effective_suspend_enabled:
             if idle_since is None:
                 idle_since = now
             idle_dur = now - idle_since

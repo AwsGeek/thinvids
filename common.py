@@ -28,6 +28,7 @@ REDIS_DB_TASKS = int(ENV("REDIS_DB_TASKS", "0"))  # Huey broker
 REDIS_DB_DATA  = int(ENV("REDIS_DB_DATA",  "1"))  # App/job state
 HUEY_NAME = ENV("HUEY_NAME", "tasks")
 HUEY_PIPELINE_NAME = ENV("HUEY_PIPELINE_NAME", f"{HUEY_NAME}:pipeline")
+HUEY_PIPELINE_BASE_NAME = ENV("HUEY_PIPELINE_BASE_NAME", HUEY_PIPELINE_NAME)
 HUEY_ENCODE_NAME = ENV("HUEY_ENCODE_NAME", f"{HUEY_NAME}:encode")
 
 @lru_cache(maxsize=None)
@@ -59,6 +60,15 @@ def get_huey(name: Optional[str] = None) -> RedisHuey:
 
 def get_pipeline_huey() -> RedisHuey:
     return get_huey(HUEY_PIPELINE_NAME)
+
+def pipeline_huey_name_for_host(host: str) -> str:
+    host = str(host or "").strip().lower().split(".", 1)[0]
+    if not host:
+        raise ValueError("pipeline host is required")
+    return f"{HUEY_PIPELINE_BASE_NAME}:{host}"
+
+def get_pipeline_huey_for_host(host: str) -> RedisHuey:
+    return get_huey(pipeline_huey_name_for_host(host))
 
 def get_encode_huey() -> RedisHuey:
     return get_huey(HUEY_ENCODE_NAME)
@@ -182,13 +192,24 @@ DEFAULT_SETTINGS = {
     "low_disk_direct_enabled": "1",
     "low_disk_min_free_gb": "20",
     "target_segment_mb": "10",
+    "min_segment_count": "100",
     "large_file_behavior": "direct",
     "default_target_height": "1080",
+    "video_encoder": "h265",
     "max_active_jobs": "2",
+    "max_active_large_jobs": "1",
     "pipeline_worker_count": "4",
-    "pipeline_drain_ratio_to_start_next": "0.75",
-    "pipeline_min_idle_workers_to_start_next": "4",
 }
+
+ALLOWED_VIDEO_ENCODERS = {"h264", "h265"}
+
+def normalize_video_encoder(value, default: str = "h265") -> str:
+    encoder = str(value or "").strip().lower()
+    if encoder in {"hevc", "h.265", "h265"}:
+        return "h265"
+    if encoder in {"avc", "h.264", "h264"}:
+        return "h264"
+    return default if default in ALLOWED_VIDEO_ENCODERS else "h265"
 
 # ---------------- Global settings fetch (with light caching) ----------------
 cached_settings = {"ts": 0, "data": {}}
@@ -236,7 +257,7 @@ def all_jobs_are_idle() -> bool:
 
     redis_client = get_redis()
 
-    active = [Status.RUNNING, Status.WAITING, Status.STARTING]
+    active = [Status.RUNNING, Status.WAITING, Status.STARTING, Status.STAMPING]
 
     # Pull indexed job keys; seed from keyspace if empty
     raw_keys = list(redis_client.smembers("jobs:all") or [])
