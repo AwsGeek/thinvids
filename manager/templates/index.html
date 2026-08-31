@@ -144,9 +144,9 @@
         <div style="min-width: 10rem;">
           <label for="sort-by" class="block text-xs font-medium text-gray-700 mb-1">Sort By</label>
           <select id="sort-by" class="border p-2 rounded w-full text-sm">
+            <option value="status">Status</option>
             <option value="date">Date</option>
             <option value="filename">Name</option>
-            <option value="status">Status</option>
           </select>
         </div>
       </div>
@@ -275,12 +275,21 @@
           <input id="settings-number-parts" type="number" min="1" max="8" class="border p-2 rounded w-full">
         </div>
       </div>
-      <div>
-        <label class="block text-sm font-medium mb-1" for="settings-target-height">Target Resolution</label>
-        <select id="settings-target-height" class="border p-2 rounded w-full">
-          <option value="720">720p</option>
-          <option value="1080">1080p</option>
-        </select>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1" for="settings-target-height">Target Resolution</label>
+          <select id="settings-target-height" class="border p-2 rounded w-full">
+            <option value="720">720p</option>
+            <option value="1080">1080p</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1" for="settings-video-encoder">Video Encoder</label>
+          <select id="settings-video-encoder" class="border p-2 rounded w-full">
+            <option value="h264">H264 / AVC</option>
+            <option value="h265">H265 / HEVC</option>
+          </select>
+        </div>
       </div>
       <div class="grid grid-cols-2 gap-4">
         <div>
@@ -370,6 +379,41 @@
     node.textContent = message;
     root.appendChild(node);
     setTimeout(()=>node.remove(), 2200);
+  }
+  async function apiRequest(url, options = {}) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    let payload = {};
+    if (text) {
+      try { payload = JSON.parse(text); }
+      catch { payload = { message: text }; }
+    }
+    if (!res.ok) {
+      const message = payload.message || payload.error || payload.status || `${res.status} ${res.statusText}`;
+      throw new Error(message);
+    }
+    return payload;
+  }
+  function setRowBusy(row, busy) {
+    if (!row) return;
+    row.querySelectorAll('.row-action-btn, .job-select').forEach(btn => {
+      btn.disabled = !!busy;
+    });
+    row.classList.toggle('opacity-60', !!busy);
+  }
+  async function runRowAction(btn, label, action) {
+    const row = btn?.closest('tr');
+    setRowBusy(row, true);
+    try {
+      const payload = await action();
+      toast(label);
+      await fetchJobs();
+      return payload;
+    } catch (err) {
+      toast(`${label} failed: ${err.message || err}`, false);
+      setRowBusy(row, false);
+      throw err;
+    }
   }
   const BLUE_FILL='rgba(37,99,235,0.85)', BLUE_STROKE='rgb(37,99,235)';
   const AXIS_COLOR='#374151';
@@ -577,14 +621,15 @@
   const ALLOWED_PAGE_SIZES = [10, 25, 50, 100];
   let CURRENT_PAGE = 1;
   let PAGE_SIZE = 10;
-  let CURRENT_SORT = 'date';
-  let CURRENT_DIR  = 'desc';
+  let CURRENT_SORT = 'status';
+  let CURRENT_DIR  = 'asc';
   let CURRENT_STATUS = 'ALL';
   let CURRENT_QUERY = '';
   let CURRENT_VISIBLE_JOB_IDS = [];
   let searchDebounceTimer = null;
   let lastJobsReqId = 0;
   const SELECTED_JOB_IDS = new Set();
+  let LAST_SELECTED_JOB_ID = '';
   const ACTIVITY_PANEL_KEY = 'thinvids_activity_panel_v1';
   const ACTIVITY_CLEAR_TS_KEY = 'thinvids_activity_clear_ts_v1';
   let ACTIVITY_PANEL_COLLAPSED = false;
@@ -689,6 +734,37 @@
     return SELECTED_JOB_IDS.size;
   }
 
+  function syncVisibleSelectionCheckboxes(){
+    document.querySelectorAll('#job-list .job-select').forEach(cb => {
+      const jobId = cb.dataset.jobid;
+      cb.checked = !!jobId && SELECTED_JOB_IDS.has(jobId);
+    });
+  }
+
+  function applyJobSelection(jobId, selected, event){
+    if (!jobId) return;
+    const checked = !!selected;
+    const currentIndex = CURRENT_VISIBLE_JOB_IDS.indexOf(jobId);
+    const anchorIndex = CURRENT_VISIBLE_JOB_IDS.indexOf(LAST_SELECTED_JOB_ID);
+
+    if (event?.shiftKey && currentIndex >= 0 && anchorIndex >= 0) {
+      const start = Math.min(anchorIndex, currentIndex);
+      const end = Math.max(anchorIndex, currentIndex);
+      CURRENT_VISIBLE_JOB_IDS.slice(start, end + 1).forEach(id => {
+        if (checked) SELECTED_JOB_IDS.add(id);
+        else SELECTED_JOB_IDS.delete(id);
+      });
+    } else if (checked) {
+      SELECTED_JOB_IDS.add(jobId);
+    } else {
+      SELECTED_JOB_IDS.delete(jobId);
+    }
+
+    LAST_SELECTED_JOB_ID = jobId;
+    syncVisibleSelectionCheckboxes();
+    updateBulkUiState();
+  }
+
   function updateBulkUiState(){
     const label = el('actions-header-label');
     const wrap = el('bulk-actions-wrap');
@@ -727,26 +803,24 @@
     let fail = 0;
     for (const jobId of ids) {
       try {
-        let res;
         if (action === 'stop') {
-          res = await fetch(`/stop_job/${jobId}`, { method: 'POST' });
+          await apiRequest(`/stop_job/${jobId}`, { method: 'POST' });
         } else if (action === 'copy') {
-          res = await fetch('/copy_job', {
+          await apiRequest('/copy_job', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ job_id: jobId })
           });
         } else if (action === 'delete') {
-          res = await fetch(`/delete_job/${jobId}`, { method: 'DELETE' });
+          await apiRequest(`/delete_job/${jobId}`, { method: 'DELETE' });
         } else if (action === 'restart') {
-          res = await fetch(`/restart_job/${jobId}`, { method: 'POST' });
+          await apiRequest(`/restart_job/${jobId}`, { method: 'POST' });
         } else {
           continue;
         }
-
-        if (res.ok) ok += 1;
-        else fail += 1;
-      } catch {
+        ok += 1;
+      } catch (err) {
+        console.warn(`Bulk ${action} failed for ${jobId}:`, err);
         fail += 1;
       }
     }
@@ -755,9 +829,10 @@
     if (fail > 0) toast(`${action.toUpperCase()}: ${fail} failed`, false);
 
     SELECTED_JOB_IDS.clear();
+    LAST_SELECTED_JOB_ID = '';
     if (actionSel) actionSel.value = '';
     updateBulkUiState();
-    fetchJobs();
+    await fetchJobs();
   }
 
   function loadPager(){
@@ -769,8 +844,16 @@
         if (Number.isInteger(s.page) && s.page>0) CURRENT_PAGE = s.page;
         const pageSize = parseInt(s.page_size, 10);
         if (ALLOWED_PAGE_SIZES.includes(pageSize)) PAGE_SIZE = pageSize;
-        if (typeof s.sort === 'string' && ['date', 'filename', 'status'].includes(s.sort)) CURRENT_SORT = s.sort;
-        if (s.dir === 'asc' || s.dir === 'desc') CURRENT_DIR = s.dir;
+        let migratedDefaultSort = false;
+        if (s.sort === 'date' && (s.dir === undefined || s.dir === 'desc')) {
+          CURRENT_SORT = 'status';
+          CURRENT_DIR = 'asc';
+          CURRENT_PAGE = 1;
+          migratedDefaultSort = true;
+        } else if (typeof s.sort === 'string' && ['date', 'filename', 'status'].includes(s.sort)) {
+          CURRENT_SORT = s.sort;
+        }
+        if (!migratedDefaultSort && (s.dir === 'asc' || s.dir === 'desc')) CURRENT_DIR = s.dir;
         if (typeof s.status === 'string') CURRENT_STATUS = s.status.toUpperCase() || 'ALL';
         if (typeof s.q === 'string') CURRENT_QUERY = s.q;
       }
@@ -886,6 +969,9 @@
     for (const jobId of selectedJobIds()){
       if (!CURRENT_VISIBLE_JOB_IDS.includes(jobId)) SELECTED_JOB_IDS.delete(jobId);
     }
+    if (LAST_SELECTED_JOB_ID && !CURRENT_VISIBLE_JOB_IDS.includes(LAST_SELECTED_JOB_ID)) {
+      LAST_SELECTED_JOB_ID = '';
+    }
 
     const jobList = el('job-list');
     jobList.innerHTML = '';
@@ -922,6 +1008,11 @@
         if (isDone && destSize > 0) return destSize;
         return Number(job.source_file_size || 0);
       })();
+      const displayCodec = (() => {
+        const destCodec = String(job.dest_codec || '').trim();
+        if (isDone && destCodec) return destCodec;
+        return String(job.source_codec || '').trim() || '…';
+      })();
       const nameInner = isDone
         ? `<button class="name-text font-bold underline ${nameColor} hover:opacity-80 name-preview"
             title="Preview"
@@ -946,7 +1037,7 @@
         </td>
         <td class="px-2 py-1 text-left name-cell">${nameCellHTML}</td>
         <td class="px-2 py-1">${formatBytes(displayFileSize)}</td>
-        <td class="px-2 py-1">${job.source_codec || '…'}</td>
+        <td class="px-2 py-1">${displayCodec}</td>
         <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.segment_elapsed||0, job.segment_progress||0)}</div></td>
         <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.encode_elapsed ||0, job.encode_progress ||0)}</div></td>
         <td class="px-2 py-1 text-center"><div class="w-28 mx-auto">${progressBar(job.combine_elapsed||0, job.combine_progress||0)}</div></td>
@@ -968,26 +1059,16 @@
       `;
       el('job-list').appendChild(row);
 
-      row.querySelector('.job-select')?.addEventListener('change', (e) => {
-        if (e.target.checked) SELECTED_JOB_IDS.add(job.job_id);
-        else SELECTED_JOB_IDS.delete(job.job_id);
-        updateBulkUiState();
+      row.querySelector('.job-select')?.addEventListener('click', (e) => {
+        applyJobSelection(job.job_id, e.target.checked, e);
       });
 
       const stampBtn = row.querySelector('.stamp-btn');
       if (stampBtn) stampBtn.addEventListener('click', async ()=>{
         if (!confirm('Create a frame-stamped copy and retarget this job to it? This uses slow software encoding.')) return;
-        try{
-          const r = await fetch(`/stamp_job/${job.job_id}`, { method:'POST' });
-          if (!r.ok) {
-            const j = await r.json().catch(()=>({}));
-            throw new Error(j.message || 'Stamp failed');
-          }
-          toast('Stamping started…');
-          fetchJobs();
-        }catch(err){
-          toast(`Stamp failed: ${err.message}`, false);
-        }
+        await runRowAction(stampBtn, 'Stamping queued', () =>
+          apiRequest(`/stamp_job/${job.job_id}`, { method:'POST' })
+        ).catch(()=>{});
       });
             
       const previewBtn = row.querySelector('.name-preview');
@@ -1002,23 +1083,38 @@
       }
       const copyBtn = row.querySelector('.copy-btn');
       if (copyBtn) copyBtn.addEventListener('click', async ()=>{
-        try{
-          const r = await fetch('/copy_job', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ job_id: job.job_id })});
-          const j = await r.json();
-          if (r.ok && j.status==='success') { toast(`Copied job ${job.job_id.split('-')[0]} → ${j.job_id.split('-')[0]} (PAUSED)`); fetchJobs(); }
-          else throw new Error(j.message || 'Copy failed');
-        }catch(err){ toast(`Copy failed: ${err.message}`, false); }
+        await runRowAction(copyBtn, 'Job copied', () =>
+          apiRequest('/copy_job', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ job_id: job.job_id })
+          })
+        ).catch(()=>{});
       });
       row.querySelector('.delete-btn').addEventListener('click', async ()=>{
         if (!confirm('Delete this job?')) return;
-        const r = await fetch(`/delete_job/${job.job_id}`, { method:'DELETE' });
-        if (r.ok) fetchJobs(); else alert('Failed to delete job');
+        await runRowAction(row.querySelector('.delete-btn'), 'Job deleted', () =>
+          apiRequest(`/delete_job/${job.job_id}`, { method:'DELETE' })
+        ).catch(()=>{});
       });
       row.querySelector('.properties-btn').addEventListener('click', async ()=>{ await showProperties(job.job_id); });
       row.querySelector('.settings-btn').addEventListener('click', async ()=>{ await showJobSettings(job.job_id); });
-      row.querySelector('.vcr-start-btn')?.addEventListener('click', async ()=>{ const r=await fetch(`/start_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
-      row.querySelector('.vcr-stop-btn')?.addEventListener('click',  async ()=>{ if(!confirm('Stop this job?'))return; const r=await fetch(`/stop_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
-      row.querySelector('.vcr-restart-btn')?.addEventListener('click',async ()=>{ const r=await fetch(`/restart_job/${job.job_id}`,{method:'POST'}); if (r.ok) fetchJobs(); });
+      row.querySelector('.vcr-start-btn')?.addEventListener('click', async (e)=>{
+        await runRowAction(e.currentTarget, 'Job queued', () =>
+          apiRequest(`/start_job/${job.job_id}`, { method:'POST' })
+        ).catch(()=>{});
+      });
+      row.querySelector('.vcr-stop-btn')?.addEventListener('click',  async (e)=>{
+        if(!confirm('Stop this job?'))return;
+        await runRowAction(e.currentTarget, 'Job stopped', () =>
+          apiRequest(`/stop_job/${job.job_id}`, { method:'POST' })
+        ).catch(()=>{});
+      });
+      row.querySelector('.vcr-restart-btn')?.addEventListener('click',async (e)=>{
+        await runRowAction(e.currentTarget, 'Job restart queued', () =>
+          apiRequest(`/restart_job/${job.job_id}`, { method:'POST' })
+        ).catch(()=>{});
+      });
     });
 
     updateBulkUiState();
@@ -1030,18 +1126,24 @@
 
   // ------- Job properties & settings modals -------
   async function showProperties(job_id){
-    const res = await fetch(`/job_properties/${job_id}`);
-    if (!res.ok) return alert('Failed to load properties');
-    const data = await res.json();
-    el('properties-content').innerText = JSON.stringify(data, null, 2);
-    el('properties-modal').classList.remove('hidden');
+    try {
+      const data = await apiRequest(`/job_properties/${job_id}`);
+      el('properties-content').innerText = JSON.stringify(data, null, 2);
+      el('properties-modal').classList.remove('hidden');
+    } catch (err) {
+      toast(`Failed to load properties: ${err.message || err}`, false);
+    }
   }
   function closeModal(id){ el(id)?.classList.add('hidden'); }
 
   async function showJobSettings(job_id){
-    const res = await fetch(`/job_settings/${job_id}`);
-    if (!res.ok) return alert('Failed to load settings');
-    const data = await res.json();
+    let data;
+    try {
+      data = await apiRequest(`/job_settings/${job_id}`);
+    } catch (err) {
+      toast(`Failed to load settings: ${err.message || err}`, false);
+      return;
+    }
     const editable = ['READY','STOPPED','FAILED','REJECTED'].includes(String(data.status||'').toUpperCase());
     el('settings-job-id').value = job_id;
     el('settings-filename').value = data.filename || '';
@@ -1049,6 +1151,8 @@
     el('settings-number-parts').value = data.number_parts || 2;
     const targetHeightSel = el('settings-target-height');
     targetHeightSel.value = String(data.target_height || 1080);
+    const videoEncoderSel = el('settings-video-encoder');
+    videoEncoderSel.value = ['h264','h265'].includes(String(data.video_encoder || 'h265')) ? String(data.video_encoder || 'h265') : 'h265';
     const vSel = el('settings-v-stream'), aSel = el('settings-a-stream');
     vSel.innerHTML = ''; aSel.innerHTML = '';
     const raw = data.streams;
@@ -1067,6 +1171,7 @@
     el('settings-segment-duration').disabled = !editable;
     el('settings-number-parts').disabled = !editable;
     targetHeightSel.disabled = !editable;
+    videoEncoderSel.disabled = !editable;
     vSel.disabled = !editable; aSel.disabled = !editable;
     // frame stamps setting
     const fsBox = el('job-software-encode');
@@ -1091,16 +1196,37 @@
     const segment_duration = parseInt(el('settings-segment-duration').value,10);
     const number_parts     = parseInt(el('settings-number-parts').value,10);
     const target_height    = parseInt(el('settings-target-height').value,10);
+    const video_encoder    = ['h264','h265'].includes(el('settings-video-encoder').value) ? el('settings-video-encoder').value : 'h265';
     const selected_v_stream= el('settings-v-stream').selectedIndex;
     const selected_a_stream= el('settings-a-stream').selectedIndex;
     const serialize_pipeline = el('job-serialize-pipeline').checked;
     const software_encode = el('job-software-encode').checked;
-    const res = await fetch(`/job_settings/${job_id}`,{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ segment_duration, number_parts, target_height, selected_v_stream, selected_a_stream, serialize_pipeline, software_encode })
-    });
-    if (res.ok){ closeModal('job-settings-modal'); fetchJobs(); }
-    else { alert((await res.text())||'Failed to save settings'); }
+    try {
+      await apiRequest(`/job_settings/${job_id}`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ segment_duration, number_parts, target_height, video_encoder, selected_v_stream, selected_a_stream, serialize_pipeline, software_encode })
+      });
+      closeModal('job-settings-modal');
+      toast('Settings saved');
+      fetchJobs();
+    } catch (err) {
+      toast(`Settings save failed: ${err.message || err}`, false);
+    }
+  }
+
+  async function startJob(job_id){
+    const btn = el('start-job-btn');
+    if (btn) btn.disabled = true;
+    try {
+      await apiRequest(`/start_job/${job_id}`, { method:'POST' });
+      closeModal('job-settings-modal');
+      toast('Job queued');
+      await fetchJobs();
+    } catch (err) {
+      toast(`Start failed: ${err.message || err}`, false);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   // ---- video modal helpers ----
@@ -1137,15 +1263,6 @@
     });
   }
 
-  // Existing close helpers (already in your file)
-  function closeModal(id){ document.getElementById(id)?.classList.add('hidden'); }
-  function closeVideoModal(){
-    const modal = document.getElementById('video-modal');
-    const player = document.getElementById('video-player');
-    player.pause(); player.removeAttribute('src'); player.load();
-    modal.classList.add('hidden'); modal.classList.remove('flex');
-  }  
-  
   window.addEventListener('DOMContentLoaded', ()=>{
 
     // Close by clicking outside the modal content
@@ -1184,7 +1301,7 @@
     const statusSel = el('status-filter');
     const searchInput = el('jobs-search');
 
-    if (sortSel) sortSel.value = ['date', 'filename', 'status'].includes(CURRENT_SORT) ? CURRENT_SORT : 'date';
+    if (sortSel) sortSel.value = ['date', 'filename', 'status'].includes(CURRENT_SORT) ? CURRENT_SORT : 'status';
     if (statusSel) {
       const allowedStatus = ['ALL', 'READY', 'STARTING', 'WAITING', 'RUNNING', 'STAMPING', 'STOPPED', 'FAILED', 'REJECTED', 'DONE'];
       if (!allowedStatus.includes(CURRENT_STATUS)) CURRENT_STATUS = 'ALL';
@@ -1195,7 +1312,7 @@
     if (pageSizeSel) pageSizeSel.value = String(ALLOWED_PAGE_SIZES.includes(PAGE_SIZE) ? PAGE_SIZE : 10);
 
     safeOn('sort-by', 'change', (e) => {
-      const nextSort = (e.target.value || 'date').toLowerCase();
+      const nextSort = (e.target.value || 'status').toLowerCase();
       if (!['date', 'filename', 'status'].includes(nextSort)) return;
       CURRENT_SORT = nextSort;
       CURRENT_DIR = (nextSort === 'date') ? 'desc' : 'asc';
@@ -1232,6 +1349,7 @@
       PAGE_SIZE = nextSize;
       CURRENT_PAGE = 1;
       SELECTED_JOB_IDS.clear();
+      LAST_SELECTED_JOB_ID = '';
       savePager();
       updateBulkUiState();
       fetchJobs();
@@ -1246,6 +1364,7 @@
         if (checked) SELECTED_JOB_IDS.add(jobId);
         else SELECTED_JOB_IDS.delete(jobId);
       });
+      LAST_SELECTED_JOB_ID = checked ? (CURRENT_VISIBLE_JOB_IDS[0] || '') : '';
       updateBulkUiState();
     });
 
@@ -1263,7 +1382,6 @@
 
     // initial pulls
     updateBulkUiState();
-    fetchJobs();
     fetchMetrics();
     fetchAndUpdateMiniNet();
     fetchActivity();

@@ -21,14 +21,15 @@
     redis_port: 6379
     redis_db_tasks: 0
     redis_db_data: 1
-    huey_name: thinvids_tasks
+    huey_name: thinvidstasks
     huey_pipeline_name: "{{ huey_name }}:pipeline"
     huey_encode_name: "{{ huey_name }}:encode"
     ttl_sec: 15
     master_http_port: 8000
     vaapi_device: /dev/dri/renderD128
     huey_workers: 1
-    manager_reboot_ssh_key_path: "/home/{{ thinman_user }}/.ssh/id_ed25519"
+    manager_reboot_ssh_public_key_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    manager_reboot_ssh_public_key: "{{ lookup('file', manager_reboot_ssh_public_key_path, errors='ignore') }}"
 
     # OS packages
     base_packages:
@@ -40,7 +41,7 @@
       - rsync
       - ffmpeg
       - vainfo
-      - intel-media-va-driver
+      - intel-media-va-driver-non-free
       - intel-gpu-tools
       - nfs-common
       - ethtool
@@ -66,6 +67,23 @@
 
   tasks:
     # --- Packages & user ---
+    - name: Enable Debian contrib/non-free apt components for Intel HEVC VAAPI
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/thinvids-nonfree.list
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          deb https://deb.debian.org/debian bookworm contrib non-free
+          deb https://deb.debian.org/debian bookworm-updates contrib non-free
+          deb https://security.debian.org/debian-security bookworm-security contrib non-free
+      register: thinvids_nonfree_sources
+
+    - name: Update apt cache after enabling Debian contrib/non-free
+      ansible.builtin.apt:
+        update_cache: true
+      when: thinvids_nonfree_sources.changed
+
     - name: Ensure packages
       ansible.builtin.package:
         name: "{{ base_packages }}"
@@ -90,43 +108,19 @@
         shell: /bin/bash
         create_home: yes
 
-    - name: Ensure manager SSH directory exists
-      ansible.builtin.file:
-        path: "/home/{{ thinman_user }}/.ssh"
-        state: directory
-        owner: "{{ thinman_user }}"
-        group: "{{ thinman_group }}"
-        mode: "0700"
-      delegate_to: "{{ groups['thinman_managers'][0] }}"
-      run_once: true
-
-    - name: Check manager reboot SSH key
-      ansible.builtin.stat:
-        path: "{{ manager_reboot_ssh_key_path }}"
-      delegate_to: "{{ groups['thinman_managers'][0] }}"
-      register: manager_reboot_ssh_key
-      run_once: true
-
-    - name: Create manager reboot SSH key
-      ansible.builtin.command:
-        cmd: "ssh-keygen -t ed25519 -f {{ manager_reboot_ssh_key_path }} -N '' -C thinvids-manager-reboot"
-        creates: "{{ manager_reboot_ssh_key_path }}"
-      become_user: "{{ thinman_user }}"
-      delegate_to: "{{ groups['thinman_managers'][0] }}"
-      run_once: true
-      when: not manager_reboot_ssh_key.stat.exists
-
-    - name: Read manager reboot SSH public key
-      ansible.builtin.slurp:
-        src: "{{ manager_reboot_ssh_key_path }}.pub"
-      delegate_to: "{{ groups['thinman_managers'][0] }}"
-      register: manager_reboot_ssh_public_key
+    - name: Ensure local manager reboot SSH public key is available
+      ansible.builtin.assert:
+        that:
+          - manager_reboot_ssh_public_key | length > 0
+        fail_msg: >-
+          Missing {{ manager_reboot_ssh_public_key_path }} on the Ansible control host.
+          Create or choose the SSH key mounted into the swarm4 Docker Compose manager.
       run_once: true
 
     - name: Allow manager SSH key to log in to workers
       ansible.posix.authorized_key:
         user: "{{ thinman_user }}"
-        key: "{{ manager_reboot_ssh_public_key.content | b64decode }}"
+        key: "{{ manager_reboot_ssh_public_key }}"
         state: present
         comment: thinvids-manager-reboot
 
@@ -289,8 +283,9 @@
           Environment=TTL_SEC={{ ttl_sec }}
           Environment=NODE_NAME=%H
           Environment=GC_BASE_DIR={{ projects_dir }}
-          Environment=GC_INTERVAL_SEC=900
-          Environment=GC_MIN_AGE_SEC=21600
+          Environment=GC_INTERVAL_SEC=300
+          Environment=GC_MIN_AGE_SEC=1800
+          Environment=GC_PRESSURE_DISK_USED_PCT=85
 
           # Use the SAME venv as the worker
           ExecStart={{ app_root }}/venv/bin/python agent.py
@@ -300,6 +295,7 @@
       notify:
         - systemd daemon-reload
         - restart thinman-agent
+      tags: build_app
 
     - name: Disable legacy single-queue worker
       ansible.builtin.systemd:
@@ -338,6 +334,7 @@
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
           Environment=HUEY_NAME={{ huey_name }}
+          Environment=HUEY_PIPELINE_BASE_NAME={{ huey_pipeline_name }}
           Environment=HUEY_PIPELINE_NAME={{ huey_pipeline_name }}
           Environment=HUEY_ENCODE_NAME={{ huey_encode_name }}
           Environment=PROJECT_ROOT={{ projects_dir }}
@@ -383,7 +380,8 @@
           Environment=REDIS_DB_TASKS={{ redis_db_tasks }}
           Environment=REDIS_DB_DATA={{ redis_db_data }}
           Environment=HUEY_NAME={{ huey_name }}
-          Environment=HUEY_PIPELINE_NAME={{ huey_pipeline_name }}
+          Environment=HUEY_PIPELINE_BASE_NAME={{ huey_pipeline_name }}
+          Environment=HUEY_PIPELINE_NAME={{ huey_pipeline_name }}:{{ inventory_hostname }}
           Environment=HUEY_ENCODE_NAME={{ huey_encode_name }}
           Environment=PROJECT_ROOT={{ projects_dir }}
           Environment=WATCH_ROOT={{ watch_dir }}
@@ -499,6 +497,7 @@
               "$SYSTEMCTL" daemon-reload
               "$SYSTEMCTL" restart thinman-agent.service  || true
               "$SYSTEMCTL" restart thinman-worker-encode.service || true
+              "$SYSTEMCTL" restart thinman-worker-pipeline.service || true
               "$LOGGER" -t "$TAG" "Resume recovery complete"
               ;;
           esac

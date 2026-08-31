@@ -1,0 +1,9 @@
+docker
+flask
+gunicorn
+huey==2.5.3
+humanize
+psutil
+redis
+requests
+watchdog

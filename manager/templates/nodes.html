@@ -9,7 +9,7 @@
         <span class="material-icons">power_settings_new</span>
         Wake All
       </button>
-      <button id="reboot-all" class="flex items-center gap-1 bg-orange-600 hover:bg-orange-700 text-white px-3 py-2 rounded">
+      <button id="reboot-all" class="flex items-center gap-1 bg-red-700 hover:bg-red-800 text-white px-3 py-2 rounded">
         <span class="material-icons">restart_alt</span>
         Reboot All
       </button>
@@ -146,6 +146,30 @@
           } catch { toast(`Failed to wake ${hostname}`, false); }
         });
         td.appendChild(btn);
+      }
+
+      // Reboot (only when online)
+      if (active && !disabled) {
+        const rebootBtn = document.createElement('button');
+        rebootBtn.className = 'ml-2 bg-red-700 hover:bg-red-800 text-white px-2 py-1 rounded text-sm';
+        rebootBtn.textContent = 'Reboot';
+        rebootBtn.title = 'Reboot this worker node via SSH';
+        rebootBtn.addEventListener('click', async () => {
+          if (!confirm(`Reboot node "${hostname}"?\n\nAny active work on this worker will be interrupted.`)) return;
+          try {
+            const r = await fetch(`/nodes/reboot/${encodeURIComponent(hostname)}`, { method: 'POST' });
+            const j = await r.json().catch(()=>({}));
+            if (r.ok) {
+              toast(`Reboot accepted by ${hostname}`);
+              setTimeout(loadNodes, 1000);
+            } else {
+              toast(j.error || `Failed to reboot ${hostname}`, false);
+            }
+          } catch {
+            toast(`Failed to reboot ${hostname}`, false);
+          }
+        });
+        td.appendChild(rebootBtn);
       }
 
       // Delete (always available)

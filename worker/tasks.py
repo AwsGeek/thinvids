@@ -1,7 +1,7 @@
 # worker/app/tasks.py
 # Master-orchestrated pipeline with tmpfs + built-in HTTP server.
-# - transcode(job_id, file_path): orchestration entrypoint (master) – runs stitch() then split()
-# - split(job_id, file_path): runs on the node that picks up this task ("master") – segments & dispatches encodes
+# - transcode(job_id, file_path): orchestration entrypoint (master) – queues split()
+# - split(job_id, file_path): publishes parts_total, queues stitch(), segments & dispatches encodes
 # - stitch(job_id): runs on any node ("stitcher") – receives encoded parts via HTTP PUT, stitches, writes final to NFS
 # - encode(job_id, idx, master_host, ...): runs on any node; GETs from master, PUTs to stitcher
 #
@@ -13,6 +13,7 @@ import os
 import re
 import time
 import json
+import csv
 import glob
 import uuid
 import shutil
@@ -26,10 +27,11 @@ from math import ceil
 from typing import List, Tuple, Optional
 from collections import deque
 
-from common import ENV, Status, get_encode_huey, get_pipeline_huey, get_redis, get_logging, emit_activity
+from common import ENV, Status, get_encode_huey, get_pipeline_huey, get_pipeline_huey_for_host, get_redis, get_logging, emit_activity, normalize_video_encoder, get_settings, as_bool
 pipeline_huey = get_pipeline_huey()
 encode_huey = get_encode_huey()
 huey = pipeline_huey
+_TARGET_PIPELINE_TASKS = {}
 redis = get_redis()
 logger = get_logging("worker")
 WORKER_NAME = ENV("HOSTNAME") or socket.gethostname()
@@ -66,11 +68,31 @@ SCALE_FILTER_1080 = ENV("VEM_SCALE_FILTER_1080", "scale=-2:1080,format=nv12,hwup
 VAAPI_RC_MODE = ENV("VEM_RC_MODE", "CQP")
 VAAPI_QP      = ENV("VEM_QP", "27")
 AUDIO_ARGS    = ENV("VEM_AUDIO_ARGS", "-c:a aac -ac 2 -b:a 192k")  # space-separated
-DIRECT_SOURCE_REQUIRED_CODECS = {"vc1", "vc-1", "wmv3"}
+VIDEO_ENCODER_DEFAULT = normalize_video_encoder(ENV("VEM_VIDEO_ENCODER", "h265"), "h265")
+VAAPI_H264_ENCODER = ENV("VEM_VAAPI_H264_ENCODER", "h264_vaapi")
+VAAPI_H265_ENCODER = ENV("VEM_VAAPI_H265_ENCODER", "hevc_vaapi")
+SOFTWARE_H264_ENCODER = ENV("VEM_SOFTWARE_H264_ENCODER", "libx264")
+SOFTWARE_H265_ENCODER = ENV("VEM_SOFTWARE_H265_ENCODER", "libx265")
+SOFTWARE_H264_PRESET = ENV("VEM_SOFTWARE_H264_PRESET", "veryfast")
+SOFTWARE_H265_PRESET = ENV("VEM_SOFTWARE_H265_PRESET", "fast")
+SOFTWARE_H264_CRF = ENV("VEM_SOFTWARE_H264_CRF", "23")
+SOFTWARE_H265_CRF = ENV("VEM_SOFTWARE_H265_CRF", "28")
+DIRECT_SOURCE_REQUIRED_CODECS = {"vc1", "vc-1", "wmv3", "av1", "av01"}
+DIRECT_SOURCE_REQUIRED_AUDIO_CODECS = {"truehd", "mlp", "flac", "alac"}
 PART_FAILURE_MAX_RETRIES = int(ENV("PART_FAILURE_MAX_RETRIES", "5"))
 SEGMENT_IO_IDLE_TIMEOUT_SEC = max(30, int(ENV("SEGMENT_IO_IDLE_TIMEOUT_SEC", "900")))
 FFPROBE_TIMEOUT_SEC = max(10, int(ENV("FFPROBE_TIMEOUT_SEC", "120")))
 JOB_HEARTBEAT_INTERVAL_SEC = max(2.0, float(ENV("JOB_HEARTBEAT_INTERVAL_SEC", "15")))
+STITCH_HOST_READY_TIMEOUT_SEC = max(60.0, float(ENV("STITCH_HOST_READY_TIMEOUT_SEC", "1800")))
+DIRECT_SOURCE_SEEK_PREROLL_SEC = max(0.0, float(ENV("DIRECT_SOURCE_SEEK_PREROLL_SEC", "30")))
+AUDIO_MUX_MAX_TIMESTAMP_STRETCH_SEC = max(0.0, float(ENV("AUDIO_MUX_MAX_TIMESTAMP_STRETCH_SEC", "2.0")))
+AUDIO_MUX_MAX_TIMESTAMP_STRETCH_PCT = max(0.0, float(ENV("AUDIO_MUX_MAX_TIMESTAMP_STRETCH_PCT", "0.00025")))
+AUDIO_MUX_FRAME_COUNT_TOLERANCE_PCT = max(0.0, float(ENV("AUDIO_MUX_FRAME_COUNT_TOLERANCE_PCT", "0.001")))
+AUDIO_MUX_FRAME_COUNT_TOLERANCE_FRAMES = max(0, int(ENV("AUDIO_MUX_FRAME_COUNT_TOLERANCE_FRAMES", "2")))
+AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC = max(
+    FFPROBE_TIMEOUT_SEC,
+    int(ENV("AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC", "900")),
+)
 
 # Parts planning (used only as fallback if manager didn't hint)
 PARTS_PER_WORKER = int(ENV("PARTS_PER_WORKER", "4"))
@@ -103,12 +125,24 @@ def _elapsed_ms(started_at):
     except Exception:
         return 0
 
+def _terminal_status_raw(status_raw: str) -> bool:
+    try:
+        status = Status.parse(status_raw)
+    except Exception:
+        return False
+    return status in (Status.FAILED, Status.REJECTED, Status.STOPPED, Status.DONE)
+
 def _job_heartbeat(job_id: str, stage: str, *, force: bool = False, note: str = "") -> None:
     now = _now()
     stage = str(stage or "").strip() or "unknown"
     last = _JOB_HEARTBEAT_CACHE.get(job_id, 0.0)
     if not force and (now - last) < JOB_HEARTBEAT_INTERVAL_SEC:
         return
+    try:
+        if _terminal_status_raw(redis.hget(_job_key(job_id), "status")):
+            return
+    except Exception:
+        pass
     mapping = {
         "last_heartbeat_at": str(now),
         "last_heartbeat_stage": stage,
@@ -121,6 +155,26 @@ def _job_heartbeat(job_id: str, stage: str, *, force: bool = False, note: str = 
         _JOB_HEARTBEAT_CACHE[job_id] = now
     except Exception:
         pass
+
+def _mark_part_inflight(job_id: str, idx: int) -> None:
+    try:
+        redis.sadd(f"job_retry_inflight:{job_id}", int(idx))
+    except Exception:
+        logger.exception("[%s] failed to mark part %s inflight", job_id, idx)
+
+def _clear_part_inflight(job_id: str, idx: int) -> None:
+    try:
+        redis.srem(f"job_retry_inflight:{job_id}", int(idx))
+    except Exception:
+        logger.exception("[%s] failed to clear part %s inflight", job_id, idx)
+
+def _dispatch_encode_part(job_id: str, idx: int, *args, **kwargs):
+    _mark_part_inflight(job_id, idx)
+    try:
+        return encode(job_id, idx, *args, **kwargs)
+    except Exception:
+        _clear_part_inflight(job_id, idx)
+        raise
 
 def _quarantine_current_node(reason: str, *, job_id: str | None = None, part_idx: int | None = None) -> None:
     worker_name = WORKER_NAME
@@ -187,6 +241,39 @@ def _bsf_for_codec(codec: str) -> str:
 def _requires_direct_source_codec(codec: str) -> bool:
     return (codec or "").strip().lower() in DIRECT_SOURCE_REQUIRED_CODECS
 
+def _audio_codec_requires_direct_source(codec: str) -> bool:
+    codec = str(codec or "").strip().lower()
+    return codec.startswith("pcm_") or codec in DIRECT_SOURCE_REQUIRED_AUDIO_CODECS
+
+def _selected_audio_codec_from_job(job) -> str:
+    try:
+        selected = int((job or {}).get("selected_a_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads((job or {}).get("streams_json") or "{}")
+    except Exception:
+        streams = {}
+    audio_streams = streams.get("audio") or []
+    if 0 <= selected < len(audio_streams):
+        return str((audio_streams[selected] or {}).get("codec") or "").strip().lower()
+    return ""
+
+def _requires_direct_source_audio(job) -> bool:
+    return _audio_codec_requires_direct_source(_selected_audio_codec_from_job(job))
+
+def _job_has_selected_audio(job) -> bool:
+    try:
+        selected = int((job or {}).get("selected_a_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads((job or {}).get("streams_json") or "{}")
+    except Exception:
+        streams = {}
+    audio_streams = streams.get("audio") or []
+    return 0 <= selected < len(audio_streams)
+
 def _run_ffprobe(args: list[str]) -> Tuple[str, str, bool]:
     try:
         completed = subprocess.run(
@@ -223,6 +310,57 @@ def _ffprobe_duration_details(input_path: str) -> Tuple[float, str, bool]:
 def _ffprobe_duration(input_path: str) -> float:
     duration, _, _ = _ffprobe_duration_details(input_path)
     return duration
+
+def _ffprobe_video_frame_count_details(
+    input_path: str,
+    *,
+    job_id: Optional[str] = None,
+    timeout_sec: Optional[int] = None,
+) -> Tuple[int, dict, str, bool]:
+    args = [
+        'ffprobe', '-v', 'error',
+        '-count_frames',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=nb_read_frames,nb_frames,duration,avg_frame_rate',
+        '-of', 'json',
+        input_path,
+    ]
+    if not job_id:
+        out, err, timed_out = _run_ffprobe(args)
+        if err:
+            return (0, {}, err, timed_out)
+    else:
+        deadline = _now() + max(1, int(timeout_sec or AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC))
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while proc.poll() is None:
+            _job_heartbeat(job_id, "audio_mux_frame_count", note="ffprobe-count-frames")
+            if _now() >= deadline:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return (0, {}, f"ffprobe frame count timed out after {int(timeout_sec or AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC)}s", True)
+            time.sleep(5)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            detail = (err or out or "").strip()
+            if detail:
+                detail = detail[-600:]
+            return (0, {}, f"ffprobe frame count rc={proc.returncode}{(': ' + detail) if detail else ''}", False)
+    try:
+        payload = json.loads(out or "{}")
+        streams = payload.get("streams") or []
+        stream = streams[0] if streams else {}
+        raw_count = stream.get("nb_read_frames") or stream.get("nb_frames") or 0
+        if str(raw_count).upper() == "N/A":
+            raw_count = 0
+        return (int(raw_count or 0), stream, "", False)
+    except Exception as exc:
+        return (0, {}, f"ffprobe frame count parse failed: {exc}", False)
 
 def _ffprobe_stream0_details(input_path: str) -> Tuple[dict, str, bool]:
     out, err, timed_out = _run_ffprobe([
@@ -273,9 +411,33 @@ def _job_project_root(job_id: str, job=None) -> str:
     root = (job.get("scratch_root") or "").strip()
     return root or PROJECT_ROOT
 
+def _job_project_roots(job_id: str, job=None) -> List[str]:
+    if job is None:
+        job = redis.hgetall(_job_key(job_id)) or {}
+    roots = [
+        (job.get("scratch_root_effective") or "").strip(),
+        (job.get("scratch_root") or "").strip(),
+        PROJECT_ROOT,
+    ]
+    result = []
+    seen = set()
+    for root in roots:
+        if not root:
+            continue
+        root_abs = os.path.abspath(root)
+        if root_abs in seen:
+            continue
+        seen.add(root_abs)
+        result.append(root_abs)
+    return result or [os.path.abspath(PROJECT_ROOT)]
+
+def _job_base_dir_path(job_id: str, root: Optional[str] = None, job=None) -> str:
+    project_root = os.path.abspath(root or _job_project_root(job_id, job))
+    return os.path.join(project_root, job_id)
+
 def _job_base_dir(job_id: str, job=None) -> str:
     preferred_root = _job_project_root(job_id, job)
-    preferred_base = os.path.join(preferred_root, job_id)
+    preferred_base = _job_base_dir_path(job_id, preferred_root)
     try:
         os.makedirs(preferred_base, exist_ok=True)
         try:
@@ -287,7 +449,7 @@ def _job_base_dir(job_id: str, job=None) -> str:
         return preferred_base
     except Exception as e:
         fallback_root = PROJECT_ROOT
-        fallback_base = os.path.join(fallback_root, job_id)
+        fallback_base = _job_base_dir_path(job_id, fallback_root)
         os.makedirs(fallback_base, exist_ok=True)
         if preferred_root != fallback_root:
             logger.warning(
@@ -306,6 +468,127 @@ def _job_base_dir(job_id: str, job=None) -> str:
                 pass
         return fallback_base
 
+def _job_status(job_id: str) -> Optional[Status]:
+    try:
+        return Status.parse(redis.hget(_job_key(job_id), "status"))
+    except Exception:
+        return None
+
+def _job_is_terminal(job_id: str) -> bool:
+    return _job_status(job_id) in (Status.FAILED, Status.REJECTED, Status.STOPPED, Status.DONE)
+
+def _cleanup_token_allows_job_dir_removal(job_id: str, run_token: Optional[str], reason: str) -> bool:
+    if _job_is_terminal(job_id):
+        return True
+    token = str(run_token or "").strip()
+    if not token:
+        return True
+    try:
+        current = str(redis.hget(_job_key(job_id), "pipeline_run_token") or "").strip()
+    except Exception:
+        current = ""
+    if current and current == token:
+        return True
+    logger.warning(
+        "[%s] skipping task cleanup for %s; token no longer owns live job (token=%s current=%s)",
+        job_id,
+        reason,
+        token[:8] or "missing",
+        current[:8] or "missing",
+    )
+    return False
+
+def _safe_job_dir_paths(job_id: str, job=None) -> List[str]:
+    paths = []
+    seen = set()
+    for root in _job_project_roots(job_id, job):
+        root_abs = os.path.abspath(root)
+        path_abs = os.path.abspath(_job_base_dir_path(job_id, root_abs))
+        try:
+            if os.path.commonpath([root_abs, path_abs]) != root_abs:
+                continue
+        except Exception:
+            continue
+        if os.path.basename(path_abs) != job_id:
+            continue
+        if path_abs == root_abs or path_abs in seen:
+            continue
+        seen.add(path_abs)
+        paths.append(path_abs)
+    return paths
+
+def _cleanup_local_job_dir(job_id: str, job=None, *, reason: str, run_token: Optional[str] = None):
+    if not _cleanup_token_allows_job_dir_removal(job_id, run_token, reason):
+        return
+    try:
+        if _as_bool(redis.hget(_job_key(job_id), "preserve_project_dir"), False):
+            logger.warning("[%s] preserving task directory after %s", job_id, reason)
+            return
+    except Exception:
+        pass
+    for path in _safe_job_dir_paths(job_id, job):
+        if not os.path.exists(path):
+            continue
+        try:
+            size_b = 0
+            for dirpath, _, filenames in os.walk(path):
+                for filename in filenames:
+                    try:
+                        size_b += os.path.getsize(os.path.join(dirpath, filename))
+                    except Exception:
+                        pass
+            shutil.rmtree(path)
+            logger.info(
+                "[%s] cleaned task directory %s after %s (%.1f MiB)",
+                job_id,
+                path,
+                reason,
+                size_b / (1024 * 1024),
+            )
+        except Exception:
+            logger.exception("[%s] failed to clean task directory %s after %s", job_id, path, reason)
+
+def _cleanup_empty_local_job_dir(job_id: str, job=None, *, reason: str, run_token: Optional[str] = None):
+    if not _cleanup_token_allows_job_dir_removal(job_id, run_token, reason):
+        return
+    try:
+        if _as_bool(redis.hget(_job_key(job_id), "preserve_project_dir"), False):
+            return
+    except Exception:
+        pass
+    for path in _safe_job_dir_paths(job_id, job):
+        try:
+            os.rmdir(path)
+            logger.info("[%s] removed empty task directory %s after %s", job_id, path, reason)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        except Exception:
+            logger.exception("[%s] failed to remove empty task directory %s after %s", job_id, path, reason)
+
+def _cleanup_local_job_dir_when_terminal(
+    job_id: str,
+    job=None,
+    *,
+    reason: str,
+    run_token: Optional[str] = None,
+    poll_sec: float = 10.0,
+    max_wait_sec: float = 7 * 24 * 3600,
+):
+    started_at = _now()
+
+    def _wait_and_clean():
+        while (_now() - started_at) < max_wait_sec:
+            if _job_is_terminal(job_id):
+                _cleanup_local_job_dir(job_id, job, reason=reason, run_token=run_token)
+                return
+            if run_token and not _task_token_is_current(job_id, run_token, "cleanup"):
+                return
+            time.sleep(max(1.0, poll_sec))
+
+    threading.Thread(target=_wait_and_clean, name=f"cleanup-{job_id[:8]}", daemon=True).start()
+
 def _part_paths(job_id: str, idx: int) -> Tuple[str, str]:
     base_dir  = _job_base_dir(job_id)
     parts_dir = os.path.join(base_dir, "parts")
@@ -313,6 +596,57 @@ def _part_paths(job_id: str, idx: int) -> Tuple[str, str]:
     _ensure_dirs(base_dir, parts_dir, enc_dir)
     return (os.path.join(parts_dir, f"part_{idx:03d}.ts"),
             os.path.join(enc_dir,   f"enc_{idx:03d}.mp4"))
+
+
+def _audio_path(job_id: str) -> str:
+    base_dir = _job_base_dir(job_id)
+    audio_dir = os.path.join(base_dir, "audio")
+    _ensure_dirs(base_dir, audio_dir)
+    return os.path.join(audio_dir, "audio.m4a")
+
+
+def _segment_manifest_path(job_id: str, job=None) -> str:
+    return os.path.join(_job_base_dir(job_id, job), "segments.csv")
+
+
+def _segment_manifest_durations(job_id: str, job=None, *, expected_parts: int = 0) -> list[float]:
+    """
+    Return source-timeline durations from ffmpeg's segment CSV.
+
+    Encoded chunks may start their local PTS at zero. The segment manifest is
+    the authoritative source timeline, so stitch uses it to avoid collapsing
+    tiny inter-segment timestamp gaps hundreds of times.
+    """
+    path = _segment_manifest_path(job_id, job)
+    if not os.path.exists(path):
+        return []
+
+    durations: list[float] = []
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if len(row) < 3:
+                    continue
+                try:
+                    start_s = float(row[1])
+                    end_s = float(row[2])
+                except Exception:
+                    continue
+                duration = end_s - start_s
+                if duration > 0:
+                    durations.append(duration)
+    except Exception:
+        logger.exception("failed to read segment manifest %s", path)
+        return []
+
+    if expected_parts > 0 and len(durations) != expected_parts:
+        logger.warning(
+            "segment manifest part count mismatch for %s: manifest=%s expected=%s",
+            job_id,
+            len(durations),
+            expected_parts,
+        )
+    return durations
 
 
 def _reset_job_run_state(job_id: str, job=None):
@@ -323,8 +657,9 @@ def _reset_job_run_state(job_id: str, job=None):
     base_dir = _job_base_dir(job_id, job)
     parts_dir = os.path.join(base_dir, "parts")
     enc_dir = os.path.join(base_dir, "encoded")
+    audio_dir = os.path.join(base_dir, "audio")
 
-    for path in (parts_dir, enc_dir):
+    for path in (parts_dir, enc_dir, audio_dir):
         try:
             shutil.rmtree(path)
         except FileNotFoundError:
@@ -336,6 +671,8 @@ def _reset_job_run_state(job_id: str, job=None):
     for path in (
         os.path.join(base_dir, "concat.txt"),
         os.path.join(base_dir, f"job_{job_id}_output.mp4"),
+        os.path.join(base_dir, f"job_{job_id}_output_av.mp4"),
+        _segment_manifest_path(job_id, job),
     ):
         try:
             if os.path.exists(path):
@@ -356,6 +693,28 @@ def _reset_job_run_state(job_id: str, job=None):
             'encode_elapsed': 0,
             'combine_progress': 0,
             'combine_elapsed': 0,
+            'combine_started': 0,
+            'audio_status': '',
+            'audio_progress': 0,
+            'audio_elapsed': 0,
+            'audio_path': '',
+            'audio_error': '',
+            'audio_mux_sync_mode': '',
+            'audio_mux_video_frame_count': '',
+            'audio_mux_source_frame_count': '',
+            'audio_mux_frame_count_delta': '',
+            'audio_mux_frame_count_tolerance': '',
+            'audio_mux_frame_count_error': '',
+            'audio_mux_video_frame_details_json': '',
+            'audio_mux_video_itsscale': '',
+            'audio_mux_target_duration': '',
+            'audio_mux_sync_correction_sec': '',
+            'video_duration_before_audio_mux': '',
+            'stitch_expected_video_duration': '',
+            'segment_manifest_count': '',
+            'segment_manifest_path': '',
+            'preserve_project_dir': '0',
+            'preserve_project_dir_reason': '',
             'error': '',
             'failed_part': 0,
             'failed_stage': '',
@@ -369,11 +728,35 @@ def _reset_job_run_state(job_id: str, job=None):
             'last_heartbeat_note': '',
             'ended_at': 0,
         })
+        redis.hdel(job_key, 'master_host', 'stitch_host', 'stitch_enqueued_at')
         redis.delete(f"job_done_parts:{job_id}")
         redis.delete(f"job_retry_counts:{job_id}")
         redis.delete(f"job_retry_ts:{job_id}")
         redis.delete(f"job_missing_first_seen:{job_id}")
         redis.delete(f"job_retry_inflight:{job_id}")
+    except Exception:
+        pass
+
+
+def _reset_job_run_state_for_token(job_id: str, run_token: Optional[str], job=None):
+    """
+    Reset stale runtime state once per manager dispatch token.
+
+    The manager launches split() directly now, so restarts must not inherit
+    master/stitch endpoints from previous runs. Keep this token-scoped so a
+    Huey retry of the same split task does not delete current-run parts.
+    """
+    job_key = _job_key(job_id)
+    token = str(run_token or "__legacy__")
+    try:
+        if (redis.hget(job_key, "run_state_reset_token") or "") == token:
+            return
+    except Exception:
+        pass
+
+    _reset_job_run_state(job_id, job)
+    try:
+        redis.hset(job_key, "run_state_reset_token", token)
     except Exception:
         pass
 
@@ -401,6 +784,20 @@ def _task_token_is_current(job_id: str, run_token: Optional[str], task_name: str
     token keeps those old tasks from spawning split/stitch/encode work after the
     manager has already reserved a newer run of the job.
     """
+    status_raw = redis.hget(_job_key(job_id), "status")
+    try:
+        status = Status.parse(status_raw)
+    except Exception:
+        status = None
+    if status in (Status.FAILED, Status.REJECTED, Status.STOPPED, Status.DONE):
+        logger.warning(
+            "[%s] %s: task ignored because job is terminal (%s)",
+            job_id,
+            task_name,
+            status.value,
+        )
+        return False
+
     token = str(run_token or "").strip()
     current = str(redis.hget(_job_key(job_id), "pipeline_run_token") or "").strip()
     if current:
@@ -459,6 +856,46 @@ def _reset_segment_video_pts_filter(filtergraph: str) -> str:
     if not filtergraph:
         return "setpts=PTS-STARTPTS"
     return f"setpts=PTS-STARTPTS,{filtergraph}"
+
+def _direct_source_video_filter(filtergraph: str, frame_count: Optional[int]) -> str:
+    """
+    Direct-source chunks are planned from the source timeline. The input seek
+    may include decode preroll, so trim first by local post-seek time and then
+    optionally cap by frame count to avoid fractional rounding at chunk ends.
+    """
+    try:
+        frames = int(frame_count or 0)
+    except Exception:
+        frames = 0
+    prefix = f"trim=end_frame={frames},setpts=PTS-STARTPTS" if frames > 0 else "setpts=PTS-STARTPTS"
+    filtergraph = (filtergraph or "").strip()
+    if not filtergraph:
+        return prefix
+    return f"{prefix},{filtergraph}"
+
+def _direct_source_trim_filter(
+    filtergraph: str,
+    *,
+    trim_start_s: float,
+    trim_duration_s: float,
+    frame_count: Optional[int],
+) -> str:
+    try:
+        frames = int(frame_count or 0)
+    except Exception:
+        frames = 0
+    trim_start_s = max(0.0, float(trim_start_s or 0.0))
+    trim_duration_s = max(0.05, float(trim_duration_s or 0.0))
+    filters = [
+        f"trim=start={trim_start_s:.6f}:duration={trim_duration_s:.6f}",
+        "setpts=PTS-STARTPTS",
+    ]
+    if frames > 0:
+        filters.extend([f"trim=end_frame={frames}", "setpts=PTS-STARTPTS"])
+    filtergraph = (filtergraph or "").strip()
+    if filtergraph:
+        filters.append(filtergraph)
+    return ",".join(filters)
 
 
 def _source_dimensions_for_job(job) -> Tuple[int, int]:
@@ -573,7 +1010,16 @@ def _load_global_settings():
     settings.setdefault("low_disk_direct_enabled", "1")
     settings.setdefault("low_disk_min_free_gb", "20")
     settings.setdefault("target_segment_mb", "10")
+    settings.setdefault("min_segment_count", "100")
+    settings.setdefault("video_encoder", VIDEO_ENCODER_DEFAULT)
     return settings
+
+def _video_encoder_for_job(job_key: str) -> str:
+    settings = _load_global_settings()
+    return normalize_video_encoder(
+        redis.hget(job_key, "video_encoder") or settings.get("video_encoder"),
+        VIDEO_ENCODER_DEFAULT,
+    )
 
 def _disk_free_bytes(path: str) -> int:
     try:
@@ -581,17 +1027,71 @@ def _disk_free_bytes(path: str) -> int:
     except Exception:
         return -1
 
-def _direct_source_plan_for_part(source_duration: float, segment_duration: float, idx: int):
+def _selected_video_fps_from_job(job) -> float:
+    try:
+        selected = int((job or {}).get("selected_v_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads((job or {}).get("streams_json") or "{}")
+    except Exception:
+        streams = {}
+    video_streams = streams.get("video") or []
+    if 0 <= selected < len(video_streams):
+        try:
+            fps = float((video_streams[selected] or {}).get("fps") or 0.0)
+            if fps > 0:
+                return fps
+        except Exception:
+            pass
+    try:
+        fps = float((job or {}).get("source_fps") or 0.0)
+        if fps > 0:
+            return fps
+    except Exception:
+        pass
+    return 0.0
+
+def _direct_source_plan_for_part(
+    source_duration: float,
+    segment_duration: float,
+    idx: int,
+    *,
+    fps: float = 0.0,
+    total_frames: int = 0,
+    total_parts: int = 0,
+):
     if idx <= 0:
-        return None, None
+        return None, None, None
+    try:
+        fps = float(fps or 0.0)
+    except Exception:
+        fps = 0.0
+    try:
+        total_frames = int(total_frames or 0)
+    except Exception:
+        total_frames = 0
+    try:
+        total_parts = int(total_parts or 0)
+    except Exception:
+        total_parts = 0
+    if fps > 0 and total_frames > 0 and total_parts > 0:
+        start_frame = int(((idx - 1) * total_frames) // total_parts)
+        end_frame = int((idx * total_frames) // total_parts)
+        if start_frame >= total_frames or end_frame <= start_frame:
+            return None, None, None
+        frame_count = end_frame - start_frame
+        start_s = start_frame / fps
+        part_duration = frame_count / fps
+        return start_s, max(0.05, part_duration), frame_count
     segment_duration = max(1.0, float(segment_duration or 10.0))
     start_s = (idx - 1) * segment_duration
     if source_duration and start_s >= source_duration:
-        return None, None
+        return None, None, None
     part_duration = segment_duration
     if source_duration:
         part_duration = max(0.05, min(segment_duration, source_duration - start_s))
-    return start_s, part_duration
+    return start_s, part_duration, None
 
 
 def _parts_for_target_size(size_b: int, target_segment_bytes: int = DEFAULT_TARGET_SEGMENT_BYTES) -> int:
@@ -609,6 +1109,14 @@ def _target_segment_bytes_from_settings(settings) -> Tuple[float, int]:
     return target_mb, max(1, int(target_mb * 1024 * 1024))
 
 
+def _min_segment_count_from_settings(settings) -> int:
+    try:
+        value = int((settings or {}).get("min_segment_count", 100))
+    except Exception:
+        value = 100
+    return max(1, value)
+
+
 def _host_from_endpoint(endpoint: str) -> str:
     raw = str(endpoint or "").strip()
     if not raw:
@@ -616,11 +1124,73 @@ def _host_from_endpoint(endpoint: str) -> str:
     raw = re.sub(r"^https?://", "", raw, flags=re.IGNORECASE)
     return raw.split("/", 1)[0].split(":", 1)[0].strip().lower()
 
+def _host_short(value: str) -> str:
+    return str(value or "").strip().lower().split(".", 1)[0]
+
+def _reserved_host_matches(job: dict, field: str) -> bool:
+    reserved = _host_short((job or {}).get(field) or "")
+    if not reserved:
+        return True
+    return reserved == _host_short(WORKER_NAME)
+
+def _wrong_reserved_host_message(job_id: str, field: str) -> str:
+    return (
+        f"[{job_id}] {WORKER_NAME} is not reserved for {field}; "
+        f"reserved={redis.hget(_job_key(job_id), field) or 'unset'}"
+    )
+
+def _pipeline_task_for_host(task_wrapper, host: str):
+    host = _host_short(host)
+    if not host:
+        raise ValueError("pipeline task host is required")
+    key = (task_wrapper.name, host)
+    wrapper = _TARGET_PIPELINE_TASKS.get(key)
+    if wrapper is not None:
+        return wrapper
+    target_huey = get_pipeline_huey_for_host(host)
+    wrapper = target_huey.task(
+        retries=task_wrapper.retries,
+        retry_delay=task_wrapper.retry_delay,
+        name=task_wrapper.name,
+    )(task_wrapper.func)
+    _TARGET_PIPELINE_TASKS[key] = wrapper
+    return wrapper
+
+def _enqueue_pipeline_task_for_host(task_wrapper, host: str, *args):
+    return _pipeline_task_for_host(task_wrapper, host)(*args)
+
+def _requeue_misdirected_pipeline_task(task_func, task_name: str, job_id: str, field: str, *args):
+    """
+    A shared pipeline queue can deliver reserved work to the wrong host.
+
+    Treat that as queue misdelivery, not task failure. Raising here lets Huey
+    put the task into its scheduled retry queue, which can delay stitcher
+    startup and leave encoders waiting for stitch_host. Requeue immediately so
+    the reserved idle host gets another chance to claim it.
+    """
+    msg = _wrong_reserved_host_message(job_id, field)
+    logger.info("%s; requeueing %s", msg, task_name)
+    try:
+        _job_heartbeat(job_id, f"{task_name}_misdirected", note=f"host={WORKER_NAME}", force=True)
+    except Exception:
+        pass
+    reserved = redis.hget(_job_key(job_id), field) or ""
+    _enqueue_pipeline_task_for_host(task_func, reserved, *args)
+    return {
+        "status": "MISDIRECTED",
+        "job_id": job_id,
+        "task": task_name,
+        "worker": WORKER_NAME,
+        "reserved": redis.hget(_job_key(job_id), field) or "",
+    }
+
 def _resolve_processing_mode(job_id: str, job, source_size_b: int) -> Tuple[str, str]:
     input_path = os.path.realpath((job.get("input_path") or "").strip())
     source_root = os.path.realpath(SOURCE_MEDIA_ROOT)
     if _requires_direct_source_codec(str(job.get("source_codec") or "")):
         return "direct", "codec_requires_direct_source"
+    if _job_has_selected_audio(job):
+        return "direct", "continuous_audio_requires_source_timeline"
     if (
         str(job.get("source_origin") or "").strip().lower() == "source_media"
         or (input_path and (input_path == source_root or input_path.startswith(source_root + os.sep)))
@@ -727,16 +1297,22 @@ def _start_http_once():
                     u = urlparse(self.path)
                     parts = u.path.split('/')
                     job_id, kind, idx = self._safe_job_idx(parts)
-                    if job_id is None or kind != "result":
+                    if job_id is None or kind not in ("result", "audio"):
                         self.send_error(404, "Not found")
                         return
 
                     job_data = redis.hgetall(_job_key(job_id)) or {}
+                    if _job_is_terminal(job_id):
+                        self.send_error(409, "Job is terminal")
+                        return
                     title = _job_title(job_data)
                     filename = job_data.get("filename") or ""
                     put_t0 = _now()
-                    _, enc_path = _part_paths(job_id, idx)
-                    tmp_path = f"{enc_path}.{uuid.uuid4().hex}.uploading"
+                    if kind == "audio":
+                        artifact_path = _audio_path(job_id)
+                    else:
+                        _, artifact_path = _part_paths(job_id, idx)
+                    tmp_path = f"{artifact_path}.{uuid.uuid4().hex}.uploading"
 
                     length = self.headers.get('Content-Length')
                     if length is None:
@@ -750,7 +1326,7 @@ def _start_http_once():
                         self.send_error(400, "Invalid Content-Length")
                         return
 
-                    _ensure_dirs(os.path.dirname(enc_path))
+                    _ensure_dirs(os.path.dirname(artifact_path))
                     with open(tmp_path, 'wb') as f:
                         remaining = to_read
                         while remaining > 0:
@@ -766,14 +1342,29 @@ def _start_http_once():
                         self.send_error(400, "Incomplete upload")
                         return
 
-                    os.replace(tmp_path, enc_path)
-                    emit_activity(
-                        f'Stitching "{title}" part {idx} completed in {_elapsed_ms(put_t0)}ms',
-                        job_id=job_id,
-                        filename=filename,
-                        stage='stitch',
-                        source='worker',
-                    )
+                    os.replace(tmp_path, artifact_path)
+                    if kind == "audio":
+                        redis.hset(_job_key(job_id), mapping={
+                            "audio_status": "READY",
+                            "audio_path": artifact_path,
+                            "audio_progress": 100,
+                            "audio_uploaded_at": str(_now()),
+                        })
+                        emit_activity(
+                            f'Audio for "{title}" uploaded in {_elapsed_ms(put_t0)}ms',
+                            job_id=job_id,
+                            filename=filename,
+                            stage='audio_upload',
+                            source='worker',
+                        )
+                    else:
+                        emit_activity(
+                            f'Stitching "{title}" part {idx} completed in {_elapsed_ms(put_t0)}ms',
+                            job_id=job_id,
+                            filename=filename,
+                            stage='stitch',
+                            source='worker',
+                        )
                     self.send_response(200)
                     self.end_headers()
                 except Exception as e:
@@ -810,8 +1401,8 @@ def _start_http_once():
 def _transcode_impl(job_id: str, file_path: str, run_token: Optional[str] = None):
     """
     Orchestration entrypoint:
-      - Kick off stitch(job_id) so the stitcher publishes stitch_host.
-      - Run split(job_id, file_path) to segment and dispatch encodes.
+      - Queue split(job_id, file_path).
+      - split publishes parts_total, then queues stitch(job_id), then dispatches encodes.
     """
     if not _task_token_is_current(job_id, run_token, "transcode"):
         return {'status': 'STALE', 'job_id': job_id}
@@ -822,10 +1413,12 @@ def _transcode_impl(job_id: str, file_path: str, run_token: Optional[str] = None
         'status': Status.RUNNING.value,
         'started_at': _now(),
     })
-    # Start stitcher first so encoders have a destination
-    stitch(job_id, run_token)
-    # Perform split/dispatch on this node (master)
-    split(job_id, file_path, run_token)
+    job = redis.hgetall(_job_key(job_id)) or {}
+    reserved_segment_host = _host_short(job.get("reserved_segment_host") or "")
+    if reserved_segment_host:
+        enqueue_split_on_host(reserved_segment_host, job_id, file_path, run_token)
+    else:
+        split(job_id, file_path, run_token)
     return {'status': 'QUEUED', 'job_id': job_id}
 
 @pipeline_huey.task(retries=999999, retry_delay=5)
@@ -833,7 +1426,37 @@ def transcode(job_id: str, file_path: str, run_token: Optional[str] = None):
     return _transcode_impl(job_id, file_path, run_token)
 
 
-@pipeline_huey.task()
+def _queue_stitcher(job_id: str, run_token: Optional[str]) -> Optional[str]:
+    job_key = _job_key(job_id)
+    job = redis.hgetall(job_key) or {}
+    reserved_stitch_host = _host_short(job.get("reserved_stitch_host") or "")
+    stitch_host = job.get("stitch_host") or ""
+    if stitch_host:
+        existing_host = _host_short(_host_from_endpoint(stitch_host))
+        if not reserved_stitch_host or existing_host == reserved_stitch_host:
+            return stitch_host
+        logger.warning(
+            "[%s] ignoring stale stitch_host=%s; reserved_stitch_host=%s",
+            job_id,
+            stitch_host,
+            reserved_stitch_host,
+        )
+        try:
+            redis.hdel(job_key, "stitch_host", "stitch_enqueued_at")
+        except Exception:
+            pass
+
+    redis.hset(job_key, mapping={
+        "stitch_enqueued_at": str(_now()),
+    })
+    if reserved_stitch_host:
+        enqueue_stitch_on_host(reserved_stitch_host, job_id, run_token)
+    else:
+        stitch(job_id, run_token)
+    return redis.hget(job_key, "stitch_host") or ""
+
+
+@pipeline_huey.task(retries=999999, retry_delay=5)
 def split(job_id: str, file_path: str, run_token: Optional[str] = None):
     """
     Master-side segmentation & dispatch:
@@ -847,12 +1470,29 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
         return {'status': 'STALE', 'job_id': job_id}
 
     job = redis.hgetall(job_key)
+    if not _reserved_host_matches(job, "reserved_segment_host"):
+        return _requeue_misdirected_pipeline_task(
+            split,
+            "split",
+            job_id,
+            "reserved_segment_host",
+            job_id,
+            file_path,
+            run_token,
+        )
     title = _job_title(job)
+    _reset_job_run_state_for_token(job_id, run_token, job)
+    job = redis.hgetall(job_key) or {}
+    if not _task_token_is_current(job_id, run_token, "split"):
+        return {'status': 'STALE', 'job_id': job_id}
 
     logger.info(f"[{job_id}] Starting transcode job")
+    cleanup_on_exit = True
 
     try:
         _start_http_once()  # HTTP server for parts
+        if not _task_token_is_current(job_id, run_token, "split"):
+            return {'status': 'STALE', 'job_id': job_id}
 
         target_height = _normalize_target_height(job.get("target_height"))
 
@@ -868,7 +1508,13 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 if os.path.exists(alt):
                     src_path = alt
         if not os.path.exists(src_path):
-            redis.hset(job_key, 'status', Status.FAILED.value)
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': f'input not found: {src_path}',
+                'failed_stage': 'input',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
             return {'status': 'FAILED', 'reason': f'input not found: {src_path}'}
 
         # Mark as RUNNING & remember input path
@@ -915,21 +1561,25 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
         kbps_calc = (fmt_bps/1000.0) if fmt_bps > 0 else (
             ((size_b*8)/duration/1000.0) if (size_b and duration) else 0.0
         )
-        redis.hset(job_key, mapping={
+        source_probe_updates = {
             'source_codec': codec,
             'source_resolution': f"{width}x{height}" if (width and height) else '',
             'source_duration': f"{duration:.2f}" if duration else '0',
             'source_fps': f"{fps:.2f}" if fps else '0',
             'source_file_size': size_b,
             'source_bitrate_kbps': f"{kbps_calc:.0f}" if kbps_calc>0 else '0'
-        })
+        }
+        redis.hset(job_key, mapping=source_probe_updates)
+        job.update(source_probe_updates)
 
-        # --- FAIL FAST: reject AV1 sources ---
-        # Normalize codec name (ffprobe reports "av1")
-        if (codec or "").strip().lower() in {"av1", "av01"}:
-            msg = "Unsupported input codec: AV1. Rejected."
+        # AV1 inputs are supported through direct-source encoding when allowed.
+        # Keep the global rejection switch as a quick safety brake.
+        if (
+            (codec or "").strip().lower() in {"av1", "av01"}
+            and as_bool(get_settings().get("av1_check_enabled", "1"), True)
+        ):
+            msg = "AV1 source rejected by global setting (av1_check_enabled)."
             logger.error(f"[{job_id}] {msg}")
-            # Mark job rejected and store a human-friendly reason
             redis.hset(job_key, mapping={
                 'status': Status.REJECTED.value,
                 'error': msg,
@@ -973,26 +1623,17 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
 
         split_settings = _load_global_settings()
         target_segment_mb, target_segment_bytes = _target_segment_bytes_from_settings(split_settings)
+        min_segment_count = _min_segment_count_from_settings(split_settings)
 
         # requested parts from configured segment size
         requested_parts = _parts_for_target_size(int(size_b or 0), target_segment_bytes)
         if requested_parts <= 0:
-            requested_parts = 100
+            requested_parts = min_segment_count
             logger.warning(f"[{job_id}] Source size unavailable; falling back to {requested_parts} requested parts.")
 
-        # estimate usable encoder workers: active workers minus reserved master/stitcher nodes
-        stitch_endpoint = redis.hget(job_key, "stitch_host") or ""
-        if not stitch_endpoint:
-            # stitch task is enqueued first; give it a brief chance to publish stitch_host
-            deadline = _now() + 3.0
-            while _now() < deadline and not stitch_endpoint:
-                if _is_job_halted(job_id):
-                    break
-                stitch_endpoint = redis.hget(job_key, "stitch_host") or ""
-                if stitch_endpoint:
-                    break
-                time.sleep(0.1)
-
+        # Stitch is queued after the part plan is published below, so at this
+        # point we only know the master is reserved.
+        stitch_endpoint = ""
         master_host_lc = str(master_host_name or "").strip().lower()
         stitch_host_lc = _host_from_endpoint(stitch_endpoint)
         reserved_hosts = {h for h in (master_host_lc, stitch_host_lc) if h}
@@ -1016,15 +1657,10 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 warmup_count = 0
             usable_encoder_workers = max(0, warmup_count - len(reserved_hosts))
 
-        # effective parts / segment size:
-        # - guarantee at least one segment per usable encoder worker
-        # - when above that, round up to a full multiple of usable workers
-        effective_parts = requested_parts
-        if usable_encoder_workers > 0:
-            if requested_parts <= usable_encoder_workers:
-                effective_parts = usable_encoder_workers
-            else:
-                effective_parts = int(ceil(float(requested_parts) / float(usable_encoder_workers)) * usable_encoder_workers)
+        # Segment count is deterministic for the same source/settings. Worker
+        # count is intentionally not part of the plan because live capacity can
+        # change between runs and should only affect queue drain speed.
+        effective_parts = max(requested_parts, min_segment_count)
 
         P = max(1, effective_parts)
         effective_segment_bytes = max(1, int(ceil(float(size_b) / float(P)))) if int(size_b or 0) > 0 else target_segment_bytes
@@ -1032,6 +1668,7 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
         redis.hset(job_key, mapping={
             "requested_segment_size_mb": f"{target_segment_mb:.6f}",
             "requested_segment_size_bytes": int(target_segment_bytes),
+            "min_segment_count": int(min_segment_count),
             "effective_segment_size_mb": f"{effective_segment_mb:.6f}",
             "effective_segment_size_bytes": int(effective_segment_bytes),
             "requested_parts": int(requested_parts),
@@ -1046,7 +1683,7 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
             redis.hdel(job_key, 'direct_segment_duration')
         logger.info(
             f"[{job_id}] Parts plan: requested={requested_parts}, effective={P}, "
-            f"usable_encoder_workers={usable_encoder_workers}, source_size={int(size_b or 0)} bytes, "
+            f"min_segments={min_segment_count}, usable_encoder_workers={usable_encoder_workers}, source_size={int(size_b or 0)} bytes, "
             f"requested_segment_mb={target_segment_mb:g}, effective_segment_mb={effective_segment_mb:.3f}, "
             f"reserved_hosts={sorted(reserved_hosts)}"
         )
@@ -1069,9 +1706,37 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
         redis.hset(job_key, mapping={'parts_total': P, 'parts_done': 0, 'segmented_chunks': 0, 'segment_progress': 0, 'segment_elapsed': 0})
         _job_heartbeat(job_id, "segment_start", force=True, note=f"parts={P}")
 
+        # Queue stitch after publishing the plan, but do not wait here. Waiting
+        # from the split task can deadlock a small pipeline pool: split occupies
+        # one pipeline worker while waiting for another pipeline worker to claim
+        # stitch. Encoders resolve stitch_host later and heartbeat while they
+        # wait, so pipeline congestion becomes backpressure instead of failure.
+        stitch_endpoint = _queue_stitcher(job_id, run_token)
+        if _job_has_selected_audio(job):
+            redis.hset(job_key, mapping={
+                'audio_status': 'QUEUED',
+                'audio_progress': 0,
+                'audio_elapsed': 0,
+                'audio_error': '',
+            })
+            encode_audio(job_id, stitch_host=stitch_endpoint, source_path=src_path, a_sel=a_sel, run_token=run_token)
+        else:
+            redis.hset(job_key, mapping={
+                'audio_status': 'NONE',
+                'audio_progress': 100,
+                'audio_elapsed': 0,
+                'audio_path': '',
+                'audio_error': '',
+            })
+
         if processing_mode == "direct":
             total_chunks = 0
             part_opened_at = _now()
+            direct_fps = _selected_video_fps_from_job(job)
+            try:
+                direct_total_frames = int(job.get("total_frames") or meta.get("nb_frames") or 0)
+            except Exception:
+                direct_total_frames = 0
             for part_idx in range(1, P + 1):
                 if _is_job_halted(job_id):
                     logger.warning(f"[{job_id}] Halted while scheduling direct-source parts.")
@@ -1079,7 +1744,14 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 if not _task_token_is_current(job_id, run_token, "split"):
                     return {'status': 'STALE', 'job_id': job_id}
 
-                start_s, part_duration = _direct_source_plan_for_part(duration, segment_duration_hint, part_idx)
+                start_s, part_duration, part_frame_count = _direct_source_plan_for_part(
+                    duration,
+                    segment_duration_hint,
+                    part_idx,
+                    fps=direct_fps,
+                    total_frames=direct_total_frames,
+                    total_parts=P,
+                )
                 if start_s is None:
                     break
 
@@ -1094,15 +1766,17 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                     source='worker',
                 )
                 _job_heartbeat(job_id, "direct_dispatch", force=True, note=f"part={part_idx}/{P}")
-                encode(
+                _dispatch_encode_part(
                     job_id,
                     part_idx,
                     master_url,
                     v_sel,
                     a_sel,
+                    stitch_host=stitch_endpoint,
                     source_path=src_path,
                     source_start_s=start_s,
                     source_duration_s=part_duration,
+                    source_frame_count=part_frame_count,
                     run_token=run_token,
                 )
                 prog = int((part_idx / max(1, P)) * 100)
@@ -1115,7 +1789,13 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 })
 
             if total_chunks <= 0:
-                redis.hset(job_key, 'status', Status.FAILED.value)
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': 'no direct-source segments produced',
+                    'failed_stage': 'segment',
+                    'failed_worker': WORKER_NAME,
+                    'ended_at': _now(),
+                })
                 return {'status': 'FAILED', 'reason': 'no segments produced'}
 
             redis.hset(job_key, mapping={
@@ -1132,15 +1812,28 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 source='worker',
             )
             logger.info(f"[{job_id}] Direct-source scheduling complete; {total_chunks} parts queued for encoding")
+            _cleanup_local_job_dir_when_terminal(
+                job_id,
+                job,
+                reason="direct split task completed",
+                run_token=run_token,
+            )
+            cleanup_on_exit = False
             return {'status': 'QUEUED', 'parts': total_chunks}
 
         # Prepare parts dir + naming
         parts_dir = os.path.join(_job_base_dir(job_id, job), "parts")
         _ensure_dirs(parts_dir)
         temp_pattern = os.path.join(parts_dir, "chunk_%03d.ts")
+        segment_manifest = _segment_manifest_path(job_id, job)
+        try:
+            if os.path.exists(segment_manifest):
+                os.remove(segment_manifest)
+        except Exception:
+            pass
 
         # Segment duration target from P (fallback 10s if unknown)
-        segment_duration = int(max(1.0, float(duration) / float(P)) if (duration and P) else 10.0)
+        segment_duration = max(1.0, float(duration) / float(P)) if (duration and P) else 10.0
         bsf = _bsf_for_codec(codec)
 
         cmd = [
@@ -1148,13 +1841,14 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
             '-nostats', '-loglevel', 'info',
             '-i', src_path,
             '-map', f'0:v:{v_sel}',
-            '-map', f'0:a:{a_sel}?',
-            '-sn', '-dn',
+            '-an', '-sn', '-dn',
             '-map_metadata', '-1',
             '-map_chapters', '-1',
             '-c', 'copy',
             '-f', 'segment',
             '-segment_time', f"{segment_duration:.6f}",
+            '-segment_list', segment_manifest,
+            '-segment_list_type', 'csv',
             '-reset_timestamps', '1',
             temp_pattern
         ]
@@ -1245,7 +1939,13 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                     except Exception as e:
                         logger.error(f"[{job_id}] Move part {part_idx} failed: {e}")
                         process.terminate(); process.wait()
-                        redis.hset(job_key, 'status', Status.FAILED.value)
+                        redis.hset(job_key, mapping={
+                            'status': Status.FAILED.value,
+                            'error': f'move part {part_idx} failed: {e}',
+                            'failed_stage': 'segment',
+                            'failed_worker': WORKER_NAME,
+                            'ended_at': _now(),
+                        })
                         return {'status': 'FAILED', 'reason': f'move part {part_idx} failed'}
 
                     queued_count = part_idx
@@ -1273,7 +1973,7 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                         )
                         if not _task_token_is_current(job_id, run_token, "split"):
                             return {'status': 'STALE', 'job_id': job_id}
-                        encode(job_id, part_idx, master_url, v_sel, a_sel, run_token=run_token)
+                        _dispatch_encode_part(job_id, part_idx, master_url, v_sel, a_sel, stitch_host=stitch_endpoint, run_token=run_token)
 
                 previous_chunk_path = chunk_path
                 previous_chunk_index = chunk_index
@@ -1291,6 +1991,7 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 'error': reason,
                 'failed_stage': 'segment',
                 'failed_worker': master_host_name,
+                'ended_at': _now(),
             })
             return {'status': 'FAILED', 'reason': reason}
 
@@ -1304,7 +2005,13 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 os.replace(previous_chunk_path, dest_path)
             except Exception as e:
                 logger.error(f"[{job_id}] Move final part {part_idx} failed: {e}")
-                redis.hset(job_key, 'status', Status.FAILED.value)
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': f'move final part {part_idx} failed: {e}',
+                    'failed_stage': 'segment',
+                    'failed_worker': WORKER_NAME,
+                    'ended_at': _now(),
+                })
                 return {'status': 'FAILED', 'reason': f'move part {part_idx} failed'}
 
             if not _is_job_halted(job_id):
@@ -1319,12 +2026,36 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 )
                 if not _task_token_is_current(job_id, run_token, "split"):
                     return {'status': 'STALE', 'job_id': job_id}
-                encode(job_id, part_idx, master_url, v_sel, a_sel, run_token=run_token)
+                _dispatch_encode_part(job_id, part_idx, master_url, v_sel, a_sel, stitch_host=stitch_endpoint, run_token=run_token)
                 total_chunks = part_idx
 
         if total_chunks <= 0:
-            redis.hset(job_key, 'status', Status.FAILED.value)
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': 'no segments produced',
+                'failed_stage': 'segment',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
             return {'status': 'FAILED', 'reason': 'no segments produced'}
+
+        segment_durations = _segment_manifest_durations(job_id, job, expected_parts=total_chunks)
+        if len(segment_durations) != total_chunks:
+            reason = (
+                f"segment manifest count mismatch: manifest={len(segment_durations)} "
+                f"parts={total_chunks}; refusing timeline-unsafe split output"
+            )
+            logger.error(f"[{job_id}] {reason}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'failed_stage': 'segment_manifest',
+                'failed_worker': WORKER_NAME,
+                'segment_manifest_path': segment_manifest,
+                'segment_manifest_count': len(segment_durations),
+                'ended_at': _now(),
+            })
+            return {'status': 'FAILED', 'reason': reason}
 
         # Finalize segmentation metadata
         redis.hset(job_key, mapping={
@@ -1332,6 +2063,9 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
             'segmented_chunks': total_chunks,
             'segment_progress': 100,
             'segment_elapsed': round(_now() - seg_t0, 2),
+            'segment_manifest_path': segment_manifest,
+            'segment_manifest_count': len(segment_durations),
+            'stitch_expected_video_duration': f"{sum(segment_durations):.6f}",
         })
 
         # Master exits — stitcher will finish the job
@@ -1343,12 +2077,28 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
             stage='segment_complete',
             source='worker',
         )
+        _cleanup_local_job_dir_when_terminal(
+            job_id,
+            job,
+            reason="split task completed",
+            run_token=run_token,
+        )
+        cleanup_on_exit = False
         return {'status': 'QUEUED', 'parts': total_chunks}
 
     except Exception as e:
         logger.exception(f"[{job_id}] split failed")
-        redis.hset(job_key, 'status', Status.FAILED.value)
+        redis.hset(job_key, mapping={
+            'status': Status.FAILED.value,
+            'error': str(e),
+            'failed_stage': 'split',
+            'failed_worker': WORKER_NAME,
+            'ended_at': _now(),
+        })
         return {'status': 'FAILED', 'error': str(e)}
+    finally:
+        if cleanup_on_exit:
+            _cleanup_local_job_dir(job_id, job, reason="split task ended", run_token=run_token)
 
 
 @encode_huey.task()
@@ -1362,6 +2112,7 @@ def encode(
     source_path: Optional[str] = None,
     source_start_s: Optional[float] = None,
     source_duration_s: Optional[float] = None,
+    source_frame_count: Optional[int] = None,
     run_token: Optional[str] = None,
 ):
     """
@@ -1382,7 +2133,25 @@ def encode(
     filename = redis.hget(job_key, "filename") or ""
     title = _job_title({"filename": filename})
     part_t0 = _now()
+    wtmp = None
+    in_path = None
+    out_path = None
+
+    def _cleanup_encode_task_files(reason: str):
+        for p in (in_path, out_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+                    logger.info("[%s] encode %s removed %s after %s", job_id, idx, p, reason)
+            except Exception:
+                logger.exception("[%s] encode %s failed to remove %s after %s", job_id, idx, p, reason)
+        _cleanup_empty_local_job_dir(job_id, reason=f"encode part {idx} {reason}", run_token=run_token)
+
     def _fail(reason: str, stage: str):
+        if not _task_token_is_current(job_id, run_token, f"encode_{stage}_fail"):
+            _cleanup_encode_task_files("stale failure")
+            return {'status': 'STALE', 'job_id': job_id, 'idx': idx}
+
         retry_cnt_key = f"job_retry_counts:{job_id}"
         retry_ts_key = f"job_retry_ts:{job_id}"
         inflight_key = f"job_retry_inflight:{job_id}"
@@ -1396,7 +2165,16 @@ def encode(
 
         failure_reason = f"part {idx} ({stage}): {reason}"
 
-        if retry_count <= PART_FAILURE_MAX_RETRIES and not _is_job_halted(job_id):
+        if _is_job_halted(job_id):
+            logger.warning(
+                "[%s] encode %s failed after job became terminal; preserving original terminal status",
+                job_id,
+                idx,
+            )
+            _cleanup_encode_task_files("terminal after failure")
+            return {'status': 'ABORTED', 'reason': failure_reason}
+
+        if retry_count <= PART_FAILURE_MAX_RETRIES:
             try:
                 redis.hset(job_key, mapping={
                     'last_part_error': failure_reason,
@@ -1426,7 +2204,8 @@ def encode(
                 stage='part_retry',
                 source='worker',
             )
-            encode(
+            _cleanup_encode_task_files("retry")
+            _dispatch_encode_part(
                 job_id,
                 idx,
                 master_host,
@@ -1436,6 +2215,7 @@ def encode(
                 source_path=source_path,
                 source_start_s=source_start_s,
                 source_duration_s=source_duration_s,
+                source_frame_count=source_frame_count,
                 run_token=run_token,
             )
             return {'status': 'RETRYING', 'reason': failure_reason}
@@ -1454,13 +2234,7 @@ def encode(
         except Exception:
             pass
         logger.error(f"[{job_id}] {mapping['error']}")
-        # best-effort cleanup
-        for p in (locals().get('in_path'), locals().get('out_path')):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+        _cleanup_encode_task_files("failure")
         return {'status': 'FAILED', 'reason': mapping['error']}
 
     try:
@@ -1474,7 +2248,7 @@ def encode(
 
         # resolve stitch_host if not provided
         if not stitch_host:
-            deadline = _now() + 60
+            deadline = _now() + STITCH_HOST_READY_TIMEOUT_SEC
             while _now() < deadline and not stitch_host:
                 _job_heartbeat(job_id, "resolve_stitcher", note=f"part={idx}")
                 stitch_host = redis.hget(job_key, 'stitch_host') or None
@@ -1485,12 +2259,14 @@ def encode(
                     return {'status': 'ABORTED'}
                 time.sleep(0.25)
             if not stitch_host:
-                stitch_host = master_host  # fallback keeps pipeline moving
+                return _fail(
+                    f"stitch_host was not published within {int(STITCH_HOST_READY_TIMEOUT_SEC)}s",
+                    stage,
+                )
 
         # Paths in local tmpfs (worker)
         wtmp = _job_base_dir(job_id)
         _ensure_dirs(wtmp)
-        in_path = None
         in_path  = os.path.join(wtmp, f"in_{idx:03d}.ts")
         out_path = os.path.join(wtmp, f"out_{idx:03d}.mp4")
         direct_source = bool(source_path) and source_start_s is not None and source_duration_s is not None
@@ -1533,43 +2309,82 @@ def encode(
         stage = "encode"
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
         target_height, force_deinterlace = _effective_target_height_for_job(job_key)
+        video_encoder = _video_encoder_for_job(job_key)
         try:
             redis.hset(job_key, mapping={
                 'target_height_effective': target_height,
                 'deinterlace_effective': '1' if force_deinterlace else '0',
+                'video_encoder_effective': video_encoder,
             })
         except Exception:
             pass
         input_args = ['-fflags', '+genpts', '-i', in_path]
-        map_args = ['-map', '0:v:0', '-map', '0:a?']
+        map_args = ['-map', '0:v:0', '-an']
         if direct_source:
+            requested_start = max(0.0, float(source_start_s or 0.0))
+            requested_duration = max(0.05, float(source_duration_s or 0.0))
+            preroll = min(requested_start, DIRECT_SOURCE_SEEK_PREROLL_SEC)
+            seek_start = max(0.0, requested_start - preroll)
+            trim_start = requested_start - seek_start
+            read_duration = trim_start + requested_duration + 2.0
             input_args = [
-                '-ss', f"{float(source_start_s or 0):.6f}",
+                '-ss', f"{seek_start:.6f}",
+                '-t', f"{read_duration:.6f}",
                 '-i', source_path,
-                '-t', f"{max(0.05, float(source_duration_s or 0.0)):.6f}",
             ]
             map_args = [
                 '-map', f'0:v:{int(v_sel)}',
-                '-map', f'0:a:{int(a_sel)}?',
+                '-an',
                 '-sn', '-dn',
                 '-map_metadata', '-1',
                 '-map_chapters', '-1',
             ]
         if software_encode:
+            software_video_args = (
+                ['-c:v', SOFTWARE_H265_ENCODER, '-preset', SOFTWARE_H265_PRESET, '-crf', SOFTWARE_H265_CRF, '-tag:v', 'hvc1']
+                if video_encoder == 'h265'
+                else ['-c:v', SOFTWARE_H264_ENCODER, '-preset', SOFTWARE_H264_PRESET, '-crf', SOFTWARE_H264_CRF]
+            )
+            video_filter = (
+                _direct_source_trim_filter(
+                    _software_scale_filter(target_height, deinterlace=force_deinterlace),
+                    trim_start_s=trim_start,
+                    trim_duration_s=requested_duration,
+                    frame_count=source_frame_count,
+                )
+                if direct_source
+                else _reset_segment_video_pts_filter(
+                    _software_scale_filter(target_height, deinterlace=force_deinterlace)
+                )
+            )
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
                 '-y',
                 '-progress','pipe:2',
                 *input_args,
                 *map_args,
-                '-vf', _reset_segment_video_pts_filter(
-                    _software_scale_filter(target_height, deinterlace=force_deinterlace)
-                ),
-                '-c:v','libx264','-preset','veryfast','-crf','23',
-                *AUDIO_ARGS.split(),
+                '-vf', video_filter,
+                *software_video_args,
                 out_path
             ]
         else:
+            vaapi_video_args = [
+                '-c:v', VAAPI_H265_ENCODER if video_encoder == 'h265' else VAAPI_H264_ENCODER,
+                '-rc_mode', VAAPI_RC_MODE,
+                '-qp', VAAPI_QP,
+            ]
+            if video_encoder == 'h265':
+                vaapi_video_args.extend(['-tag:v', 'hvc1'])
+            video_filter = (
+                _direct_source_trim_filter(
+                    _vaapi_scale_filter(target_height),
+                    trim_start_s=trim_start,
+                    trim_duration_s=requested_duration,
+                    frame_count=source_frame_count,
+                )
+                if direct_source
+                else _reset_segment_video_pts_filter(_vaapi_scale_filter(target_height))
+            )
             cmd = [
                 'ffmpeg','-hide_banner','-nostats','-loglevel','error',
                 '-y',
@@ -1577,11 +2392,8 @@ def encode(
                 '-vaapi_device', VAAPI_DEVICE,
                 *input_args,
                 *map_args,
-                '-vf', _reset_segment_video_pts_filter(_vaapi_scale_filter(target_height)),
-                '-c:v','h264_vaapi',
-                '-rc_mode', VAAPI_RC_MODE,
-                '-qp', VAAPI_QP,
-                *AUDIO_ARGS.split(),
+                '-vf', video_filter,
+                *vaapi_video_args,
                 out_path
             ]
 
@@ -1660,8 +2472,7 @@ def encode(
 
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] encode {idx}: halted before uploading encoded part")
-            try: os.remove(out_path)
-            except Exception: pass
+            _cleanup_encode_task_files("halted before upload")
             return {'status': 'ABORTED'}
 
         try:
@@ -1673,6 +2484,14 @@ def encode(
         except Exception as e:
             return _fail(f"upload failed: {e}", stage)
 
+        if not _task_token_is_current(job_id, run_token, "encode_upload_complete"):
+            _cleanup_encode_task_files("stale after upload")
+            return {'status': 'STALE', 'job_id': job_id, 'idx': idx}
+        if _is_job_halted(job_id):
+            logger.warning(f"[{job_id}] encode {idx}: halted after upload; skipping progress update")
+            _cleanup_encode_task_files("halted after upload")
+            return {'status': 'ABORTED'}
+
         logger.info(f"[{job_id}] Uploaded part {idx}")
         _job_heartbeat(job_id, "upload_complete", force=True, note=f"part={idx}")
         emit_activity(
@@ -1683,16 +2502,14 @@ def encode(
             source='worker',
         )
 
-        # Cleanup local tmpfs
-        cleanup_paths = [out_path]
-        if not direct_source:
-            cleanup_paths.append(in_path)
-        for p in cleanup_paths:
-            try: os.remove(p)
-            except Exception: pass
+        _cleanup_encode_task_files("successful upload")
 
         # ------- Commit part & update encode stats (one-shot at completion) -------
         try:
+            if not _task_token_is_current(job_id, run_token, "encode_progress_update"):
+                return {'status': 'STALE', 'job_id': job_id, 'idx': idx}
+            if _is_job_halted(job_id):
+                return {'status': 'ABORTED'}
             done_set = f"job_done_parts:{job_id}"
             added = redis.sadd(done_set, idx)  # 1 if new, 0 if already present
             if added:
@@ -1730,15 +2547,264 @@ def encode(
         except Exception as e:
             logger.error(f"[{job_id}] encode {idx} progress update error: {e}")
 
+        _clear_part_inflight(job_id, idx)
         return {'status':'COMPLETED','idx': idx}
 
     except Exception as e:
         # Catch-all — fail job with a generic reason
         return _fail(f"unexpected error: {e}", stage if 'stage' in locals() else 'unknown')
+    finally:
+        _cleanup_encode_task_files("task ended")
+
+
+@encode_huey.task()
+def encode_audio(
+    job_id: str,
+    stitch_host: Optional[str] = None,
+    source_path: Optional[str] = None,
+    a_sel: int = 0,
+    run_token: Optional[str] = None,
+):
+    """
+    Encode the selected source audio once as a continuous track.
+
+    Video chunks are encoded independently and concat-copied later; doing the
+    audio once avoids AAC priming/padding artifacts at every video chunk seam.
+    """
+    job_key = _job_key(job_id)
+    if not _task_token_is_current(job_id, run_token, "audio"):
+        return {'status': 'STALE', 'job_id': job_id}
+
+    job = redis.hgetall(job_key) or {}
+    filename = job.get("filename") or ""
+    title = _job_title(job)
+    worker_name = WORKER_NAME
+    audio_t0 = _now()
+    local_audio_path = None
+
+    def _cleanup_audio_task_files(reason: str):
+        try:
+            if local_audio_path and os.path.exists(local_audio_path):
+                os.remove(local_audio_path)
+                logger.info("[%s] audio removed %s after %s", job_id, local_audio_path, reason)
+        except Exception:
+            logger.exception("[%s] audio failed to remove %s after %s", job_id, local_audio_path, reason)
+        _cleanup_empty_local_job_dir(job_id, reason=f"audio {reason}", run_token=run_token)
+
+    def _fail(reason: str, stage: str):
+        if not _task_token_is_current(job_id, run_token, f"audio_{stage}_fail"):
+            _cleanup_audio_task_files("stale failure")
+            return {'status': 'STALE', 'job_id': job_id}
+        mapping = {
+            'status': Status.FAILED.value,
+            'error': f"audio {stage}: {reason}",
+            'audio_status': 'FAILED',
+            'audio_error': reason,
+            'failed_stage': f'audio_{stage}',
+            'failed_worker': worker_name,
+            'ended_at': _now(),
+        }
+        try:
+            redis.hset(job_key, mapping=mapping)
+        except Exception:
+            pass
+        logger.error("[%s] %s", job_id, mapping["error"])
+        _cleanup_audio_task_files("failure")
+        return {'status': 'FAILED', 'reason': mapping["error"]}
+
+    try:
+        if _is_job_halted(job_id):
+            logger.warning("[%s] audio: halted before start", job_id)
+            return {'status': 'ABORTED'}
+
+        if not _job_has_selected_audio(job):
+            redis.hset(job_key, mapping={
+                'audio_status': 'NONE',
+                'audio_progress': 100,
+                'audio_elapsed': 0,
+                'audio_path': '',
+                'audio_error': '',
+            })
+            return {'status': 'NO_AUDIO'}
+
+        if not source_path:
+            source_path = (job.get('input_path') or '').strip()
+        if not source_path or not os.path.exists(source_path):
+            alt = os.path.join(WATCH_ROOT, filename.lstrip('/')) if filename else ''
+            if alt and os.path.exists(alt):
+                source_path = alt
+            else:
+                return _fail(f"source not found: {filename or source_path or '(empty)'}", "source")
+
+        try:
+            a_sel = int(a_sel if a_sel is not None else (job.get('selected_a_stream') or 0))
+        except Exception:
+            a_sel = 0
+
+        if not stitch_host:
+            deadline = _now() + STITCH_HOST_READY_TIMEOUT_SEC
+            while _now() < deadline and not stitch_host:
+                _job_heartbeat(job_id, "resolve_audio_stitcher")
+                stitch_host = redis.hget(job_key, 'stitch_host') or None
+                if stitch_host:
+                    break
+                if _is_job_halted(job_id):
+                    logger.warning("[%s] audio: halted while waiting for stitch_host", job_id)
+                    return {'status': 'ABORTED'}
+                time.sleep(0.25)
+            if not stitch_host:
+                return _fail(
+                    f"stitch_host was not published within {int(STITCH_HOST_READY_TIMEOUT_SEC)}s",
+                    "resolve_stitcher",
+                )
+
+        wtmp = _job_base_dir(job_id)
+        _ensure_dirs(wtmp)
+        local_audio_path = os.path.join(wtmp, "source_audio.m4a")
+        try:
+            source_duration = float(redis.hget(job_key, 'source_duration') or 0.0)
+        except Exception:
+            source_duration = 0.0
+        total_us = int(max(0.0, source_duration) * 1_000_000)
+
+        redis.hset(job_key, mapping={
+            'audio_status': 'ENCODING',
+            'audio_progress': 0,
+            'audio_elapsed': 0,
+            'audio_started_at': str(audio_t0),
+            'audio_worker': worker_name,
+            'audio_error': '',
+        })
+        _job_heartbeat(job_id, "audio_encode_start", force=True)
+        emit_activity(
+            f'Encoding continuous audio for "{title}" started',
+            job_id=job_id,
+            filename=filename,
+            stage='audio_encode_start',
+            source='worker',
+        )
+
+        cmd = [
+            'ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'error',
+            '-y',
+            '-progress', 'pipe:2',
+            '-i', source_path,
+            '-map', f'0:a:{a_sel}?',
+            '-vn', '-sn', '-dn',
+            '-map_metadata', '-1',
+            '-map_chapters', '-1',
+            *AUDIO_ARGS.split(),
+            local_audio_path,
+        ]
+        logger.info("[%s] audio encode cmd: %s", job_id, " ".join(cmd))
+
+        stderr_tail = deque(maxlen=120)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            return _fail(f"spawn ffmpeg failed: {e}", "encode")
+
+        try:
+            if proc.stderr is not None:
+                for raw_line in proc.stderr:
+                    line = raw_line.rstrip("\n")
+                    if line:
+                        stderr_tail.append(line)
+                    _job_heartbeat(job_id, "audio_encode")
+                    if line.startswith("out_time_ms="):
+                        try:
+                            out_ms = int(line.split("=", 1)[1] or 0)
+                        except Exception:
+                            out_ms = 0
+                        if total_us > 0:
+                            progress = min(99, max(0, int((out_ms / total_us) * 100)))
+                            redis.hset(job_key, mapping={
+                                'audio_progress': progress,
+                                'audio_elapsed': round(_now() - audio_t0, 2),
+                            })
+                    if _is_job_halted(job_id):
+                        logger.warning("[%s] audio: halted while encoding", job_id)
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        _cleanup_audio_task_files("halted")
+                        return {'status': 'ABORTED'}
+        finally:
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
+            except Exception:
+                pass
+        rc = proc.wait()
+        if rc != 0 or not os.path.exists(local_audio_path) or os.path.getsize(local_audio_path) <= 0:
+            tail = "\n".join(list(stderr_tail)[-40:])
+            return _fail(f"ffmpeg rc={rc}; tail:\n{tail}", "encode")
+
+        if not _task_token_is_current(job_id, run_token, "audio_upload"):
+            _cleanup_audio_task_files("stale before upload")
+            return {'status': 'STALE', 'job_id': job_id}
+        if _is_job_halted(job_id):
+            _cleanup_audio_task_files("halted before upload")
+            return {'status': 'ABORTED'}
+
+        import requests
+        put_url = f"{stitch_host.rstrip('/')}/job/{job_id}/audio/1"
+        redis.hset(job_key, mapping={
+            'audio_status': 'UPLOADING',
+            'audio_progress': 99,
+            'audio_elapsed': round(_now() - audio_t0, 2),
+        })
+        _job_heartbeat(job_id, "audio_upload_start", force=True)
+        try:
+            with open(local_audio_path, 'rb') as f:
+                headers = {'Content-Type': 'audio/mp4', 'Content-Length': str(os.path.getsize(local_audio_path))}
+                response = requests.put(put_url, data=f, headers=headers, timeout=180)
+                if response.status_code // 100 != 2:
+                    return _fail(f"PUT failed {response.status_code}: {response.text[:300]}", "upload")
+        except Exception as e:
+            return _fail(f"upload failed: {e}", "upload")
+
+        if not _task_token_is_current(job_id, run_token, "audio_upload_complete"):
+            _cleanup_audio_task_files("stale after upload")
+            return {'status': 'STALE', 'job_id': job_id}
+        if _is_job_halted(job_id):
+            _cleanup_audio_task_files("halted after upload")
+            return {'status': 'ABORTED'}
+
+        redis.hset(job_key, mapping={
+            'audio_status': 'READY',
+            'audio_progress': 100,
+            'audio_elapsed': round(_now() - audio_t0, 2),
+            'audio_worker': worker_name,
+            'audio_completed_at': str(_now()),
+        })
+        _job_heartbeat(job_id, "audio_upload_complete", force=True)
+        emit_activity(
+            f'Encoding continuous audio for "{title}" completed in {_elapsed_ms(audio_t0)}ms',
+            job_id=job_id,
+            filename=filename,
+            stage='audio_encode_complete',
+            source='worker',
+        )
+        _cleanup_audio_task_files("successful upload")
+        return {'status': 'COMPLETED'}
+
+    except Exception as e:
+        return _fail(f"unexpected error: {e}", "unexpected")
+    finally:
+        _cleanup_audio_task_files("task ended")
 
 
 
-@pipeline_huey.task()
+@pipeline_huey.task(retries=999999, retry_delay=5)
 def stitch(job_id: str, run_token: Optional[str] = None):
     """
     Stitcher node:
@@ -1752,6 +2818,17 @@ def stitch(job_id: str, run_token: Optional[str] = None):
 
     stitch_stage_t0 = _now()
     initial_job = redis.hgetall(job_key) or {}
+    if not _reserved_host_matches(initial_job, "reserved_stitch_host"):
+        return _requeue_misdirected_pipeline_task(
+            stitch,
+            "stitch",
+            job_id,
+            "reserved_stitch_host",
+            job_id,
+            run_token,
+        )
+    if not _task_token_is_current(job_id, run_token, "stitch"):
+        return {'status': 'STALE', 'job_id': job_id}
     title = _job_title(initial_job)
     emit_activity(
         f'Stitching "{title}" started',
@@ -1761,8 +2838,11 @@ def stitch(job_id: str, run_token: Optional[str] = None):
         source='worker',
     )
     _job_heartbeat(job_id, "stitch_start", force=True)
+    cleanup_on_exit = True
     try:
         _start_http_once()
+        if not _task_token_is_current(job_id, run_token, "stitch"):
+            return {'status': 'STALE', 'job_id': job_id}
         stitch_host = f"http://{ENV('HOSTNAME') or socket.gethostname()}:{HTTP_PORT}"
         redis.hset(job_key, mapping={'stitch_host': stitch_host})
         logger.info(f"[{job_id}] Stitcher ready at {stitch_host}")
@@ -1778,6 +2858,7 @@ def stitch(job_id: str, run_token: Optional[str] = None):
         MISS_MIN_AGE_SEC               = float(ENV("STITCH_MISS_MIN_AGE_SEC", "90"))
         RETRY_WINDOW_AHEAD             = int(ENV("STITCH_RETRY_WINDOW_AHEAD", "8"))   # how far past the contiguous frontier we consider
         MAX_PARALLEL_REDISPATCH        = int(ENV("STITCH_MAX_PARALLEL_REDISPATCH", "3"))
+        FINAL_INFLIGHT_GRACE_SEC       = float(ENV("STITCH_FINAL_INFLIGHT_GRACE_SEC", "180"))
 
         # ---- Wait for parts_total ----
         deadline = _now() + 300
@@ -1796,7 +2877,15 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                 pass
             time.sleep(0.5)
         if P <= 0:
-            logger.error(f"[{job_id}] stitch: parts_total not set")
+            reason = "stitch timed out waiting for parts_total; split/segment task did not publish any parts"
+            logger.error(f"[{job_id}] {reason}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'failed_stage': 'stitch_wait_total',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
             return {'status':'FAILED','reason':'parts_total not set'}
 
         enc_dir = os.path.join(_job_base_dir(job_id), "encoded")
@@ -1840,6 +2929,98 @@ def stitch(job_id: str, run_token: Optional[str] = None):
         # Stall detection: only retry if nothing new arrived for a while
         last_ready_count = -1
         last_change_ts   = _now()
+        stitched_frontier = 0
+        try:
+            stitched_frontier = int(redis.hget(job_key, 'stitched_chunks') or 0)
+        except Exception:
+            stitched_frontier = 0
+        combine_started = 0.0
+        try:
+            combine_started = float(redis.hget(job_key, 'combine_started') or 0.0)
+        except Exception:
+            combine_started = 0.0
+        stitch_emit_step = max(1, P // 20)
+        last_stitch_emit_frontier = stitched_frontier
+
+        def _contiguous_frontier(ready: set[int]) -> int:
+            frontier = 0
+            for i in range(1, P + 1):
+                if i in ready:
+                    frontier = i
+                else:
+                    break
+            return frontier
+
+        def _advance_stitch_progress(ready: set[int], force: bool = False) -> int:
+            nonlocal stitched_frontier, combine_started, last_stitch_emit_frontier
+            frontier = _contiguous_frontier(ready)
+            if frontier <= stitched_frontier and not force:
+                return stitched_frontier
+
+            now_ts = _now()
+            if combine_started <= 0:
+                combine_started = now_ts
+
+            stitched_frontier = max(stitched_frontier, frontier)
+            progress = int((stitched_frontier / P) * 100) if P else 0
+            # Keep 100 reserved for the final concat/remux completion.
+            progress = min(99, max(0, progress))
+            try:
+                current_progress = int(redis.hget(job_key, 'combine_progress') or 0)
+            except Exception:
+                current_progress = 0
+            mapping = {
+                'stitched_chunks': stitched_frontier,
+                'combine_started': combine_started,
+                'combine_elapsed': round(now_ts - combine_started, 2),
+                'combine_progress': max(current_progress, progress),
+            }
+            redis.hset(job_key, mapping=mapping)
+
+            if stitched_frontier > 0:
+                _job_heartbeat(
+                    job_id,
+                    "stitch_sequential",
+                    note=f"parts={stitched_frontier}/{P}",
+                )
+            if (
+                stitched_frontier >= P
+                or stitched_frontier - last_stitch_emit_frontier >= stitch_emit_step
+            ):
+                try:
+                    current_job = redis.hgetall(job_key) or {}
+                    emit_activity(
+                        f'Stitching "{_job_title(current_job)}" reached part {stitched_frontier}/{P}',
+                        job_id=job_id,
+                        filename=current_job.get('filename'),
+                        stage='stitch_progress',
+                        source='worker',
+                    )
+                    last_stitch_emit_frontier = stitched_frontier
+                except Exception:
+                    pass
+            return stitched_frontier
+
+        def _inflight_missing(missing: list[int]) -> list[int]:
+            active = []
+            for part_idx in missing:
+                try:
+                    if redis.sismember(inflight_key, part_idx):
+                        active.append(part_idx)
+                except Exception:
+                    pass
+            return active
+
+        def _recent_retry_missing(missing: list[int], now_ts: float) -> list[int]:
+            recent = []
+            for part_idx in missing:
+                try:
+                    last_retry = float(redis.hget(retry_ts_key, part_idx) or 0.0)
+                except Exception:
+                    last_retry = 0.0
+                if last_retry > 0 and (now_ts - last_retry) < FINAL_INFLIGHT_GRACE_SEC:
+                    recent.append(part_idx)
+            return recent
 
         # Helper: schedule (re)encode conservatively
         def _retry_part(idx: int):
@@ -1868,12 +3049,24 @@ def stitch(job_id: str, run_token: Optional[str] = None):
 
             logger.warning(f"[{job_id}] stitch: re-dispatching part {idx}")
             if str(job.get("processing_mode_effective") or job.get("processing_mode") or "split").strip().lower() == "direct":
-                start_s, part_dur = _direct_source_plan_for_part(src_dur, seg_dur, idx)
+                direct_fps = _selected_video_fps_from_job(job)
+                try:
+                    direct_total_frames = int(job.get("total_frames") or 0)
+                except Exception:
+                    direct_total_frames = 0
+                start_s, part_dur, part_frame_count = _direct_source_plan_for_part(
+                    src_dur,
+                    seg_dur,
+                    idx,
+                    fps=direct_fps,
+                    total_frames=direct_total_frames,
+                    total_parts=P,
+                )
                 if start_s is None or part_dur is None or not source_path:
                     logger.error(f"[{job_id}] stitch: cannot retry direct-source part {idx}; missing segment plan")
                     redis.srem(inflight_key, idx)
                     return False
-                encode(
+                _dispatch_encode_part(
                     job_id,
                     idx,
                     master_host,
@@ -1883,10 +3076,11 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                     source_path=source_path,
                     source_start_s=start_s,
                     source_duration_s=part_dur,
+                    source_frame_count=part_frame_count,
                     run_token=run_token,
                 )
             else:
-                encode(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host, run_token=run_token)
+                _dispatch_encode_part(job_id, idx, master_host, v_sel, a_sel, stitch_host=stitch_host, run_token=run_token)
 
             now_ts = _now()
             pipe = redis.pipeline()
@@ -1905,6 +3099,7 @@ def stitch(job_id: str, run_token: Optional[str] = None):
 
             ready = _ready_set()
             done_fs = len(ready)
+            frontier = _advance_stitch_progress(ready)
 
             # Clear inflight markers for any that have arrived
             try:
@@ -1942,13 +3137,6 @@ def stitch(job_id: str, run_token: Optional[str] = None):
 
             # --- Conservative retry strategy ---
             now_ts = _now()
-            # Find largest contiguous ready prefix (head-of-line)
-            frontier = 0
-            for i in range(1, P + 1):
-                if i in ready:
-                    frontier = i
-                else:
-                    break
 
             # Only consider a small window beyond the frontier
             horizon = min(P, frontier + RETRY_WINDOW_AHEAD)
@@ -2016,6 +3204,11 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                     cnt, last_retry, first_seen = 0, 0.0, 0.0
 
                 if cnt >= MAX_RETRIES:
+                    try:
+                        if redis.sismember(inflight_key, idx):
+                            continue
+                    except Exception:
+                        pass
                     # give extra grace after last retry proportional to part estimate
                     if (now_ts - max(last_retry, first_seen)) > max(2 * est_part_secs, STALL_BEFORE_RETRY_SEC):
                         early_fail = True
@@ -2028,12 +3221,57 @@ def stitch(job_id: str, run_token: Optional[str] = None):
             # pacing
             time.sleep(0.5 if dispatched == 0 else 1.0)
 
-        # Final readiness check
+        # Final readiness check. Do not fail while retry uploads are still in
+        # flight or while their files may not yet be visible/stable locally.
         final_ready = _ready_set()
+        try:
+            if final_ready:
+                redis.srem(inflight_key, *list(final_ready))
+        except Exception:
+            pass
+        _advance_stitch_progress(final_ready, force=True)
+        final_wait_until = _now() + FINAL_INFLIGHT_GRACE_SEC
+        while len(final_ready) < P and _now() < final_wait_until:
+            if _is_job_halted(job_id):
+                logger.warning(f"[{job_id}] stitch aborted during final inflight grace")
+                return {'status': 'ABORTED'}
+            if not _task_token_is_current(job_id, run_token, "stitch"):
+                return {'status': 'STALE', 'job_id': job_id}
+
+            missing_now = sorted(expected - final_ready)
+            inflight_now = _inflight_missing(missing_now)
+            recent_retry_now = _recent_retry_missing(missing_now, _now())
+            if not inflight_now and not recent_retry_now:
+                break
+
+            _job_heartbeat(
+                job_id,
+                "stitch_final_inflight_wait",
+                note=(
+                    f"missing={missing_now[:12]} "
+                    f"inflight={inflight_now[:12]} recent_retry={recent_retry_now[:12]}"
+                ),
+            )
+            time.sleep(0.5)
+            final_ready = _ready_set()
+            try:
+                if final_ready:
+                    redis.srem(inflight_key, *list(final_ready))
+            except Exception:
+                pass
+            _advance_stitch_progress(final_ready, force=True)
+
         if len(final_ready) < P:
             missing = sorted(expected - final_ready)
+            reason = f"missing encoded parts after conservative retries: {missing}"
             logger.error(f"[{job_id}] stitch timeout or retries exhausted; missing: {missing}")
-            redis.hset(job_key, 'status', Status.FAILED.value)
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'failed_stage': 'stitch_wait_parts',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
             try:
                 redis.delete(f"job_done_parts:{job_id}")
                 redis.delete(retry_cnt_key)
@@ -2042,21 +3280,46 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                 redis.delete(inflight_key)
             except Exception:
                 pass
-            return {'status':'FAILED','reason':'missing encoded parts after conservative retries'}
+            return {'status':'FAILED','reason': reason}
 
         # ---- Stitch (concat copy) ----
-        base_dir = _job_base_dir(job_id)
+        job = redis.hgetall(job_key) or {}
+        base_dir = _job_base_dir(job_id, job)
         concat_path = os.path.join(base_dir, "concat.txt")
         enc_paths = [os.path.join(enc_dir, f"enc_{i:03d}.mp4") for i in range(1, P + 1)]
+        segment_durations = _segment_manifest_durations(job_id, job, expected_parts=P)
+        expected_video_duration = sum(segment_durations) if len(segment_durations) == P else 0.0
         with open(concat_path, 'w') as f:
-            for pth in enc_paths:
+            if segment_durations:
+                f.write("ffconcat version 1.0\n")
+            for idx, pth in enumerate(enc_paths):
                 f.write(f"file '{pth}'\n")
+                if idx < len(segment_durations):
+                    f.write(f"duration {segment_durations[idx]:.6f}\n")
+        redis.hset(job_key, mapping={
+            'segment_manifest_path': _segment_manifest_path(job_id, job) if segment_durations else '',
+            'segment_manifest_count': len(segment_durations),
+            'stitch_expected_video_duration': f'{expected_video_duration:.6f}' if expected_video_duration else '',
+        })
 
         local_out = os.path.join(base_dir, f"job_{job_id}_output.mp4")
-        combine_t0 = _now()
-        redis.hset(job_key, mapping={'combine_progress': 0, 'combine_elapsed': 0})
+        try:
+            combine_t0 = float(redis.hget(job_key, 'combine_started') or 0.0)
+        except Exception:
+            combine_t0 = 0.0
+        if combine_t0 <= 0:
+            combine_t0 = _now()
+            redis.hset(job_key, 'combine_started', combine_t0)
+        try:
+            current_combine_progress = int(redis.hget(job_key, 'combine_progress') or 0)
+        except Exception:
+            current_combine_progress = 0
+        redis.hset(job_key, mapping={
+            'combine_progress': max(0, current_combine_progress),
+            'combine_elapsed': round(_now() - combine_t0, 2),
+        })
 
-        total_us = int((src_dur or 0) * 1_000_000)
+        total_us = int((expected_video_duration or src_dur or 0) * 1_000_000)
         stitch_cmd = [
             'ffmpeg', '-hide_banner',
             '-f', 'concat', '-safe', '0',
@@ -2098,8 +3361,12 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                     if total_us > 0:
                         pct = int(min(100, max(0, (out_ms / total_us) * 100)))
                         pct = min(pct, 99)
+                        try:
+                            current_pct = int(redis.hget(job_key, 'combine_progress') or 0)
+                        except Exception:
+                            current_pct = 0
                         redis.hset(job_key, mapping={
-                            'combine_progress': pct,
+                            'combine_progress': max(current_pct, pct),
                             'combine_elapsed': round(_now() - combine_t0, 2),
                         })
                     else:
@@ -2115,13 +3382,225 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                 err_tail = (proc.stderr.read() or '')[-1000:]
             except Exception:
                 pass
-            logger.error(f"[{job_id}] Stitch failed (rc={rc}): {err_tail}")
-            redis.hset(job_key, 'status', Status.FAILED.value)
-            return {'status': 'FAILED', 'reason': 'stitch failed'}
+            reason = f"stitch failed (rc={rc}): {err_tail}".strip()
+            logger.error(f"[{job_id}] {reason}")
+            redis.hset(job_key, mapping={
+                'status': Status.FAILED.value,
+                'error': reason,
+                'failed_stage': 'stitch',
+                'failed_worker': WORKER_NAME,
+                'ended_at': _now(),
+            })
+            return {'status': 'FAILED', 'reason': reason}
 
         if _is_job_halted(job_id):
             logger.warning(f"[{job_id}] stitch halted before moving file")
             return {'status': 'ABORTED'}
+
+        # New pipeline mode: encoded chunks are video-only; audio is encoded
+        # once from the original source and uploaded as a single continuous m4a.
+        job = redis.hgetall(job_key) or {}
+        audio_status = str(job.get("audio_status") or "").strip().upper()
+        audio_path = _audio_path(job_id)
+        if audio_status and audio_status != "NONE":
+            audio_deadline = _now() + max(300.0, (src_dur or 0) * 1.5)
+            while _now() < audio_deadline:
+                if _is_job_halted(job_id):
+                    logger.warning(f"[{job_id}] stitch halted while waiting for continuous audio")
+                    return {'status': 'ABORTED'}
+                if not _task_token_is_current(job_id, run_token, "stitch_audio_wait"):
+                    return {'status': 'STALE', 'job_id': job_id}
+
+                job = redis.hgetall(job_key) or {}
+                audio_status = str(job.get("audio_status") or "").strip().upper()
+                if audio_status == "READY" and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                    break
+                if audio_status == "FAILED":
+                    reason = job.get("audio_error") or "continuous audio encode failed"
+                    redis.hset(job_key, mapping={
+                        'status': Status.FAILED.value,
+                        'error': f"audio failed before mux: {reason}",
+                        'failed_stage': 'audio_mux_wait',
+                        'failed_worker': WORKER_NAME,
+                        'ended_at': _now(),
+                    })
+                    return {'status': 'FAILED', 'reason': reason}
+                _job_heartbeat(job_id, "audio_wait", note=f"status={audio_status or 'unknown'}")
+                time.sleep(0.5)
+
+            if audio_status != "READY" or not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
+                reason = f"continuous audio was not ready before timeout; status={audio_status or 'unknown'}"
+                logger.error(f"[{job_id}] {reason}")
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': reason,
+                    'failed_stage': 'audio_mux_wait',
+                    'failed_worker': WORKER_NAME,
+                    'ended_at': _now(),
+                })
+                return {'status': 'FAILED', 'reason': reason}
+
+            muxed_out = os.path.join(base_dir, f"job_{job_id}_output_av.mp4")
+            stitched_video_duration = _ffprobe_duration(local_out)
+            audio_duration = _ffprobe_duration(audio_path)
+            target_mux_duration = audio_duration if audio_duration > 0 else (
+                expected_video_duration if expected_video_duration > 0 else (src_dur if src_dur and src_dur > 0 else 0.0)
+            )
+            video_input_args = []
+            video_timebase_scale = 1.0
+            if stitched_video_duration > 0 and target_mux_duration > 0:
+                drift_sec = stitched_video_duration - target_mux_duration
+                if abs(drift_sec) > 0.05:
+                    allowed_stretch_sec = max(
+                        AUDIO_MUX_MAX_TIMESTAMP_STRETCH_SEC,
+                        target_mux_duration * AUDIO_MUX_MAX_TIMESTAMP_STRETCH_PCT,
+                    )
+                    if abs(drift_sec) > allowed_stretch_sec:
+                        try:
+                            source_frame_count = int(job.get("total_frames") or 0)
+                        except Exception:
+                            source_frame_count = 0
+                        video_frame_count, video_frame_details, frame_count_error, _ = _ffprobe_video_frame_count_details(
+                            local_out,
+                            job_id=job_id,
+                            timeout_sec=AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC,
+                        )
+                        frame_tolerance = max(
+                            AUDIO_MUX_FRAME_COUNT_TOLERANCE_FRAMES,
+                            int(source_frame_count * AUDIO_MUX_FRAME_COUNT_TOLERANCE_PCT) if source_frame_count > 0 else 0,
+                        )
+                        frame_delta = video_frame_count - source_frame_count if video_frame_count and source_frame_count else 0
+                        redis.hset(job_key, mapping={
+                            'video_duration_before_audio_mux': f'{stitched_video_duration:.6f}',
+                            'audio_mux_target_duration': f'{target_mux_duration:.6f}',
+                            'audio_mux_sync_correction_sec': f'{drift_sec:.6f}',
+                            'audio_mux_video_frame_count': str(video_frame_count or ''),
+                            'audio_mux_source_frame_count': str(source_frame_count or ''),
+                            'audio_mux_frame_count_delta': str(frame_delta) if video_frame_count and source_frame_count else '',
+                            'audio_mux_frame_count_tolerance': str(frame_tolerance),
+                            'audio_mux_frame_count_error': frame_count_error or '',
+                            'audio_mux_video_frame_details_json': json.dumps(video_frame_details or {}, separators=(",", ":")),
+                        })
+                        reason = (
+                            "unsafe continuous audio mux drift: "
+                            f"video={stitched_video_duration:.6f}s "
+                            f"target={target_mux_duration:.6f}s "
+                            f"drift={drift_sec:.6f}s "
+                            f"max={allowed_stretch_sec:.6f}s "
+                            f"frames={video_frame_count or 'unknown'}/{source_frame_count or 'unknown'} "
+                            f"delta={frame_delta if video_frame_count and source_frame_count else 'unknown'}"
+                        )
+                        logger.error(f"[{job_id}] {reason}")
+                        redis.hset(job_key, mapping={
+                            'status': Status.FAILED.value,
+                            'error': reason,
+                            'audio_status': 'FAILED',
+                            'audio_error': reason,
+                            'audio_mux_video_itsscale': '',
+                            'audio_mux_sync_mode': 'failed_duration_drift',
+                            'preserve_project_dir': '1',
+                            'preserve_project_dir_reason': 'audio_mux_sync_duration_diagnostic',
+                            'failed_stage': 'audio_mux_sync',
+                            'failed_worker': WORKER_NAME,
+                            'ended_at': _now(),
+                        })
+                        cleanup_on_exit = False
+                        return {'status': 'FAILED', 'reason': reason}
+                    video_timebase_scale = target_mux_duration / stitched_video_duration
+                    video_input_args = ['-itsscale', f'{video_timebase_scale:.12f}']
+                    redis.hset(job_key, mapping={
+                        'video_duration_before_audio_mux': f'{stitched_video_duration:.6f}',
+                        'audio_mux_target_duration': f'{target_mux_duration:.6f}',
+                        'audio_mux_sync_correction_sec': f'{drift_sec:.6f}',
+                        'audio_mux_video_itsscale': f'{video_timebase_scale:.12f}',
+                        'audio_mux_sync_mode': 'timestamp_scale',
+                    })
+                    logger.warning(
+                        "[%s] applying video timestamp scale before audio mux: video=%.6fs target=%.6fs drift=%.6fs scale=%.12f",
+                        job_id,
+                        stitched_video_duration,
+                        target_mux_duration,
+                        drift_sec,
+                        video_timebase_scale,
+                    )
+            audio_mux_cmd = [
+                'ffmpeg', '-hide_banner',
+                '-nostats', '-loglevel', 'error',
+                '-y',
+                *video_input_args,
+                '-i', local_out,
+                '-i', audio_path,
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-map_metadata', '-1',
+                '-map_chapters', '-1',
+                '-movflags', '+faststart',
+                '-progress', 'pipe:1',
+                muxed_out,
+            ]
+            logger.info(f"[{job_id}] Audio mux cmd: {' '.join(audio_mux_cmd)}")
+            emit_activity(
+                f'Muxing continuous audio for "{_job_title(job)}"',
+                job_id=job_id,
+                filename=job.get('filename'),
+                stage='audio_mux',
+                source='worker',
+            )
+            redis.hset(job_key, mapping={'audio_status': 'MUXING'})
+            audio_mux = subprocess.Popen(audio_mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                while True:
+                    line = audio_mux.stdout.readline() if audio_mux.stdout else ''
+                    if not line:
+                        if audio_mux.poll() is not None:
+                            break
+                        _job_heartbeat(job_id, "audio_mux")
+                        time.sleep(0.05)
+                        continue
+                    _job_heartbeat(job_id, "audio_mux", note="ffmpeg-progress")
+                    if _is_job_halted(job_id):
+                        logger.warning(f"[{job_id}] stitch halted while muxing continuous audio")
+                        audio_mux.terminate()
+                        try:
+                            audio_mux.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            audio_mux.kill()
+                        return {'status': 'ABORTED'}
+                    if line.startswith('progress=') and line.split('=', 1)[1].strip() == 'end':
+                        break
+            finally:
+                audio_rc = audio_mux.wait()
+            if audio_rc != 0 or not os.path.exists(muxed_out):
+                err_tail = ''
+                try:
+                    err_tail = (audio_mux.stderr.read() or '')[-1000:]
+                except Exception:
+                    pass
+                reason = f"continuous audio mux failed (rc={audio_rc}): {err_tail}".strip()
+                logger.error(f"[{job_id}] {reason}")
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': reason,
+                    'audio_status': 'FAILED',
+                    'audio_error': reason,
+                    'failed_stage': 'audio_mux',
+                    'failed_worker': WORKER_NAME,
+                    'ended_at': _now(),
+                })
+                return {'status': 'FAILED', 'reason': reason}
+
+            try:
+                os.remove(local_out)
+            except Exception:
+                pass
+            local_out = muxed_out
+            redis.hset(job_key, mapping={
+                'audio_status': 'MUXED',
+                'audio_progress': 100,
+                'audio_muxed_at': str(_now()),
+            })
 
         # Decide whether to remux English subtitles from the source into the final file.
         job = redis.hgetall(job_key) or {}
@@ -2191,17 +3670,64 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                 except Exception:
                     continue
                 subtitle_cmd.extend(["-map", f"1:{stream_index}"])
+            subtitle_cmd.extend(["-progress", "pipe:1"])
             subtitle_cmd.append(subtitle_mux_path)
             logger.info(f"[{job_id}] Subtitle remux cmd: {' '.join(subtitle_cmd)}")
-            subtitle_mux = subprocess.run(
+            subtitle_stderr_tail = deque(maxlen=80)
+            subtitle_mux = subprocess.Popen(
                 subtitle_cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
             )
-            if subtitle_mux.returncode != 0 or not os.path.exists(subtitle_mux_path):
-                err_tail = ((subtitle_mux.stderr or "") or (subtitle_mux.stdout or ""))[-1200:]
-                subtitle_warning = f"subtitle remux failed; output kept without subtitles: {err_tail or subtitle_mux.returncode}"
+            while True:
+                if _is_job_halted(job_id):
+                    logger.warning(f"[{job_id}] stitch halted during subtitle remux")
+                    subtitle_mux.terminate()
+                    try:
+                        subtitle_mux.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        subtitle_mux.kill()
+                    return {'status': 'ABORTED'}
+
+                ready_stdout = []
+                ready_stderr = []
+                try:
+                    streams = [s for s in (subtitle_mux.stdout, subtitle_mux.stderr) if s is not None]
+                    if streams:
+                        ready_stdout, _, _ = select.select(streams, [], [], 1.0)
+                except Exception:
+                    ready_stdout = []
+
+                if not ready_stdout:
+                    _job_heartbeat(job_id, "subtitle_mux", note="waiting")
+                    if subtitle_mux.poll() is not None:
+                        break
+                    continue
+
+                for stream in ready_stdout:
+                    line = stream.readline()
+                    if not line:
+                        continue
+                    if stream is subtitle_mux.stderr:
+                        subtitle_stderr_tail.append(line.rstrip())
+                    else:
+                        _job_heartbeat(job_id, "subtitle_mux", note="ffmpeg-progress")
+
+                if subtitle_mux.poll() is not None:
+                    break
+
+            subtitle_rc = subtitle_mux.wait()
+            try:
+                if subtitle_mux.stderr:
+                    for line in subtitle_mux.stderr.readlines():
+                        if line:
+                            subtitle_stderr_tail.append(line.rstrip())
+            except Exception:
+                pass
+            if subtitle_rc != 0 or not os.path.exists(subtitle_mux_path):
+                err_tail = "\n".join(subtitle_stderr_tail)[-1200:]
+                subtitle_warning = f"subtitle remux failed; output kept without subtitles: {err_tail or subtitle_rc}"
                 logger.warning(f"[{job_id}] {subtitle_warning}")
                 emit_activity(
                     f'Finished "{_job_title(job)}" without subtitles after remux failure',
@@ -2273,11 +3799,8 @@ def stitch(job_id: str, run_token: Optional[str] = None):
         except Exception:
             pass
 
-        # Cleanup project temp dir
-        try:
-            shutil.rmtree(_job_base_dir(job_id))
-        except Exception:
-            pass
+        _cleanup_local_job_dir(job_id, job, reason="stitch success", run_token=run_token)
+        cleanup_on_exit = False
 
         # Final combine progress update + cleanup of retry metadata
         redis.hset(job_key, mapping={
@@ -2308,8 +3831,17 @@ def stitch(job_id: str, run_token: Optional[str] = None):
 
     except Exception as e:
         logger.exception(f"[{job_id}] stitch failed")
-        redis.hset(job_key, 'status', Status.FAILED.value)
+        redis.hset(job_key, mapping={
+            'status': Status.FAILED.value,
+            'error': str(e),
+            'failed_stage': 'stitch',
+            'failed_worker': WORKER_NAME,
+            'ended_at': _now(),
+        })
         return {'status': 'FAILED', 'error': str(e)}
+    finally:
+        if cleanup_on_exit:
+            _cleanup_local_job_dir(job_id, initial_job, reason="stitch task ended", run_token=run_token)
 
 @pipeline_huey.task()
 def stamp(job_id: str, run_token: Optional[str] = None):
@@ -2611,3 +4143,15 @@ def stamp(job_id: str, run_token: Optional[str] = None):
 
     logger.info(f"[{job_id}] STAMP completed → {stamped_path}")
     return {'status': 'COMPLETED', 'output': stamped_path}
+
+
+def enqueue_split_on_host(host: str, job_id: str, file_path: str, run_token: Optional[str] = None):
+    return _enqueue_pipeline_task_for_host(split, host, job_id, file_path, run_token)
+
+
+def enqueue_stitch_on_host(host: str, job_id: str, run_token: Optional[str] = None):
+    return _enqueue_pipeline_task_for_host(stitch, host, job_id, run_token)
+
+
+def enqueue_stamp_on_host(host: str, job_id: str, run_token: Optional[str] = None):
+    return _enqueue_pipeline_task_for_host(stamp, host, job_id, run_token)

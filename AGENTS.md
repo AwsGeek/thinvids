@@ -14,7 +14,9 @@ This file defines how AI coding agents should operate in the `thinvids` reposito
 - `worker/`: task pipeline for segmenting, encoding, and stitching media.
 - `agent/`: worker-side metrics/heartbeat and idle-state behavior.
 - `common.py`: shared constants/utilities used across manager, worker, and agent.
-- `ansible_manager.yml` and `ansible_workers.yml`: source of truth for deployment and systemd wiring.
+- `docker-compose.yml`: source of truth for the manager-side stack on `swarm4`.
+- `ansible_workers.yml`: source of truth for worker deployment and systemd wiring.
+- `ansible_manager.yml`: legacy manager deployment path retained for rollback/reference.
 
 ## 3. Where to work
 - Work only inside this repository unless explicitly asked to touch another repo.
@@ -29,8 +31,8 @@ This file defines how AI coding agents should operate in the `thinvids` reposito
 - If a request is ambiguous, choose the safest interpretation and state assumptions.
 
 ## 5. Deployment and operations conventions
-- Prefer Ansible playbooks over ad-hoc host changes.
-- Keep manager and worker changes compatible with existing systemd service expectations.
+- Prefer Docker Compose for manager-side changes and Ansible playbooks for worker changes.
+- Keep worker changes compatible with existing systemd service expectations.
 - Preserve mount/path assumptions unless explicitly asked to change them (`/watch`, `/library`, `/config`, `/opt/jerry`).
 - Preserve Redis contract compatibility unless a coordinated change is requested.
 - Reuse repo scripts where relevant (`command-workers.sh`, `tail-workers.sh`, `nodes-suspend.sh`).

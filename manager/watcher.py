@@ -6,7 +6,48 @@ import threading
 import logging
 import requests
 import fcntl
+import shlex
 from concurrent.futures import ThreadPoolExecutor
+
+def _load_env_file(path: str) -> None:
+    """
+    Load watcher overrides at process start.
+
+    Systemd injects EnvironmentFile values before launching the process. Docker
+    restarts do not re-read bind-mounted env files, so Compose mode lets the
+    watcher read the same file directly.
+    """
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logging.getLogger("watcher").warning("Could not read watcher env file %s: %s", path, exc)
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            parts = shlex.split(raw_value, comments=False, posix=True)
+            value = "" if not parts else " ".join(parts)
+        except ValueError:
+            value = raw_value.strip().strip("\"'")
+        os.environ[key] = value
+
+_load_env_file(os.getenv("WATCHER_ENV_FILE", "/config/watcher.env"))
 
 # --- Optional watchdog (can be disabled by env) ---
 USE_WATCHDOG = os.getenv("USE_WATCHDOG", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -38,6 +79,11 @@ ADOPT_MARKER_FILE = os.getenv("ADOPT_EXISTING_PROCESSED_MARKER", "").strip()
 PROCESSED_PATH_ALIASES = os.getenv("PROCESSED_PATH_ALIASES", "").strip()
 
 VIDEO_EXTS = {".mkv", ".mp4"}  # case-insensitive
+IGNORED_DIR_NAMES = {
+    name.strip()
+    for name in os.getenv("WATCHER_IGNORED_DIRS", ".incoming").split(",")
+    if name.strip()
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [watcher] %(message)s")
 logger = logging.getLogger("watcher")
@@ -269,7 +315,25 @@ class FileProcessedStore:
 # ===================================================
 #                    HELPERS
 # ===================================================
+def is_ignored_path(path: str) -> bool:
+    try:
+        rel = os.path.relpath(path, WATCH_ROOT)
+    except ValueError:
+        rel = path
+    parts = str(rel or "").replace("\\", "/").split("/")
+    return any(part in IGNORED_DIR_NAMES for part in parts)
+
+
+def prune_ignored_dirs(dirs):
+    dirs[:] = [
+        d for d in dirs
+        if not d.startswith(".") and d not in IGNORED_DIR_NAMES
+    ]
+
+
 def is_video_file(path: str) -> bool:
+    if is_ignored_path(path):
+        return False
     _, ext = os.path.splitext(path)
     return ext.lower() in VIDEO_EXTS
 
@@ -353,6 +417,11 @@ def submit_job_if_stable(path: str, store: FileProcessedStore):
     Stabilize (size constant for STABLE_CHECKS*STABLE_DELAY_SEC)
     then POST to SUBMIT_URL once. On success, mark as processed in the store.
     """
+    if is_ignored_path(path):
+        with _index_lock:
+            _pending.discard(path)
+        return
+
     rel = rel_from_watch(path)
     initial_sig = signature_for_path(path)
     state, ledger_rel = processed_state_for_rel(store, rel, initial_sig)
@@ -428,6 +497,9 @@ def submit_job_if_stable(path: str, store: FileProcessedStore):
             _pending.discard(path)
 
 def schedule_submit(executor: ThreadPoolExecutor, path: str, store: FileProcessedStore):
+    if is_ignored_path(path):
+        return
+
     rel = rel_from_watch(path)
     sig = signature_for_path(path)
     if not sig:
@@ -463,7 +535,7 @@ def initial_index_scan():
     count = 0
     t0 = time.time()
     for root, dirs, files in os.walk(WATCH_ROOT):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        prune_ignored_dirs(dirs)
         for name in files:
             if name.startswith("."):
                 continue
@@ -490,7 +562,7 @@ def bootstrap_processed_if_first_run(store: FileProcessedStore):
     logger.info("Processed store is empty -> first run. Bootstrapping...")
     rels = []
     for root, dirs, files in os.walk(WATCH_ROOT):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        prune_ignored_dirs(dirs)
         for name in files:
             if name.startswith("."):
                 continue
@@ -534,7 +606,7 @@ def adopt_existing_processed_once(store: FileProcessedStore):
     rels_to_add = []
 
     for root, dirs, files in os.walk(WATCH_ROOT):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        prune_ignored_dirs(dirs)
         for name in files:
             if name.startswith("."):
                 continue
@@ -596,7 +668,7 @@ def periodic_scanner(executor: ThreadPoolExecutor, interval: int, store: FilePro
         candidates = []
 
         for root, dirs, files in os.walk(WATCH_ROOT):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            prune_ignored_dirs(dirs)
             for name in files:
                 if name.startswith("."):
                     continue
@@ -678,6 +750,8 @@ if USE_WATCHDOG:
 # ===================================================
 def start_watcher():
     logger.info(f"Watching root: {WATCH_ROOT}")
+    if IGNORED_DIR_NAMES:
+        logger.info("Ignoring watch directories: %s", ", ".join(sorted(IGNORED_DIR_NAMES)))
     os.makedirs(WATCH_ROOT, exist_ok=True)
     # Make sure /config exists (NFS mount managed by Ansible)
     try:
