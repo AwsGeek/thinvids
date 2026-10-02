@@ -1158,11 +1158,11 @@
     const raw = data.streams;
     const streams = typeof raw === 'string' ? (JSON.parse(raw)||{video:[],audio:[]}) : (raw||{video:[],audio:[]});
     (streams.video||[]).forEach((v,idx)=>{
-      const label = [`#${idx}`, v.codec||'', (v.width&&v.height)?`${v.width}x${v.height}`:'', v.fps?`${Number(v.fps).toFixed(2)}fps`:'', v.title?`“${v.title}”`:''].filter(Boolean).join(' · ');
+      const label = [`Source #${v.index ?? idx}`, v.codec||'', (v.width&&v.height)?`${v.width}x${v.height}`:'', v.fps?`${Number(v.fps).toFixed(2)}fps`:'', v.title?`“${v.title}”`:''].filter(Boolean).join(' · ');
       const o = document.createElement('option'); o.value=String(idx); o.textContent=label; vSel.appendChild(o);
     });
     (streams.audio||[]).forEach((a,idx)=>{
-      const label = [`#${idx}`, a.codec||'', a.channel_layout||(a.channels?`${a.channels}ch`:''), a.language||'', a.title?`“${a.title}”`:'', a.disposition_default?'(default)':''].filter(Boolean).join(' · ');
+      const label = [`Source #${a.index ?? idx}`, a.codec||'', a.channel_layout||(a.channels?`${a.channels}ch`:''), a.language||'', a.title?`“${a.title}”`:'', a.disposition_default?'(default)':''].filter(Boolean).join(' · ');
       const o = document.createElement('option'); o.value=String(idx); o.textContent=label; aSel.appendChild(o);
     });
     const setSelectIndexByValue = (sel,val,fallback=0)=>{ if(!sel||!sel.options.length)return; let i=parseInt(val,10); if(Number.isNaN(i)) i=fallback; if(i<0||i>=sel.options.length) i=fallback; sel.selectedIndex=i; };

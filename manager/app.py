@@ -2887,7 +2887,7 @@ def get_video_details(job_id: str, file_path: str):
 
     cmd = [
         'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,channels,channel_layout,disposition:stream_tags=language,title',
+        '-show_entries', 'format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_frames,duration,channels,channel_layout,disposition:stream_tags=language,title,DURATION,NUMBER_OF_FRAMES,NUMBER_OF_PACKETS',
         '-of', 'json', real_input
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -2907,13 +2907,24 @@ def get_video_details(job_id: str, file_path: str):
     kbps = (fmt_bps/1000.0) if fmt_bps>0 else (((size_b*8)/duration_s/1000.0) if (size_b and duration_s) else 0.0)
 
     video_streams, audio_streams = [], []
+
+    def _positive_int(value) -> int:
+        try:
+            raw = str(value or '').strip()
+            if not raw or raw.upper() == 'N/A':
+                return 0
+            return int(float(raw))
+        except Exception:
+            return 0
+
     for s in streams:
+        tags = s.get('tags') or {}
         base = {
             'index': int(s.get('index', 0)),
             'codec': s.get('codec_name') or '',
             'disposition_default': bool((s.get('disposition') or {}).get('default', 0)),
-            'title': ((s.get('tags') or {}).get('title') or ''),
-            'language': ((s.get('tags') or {}).get('language') or '')
+            'title': (tags.get('title') or ''),
+            'language': (tags.get('language') or '')
         }
         if s.get('codec_type') == 'video':
             afr = s.get('avg_frame_rate') or '0'
@@ -2921,11 +2932,14 @@ def get_video_details(job_id: str, file_path: str):
                 fps = (float(afr.split('/')[0]) / float(afr.split('/')[1])) if '/' in afr else float(afr)
             except Exception:
                 fps = 0.0
+            raw_frames = s.get('nb_frames') or tags.get('NUMBER_OF_FRAMES') or tags.get('NUMBER_OF_PACKETS')
             video_streams.append({**base,
                 'width': int(s.get('width') or 0),
                 'height': int(s.get('height') or 0),
                 'fps': fps,
-                'nb_frames': int(s.get('nb_frames', 0) or 0)
+                'nb_frames': _positive_int(raw_frames),
+                'duration': s.get('duration') or tags.get('DURATION') or '',
+                'tags': tags,
             })
         elif s.get('codec_type') == 'audio':
             audio_streams.append({**base,
@@ -2979,8 +2993,10 @@ def get_video_details(job_id: str, file_path: str):
     pv = video_streams[0] if video_streams else {}
     fps = float(pv.get('fps', 0) or 0)
     total_frames = int(pv.get('nb_frames') or 0)
+    frame_count_method = 'stream_metadata' if total_frames else ''
     if total_frames == 0 and duration_s and fps:
-        total_frames = int(duration_s * fps)
+        total_frames = int(round(duration_s * fps))
+        frame_count_method = 'duration_x_fps_estimate'
 
     mapping = {
         'source_file_size': size_b,
@@ -2995,6 +3011,9 @@ def get_video_details(job_id: str, file_path: str):
     }
     if total_frames:
         mapping['total_frames'] = total_frames
+        mapping['source_frame_count_method'] = frame_count_method
+        if frame_count_method != 'duration_x_fps_estimate':
+            mapping['source_frame_count_exact'] = total_frames
 
     return mapping
 
@@ -3253,6 +3272,21 @@ def copy_job():
         'stitched_chunks': 0,
         'streams_json': src.get('streams_json')
     }
+    for field in (
+        'source_codec',
+        'source_resolution',
+        'source_duration',
+        'source_fps',
+        'source_file_size',
+        'source_bitrate_kbps',
+        'total_frames',
+        'source_frame_count_exact',
+        'source_frame_count_method',
+        'source_frame_count_details_json',
+    ):
+        value = src.get(field)
+        if value not in (None, ''):
+            new_job[field] = value
     new_key = f"job:{new_job_id}"
     redis_client.hset(new_key, mapping=new_job)
     # index the job for fast listing

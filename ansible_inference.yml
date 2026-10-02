@@ -1,0 +1,465 @@
+- name: Retire one Thinvids host and install the inference baseline
+  hosts: thinman_workers:inference_workers
+  become: true
+  gather_facts: false
+  vars:
+    inference_units:
+      - thinman-agent.service
+      - thinman-worker-encode.service
+      - thinman-worker-pipeline.service
+      - thinman-worker.service
+    inference_hooks:
+      - /lib/systemd/system-sleep/thinman-resume
+      - /etc/systemd/system-sleep/thinman-resume
+    inference_model: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
+
+  pre_tasks:
+    - name: Require exactly one explicitly limited host
+      ansible.builtin.assert:
+        that:
+          - migration_controller | default(false) | bool
+          - ansible_play_hosts_all | length == 1
+          - inventory_hostname is match('^thinman[0-9]{2,3}$')
+          - llama_revision is match('^[0-9a-f]{40}$')
+          - model_revision is match('^[0-9a-f]{40}$')
+          - model_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: Run repurpose-node.sh with one registered host.
+      tags: always
+
+    - name: Wait for the selected host to wake
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+        sleep: 5
+      tags: always
+
+    - name: Gather host identity and hardware
+      ansible.builtin.setup:
+      tags: always
+
+    - name: Confirm SSH reached the requested machine
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.hostname == inventory_hostname
+          - ansible_facts.os_family == 'Debian'
+        fail_msg: Host identity or OS differs from the supported Thinvids worker.
+      tags: always
+
+    - name: Read service states
+      ansible.builtin.service_facts:
+      tags: always
+
+  tasks:
+    - name: Retire Thinvids services
+      tags: retire
+      block:
+        - name: Identify installed Thinvids units
+          ansible.builtin.set_fact:
+            retiring_units: "{{ inference_units | select('in', ansible_facts.services) | list }}"
+
+        - name: Refuse unknown Thinvids service names
+          ansible.builtin.assert:
+            that:
+              - ansible_facts.services.keys() | select('match', '^thinman.*[.]service$') | difference(inference_units) | length == 0
+            fail_msg: Worker service layout differs from the known Thinvids deployment; inspect it before retirement.
+
+        - name: Protect mounted data before removing application directories
+          ansible.builtin.script:
+            cmd: tools/inference/check_removal.py
+            executable: python3
+          changed_when: false
+
+        - name: Create retirement checkpoint directory
+          ansible.builtin.file:
+            path: /var/lib/thinvids-retirement
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Inspect resume hooks
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop: "{{ inference_hooks }}"
+          register: resume_hooks
+
+        - name: Preserve original services and hook metadata once
+          ansible.builtin.copy:
+            dest: /var/lib/thinvids-retirement/original.json
+            content: "{{ {'services': ansible_facts.services, 'hooks': resume_hooks.results} | to_nice_json }}\n"
+            owner: root
+            group: root
+            mode: '0600'
+            force: false
+
+        - name: Remove Thinvids resume hooks
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ inference_hooks }}"
+
+        - name: Create service override directories
+          ansible.builtin.file:
+            path: "/etc/systemd/system/{{ item }}.d"
+            state: directory
+            mode: '0755'
+          loop: "{{ retiring_units }}"
+
+        - name: Prevent worker startup even if a resume hook was already executing
+          ansible.builtin.copy:
+            dest: "/etc/systemd/system/{{ item }}.d/90-dedicated-inference.conf"
+            content: |
+              [Unit]
+              ConditionPathExists=!/var/lib/thinvids-retirement/dedicated-inference
+            mode: '0644'
+          loop: "{{ retiring_units }}"
+
+        - name: Mark this host dedicated to inference
+          ansible.builtin.copy:
+            dest: /var/lib/thinvids-retirement/dedicated-inference
+            content: "Managed by Thinvids repurpose-node.sh\n"
+            mode: '0600'
+
+        - name: Reload the startup guards
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Stop agent first, then stop and disable consumers
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+            enabled: false
+          loop: "{{ retiring_units }}"
+
+        - name: Remove Thinvids unit files and drop-ins
+          ansible.builtin.file:
+            path: "/etc/systemd/system/{{ item }}"
+            state: absent
+          loop: "{{ inference_units + (inference_units | map('regex_replace', '$', '.d') | list) }}"
+
+        - name: Remove worker application, private virtualenv, and reboot permission
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /opt/jerry/current
+            - /opt/jerry/venv
+            - /etc/sudoers.d/thinvids-worker-reboot
+
+        - name: Reload after removing Thinvids units
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Verify retired units are not running
+          ansible.builtin.command:
+            argv: [systemctl, is-active, "{{ item }}"]
+          loop: "{{ inference_units }}"
+          register: retired_active
+          changed_when: false
+          failed_when: retired_active.stdout not in ['inactive', 'failed', 'unknown']
+
+        - name: Verify unit definitions are gone
+          ansible.builtin.command:
+            argv: [systemctl, show, --property=LoadState, --value, "{{ item }}"]
+          loop: "{{ inference_units }}"
+          register: removed_unit
+          changed_when: false
+          failed_when: removed_unit.stdout != 'not-found'
+
+        - name: Record completed Thinvids software removal
+          ansible.builtin.copy:
+            dest: /var/lib/thinvids-retirement/software-removed
+            content: "Thinvids services, hooks, application and private virtualenv removed.\n"
+            mode: '0600'
+
+    - name: Install and validate local inference
+      tags: install
+      block:
+        - name: Check retirement marker
+          ansible.builtin.stat:
+            path: /var/lib/thinvids-retirement/software-removed
+          register: retirement
+
+        - name: Require retirement and sufficient baseline memory
+          ansible.builtin.assert:
+            that:
+              - retirement.stat.exists
+              - ansible_facts.memtotal_mb | int >= 3000
+              - ansible_facts.processor_vcpus | int >= 2
+            fail_msg: Retire the worker first; baseline requires at least 3 GB RAM and two logical CPUs.
+
+        - name: Choose thread count for this host
+          ansible.builtin.set_fact:
+            inference_threads: "{{ [4, ansible_facts.processor_vcpus | int] | min }}"
+
+        - name: Require free disk space before package installation and build
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - "import os; s = os.statvfs('/opt'); assert s.f_bavail * s.f_frsize >= 5 * 1024**3, 'Need at least 5 GiB free on /opt filesystem'"
+          changed_when: false
+
+        - name: Install native build and unprivileged Ansible dependencies
+          ansible.builtin.apt:
+            name: [acl, build-essential, cmake, git, curl, libssl-dev, libcurl4-openssl-dev, lm-sensors]
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Create isolated inference account
+          ansible.builtin.user:
+            name: inference
+            system: true
+            create_home: true
+            home: /var/lib/inference
+            shell: /usr/sbin/nologin
+
+        - name: Create runtime and model directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+          loop: [/opt/inference, /opt/inference/models]
+
+        - name: Create writable benchmark directory
+          ansible.builtin.file:
+            path: /opt/inference/results
+            state: directory
+            owner: inference
+            mode: '0755'
+
+        - name: Inspect previous automation manifest
+          ansible.builtin.stat:
+            path: /opt/inference/automation.json
+          register: manifest
+
+        - name: Read previous automation manifest
+          ansible.builtin.slurp:
+            src: /opt/inference/automation.json
+          register: old_manifest
+          when: manifest.stat.exists
+
+        - name: Refuse to mix benchmark revisions on rerun
+          ansible.builtin.assert:
+            that:
+              - (old_manifest.content | b64decode | from_json).llama_revision == llama_revision
+              - (old_manifest.content | b64decode | from_json).model_sha256 == model_sha256
+            fail_msg: Existing automated installation uses different pins; preserve results and review before changing them.
+          when: manifest.stat.exists
+
+        - name: Ensure an interrupted benchmark is no longer running
+          ansible.builtin.command:
+            argv: [flock, --nonblock, /var/lib/inference/benchmark.lock, 'true']
+          become_user: inference
+          changed_when: false
+
+        - name: Stop existing inference processes before measuring
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop: [qwen-inference.service, qwen-rpc.service]
+          when: item in ansible_facts.services
+
+        - name: Check out the shared pinned llama.cpp revision
+          ansible.builtin.git:
+            repo: https://github.com/ggml-org/llama.cpp.git
+            dest: /opt/inference/llama.cpp
+            version: "{{ llama_revision }}"
+            force: false
+
+        - name: Configure for this node's native CPU with RPC support
+          ansible.builtin.command:
+            argv:
+              - flock
+              - --nonblock
+              - /var/lock/thinvids-inference-build.lock
+              - cmake
+              - -S
+              - /opt/inference/llama.cpp
+              - -B
+              - /opt/inference/llama.cpp/build
+              - -DCMAKE_BUILD_TYPE=Release
+              - -DGGML_NATIVE=ON
+              - -DGGML_RPC=ON
+              - -DLLAMA_BUILD_TESTS=OFF
+
+        - name: Build local server, benchmark, and RPC worker
+          ansible.builtin.command:
+            argv: [flock, --nonblock, /var/lock/thinvids-inference-build.lock, cmake, --build, /opt/inference/llama.cpp/build, --config, Release, -j, '2', --target, llama-server, llama-bench, ggml-rpc-server]
+          async: 7200
+          poll: 15
+
+        - name: Download the pinned model and verify official SHA-256
+          ansible.builtin.get_url:
+            url: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/{{ model_revision }}/{{ inference_model }}"
+            dest: "/opt/inference/models/{{ inference_model }}"
+            checksum: "sha256:{{ model_sha256 }}"
+            mode: '0644'
+            timeout: 120
+          register: download
+          retries: 3
+          delay: 5
+          until: download is succeeded
+
+        - name: Inspect completed baseline
+          ansible.builtin.stat:
+            path: /opt/inference/results/baseline-cpu.json
+          register: baseline
+
+        - name: Do not silently reuse an untracked benchmark
+          ansible.builtin.assert:
+            that:
+              - not baseline.stat.exists or manifest.stat.exists
+            fail_msg: Existing baseline has no prior automation manifest; archive it before running this pilot.
+
+        - name: Record reproducibility manifest
+          ansible.builtin.copy:
+            dest: /opt/inference/automation.json
+            content: "{{ {'llama_revision': llama_revision, 'model_revision': model_revision, 'model_sha256': model_sha256, 'hostname': inventory_hostname, 'threads': inference_threads, 'memtotal_mb': ansible_facts.memtotal_mb} | to_nice_json }}\n"
+            mode: '0644'
+
+        - name: Measure baseline once, before serving requests
+          ansible.builtin.command:
+            argv:
+              - flock
+              - --nonblock
+              - /var/lib/inference/benchmark.lock
+              - /opt/inference/llama.cpp/build/bin/llama-bench
+              - -m
+              - "/opt/inference/models/{{ inference_model }}"
+              - -ngl
+              - '0'
+              - -t
+              - "2,{{ inference_threads }}"
+              - -p
+              - '512'
+              - -n
+              - '128'
+              - -r
+              - '5'
+              - -o
+              - json
+          become_user: inference
+          register: benchmark
+          async: 3600
+          poll: 15
+          when: not baseline.stat.exists
+
+        - name: Preserve successful benchmark JSON
+          ansible.builtin.copy:
+            dest: /opt/inference/results/baseline-cpu.json
+            content: "{{ benchmark.stdout | from_json | to_nice_json }}\n"
+            owner: inference
+            mode: '0644'
+          when: not baseline.stat.exists
+
+        - name: Read the preserved benchmark
+          ansible.builtin.slurp:
+            src: /opt/inference/results/baseline-cpu.json
+          register: saved_benchmark
+
+        - name: Validate benchmark contents
+          ansible.builtin.assert:
+            that:
+              - saved_benchmark.content | b64decode | from_json | type_debug == 'list'
+              - saved_benchmark.content | b64decode | from_json | length > 0
+
+        - name: Install local and RPC service definitions
+          ansible.builtin.copy:
+            dest: "/etc/systemd/system/{{ item }}"
+            content: "{{ lookup('file', playbook_dir + '/docs/inference/' + item) | replace('-t 4 -tb 4', '-t ' + (inference_threads | string) + ' -tb ' + (inference_threads | string)) | replace('--threads 4', '--threads ' + (inference_threads | string)) }}\n"
+            mode: '0644'
+          loop: [qwen-inference.service, qwen-rpc.service]
+
+        - name: Reload inference units
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: Leave RPC available but stopped for the baseline
+          ansible.builtin.systemd:
+            name: qwen-rpc.service
+            state: stopped
+            enabled: false
+
+        - name: Enable and start the baseline chat server
+          ansible.builtin.systemd:
+            name: qwen-inference.service
+            state: started
+            enabled: true
+
+        - name: Wait for the model to become healthy
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8080/health
+            return_content: true
+          register: health
+          until: health.status == 200 and health.json.status == 'ok'
+          retries: 60
+          delay: 5
+
+        - name: Verify a real chat completion
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8080/v1/chat/completions
+            method: POST
+            body_format: json
+            body:
+              model: qwen-baseline
+              messages:
+                - role: user
+                  content: Say hello in one short sentence.
+              temperature: 0
+              max_tokens: 32
+              stream: false
+            timeout: 300
+            return_content: true
+          register: smoke
+
+        - name: Require nonempty generated text
+          ansible.builtin.assert:
+            that:
+              - smoke.json.choices | length > 0
+              - smoke.json.choices[0].message.content | trim | length > 0
+
+        - name: Check previous successful reboot validation
+          ansible.builtin.stat:
+            path: /opt/inference/reboot-verified.json
+          register: reboot_verified
+
+        - name: Verify dedicated services survive a reboot on first installation
+          ansible.builtin.reboot:
+            reboot_timeout: 300
+            post_reboot_delay: 10
+          when: not reboot_verified.stat.exists
+
+        - name: Wait for chat health after reboot
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8080/health
+            return_content: true
+          register: reboot_health
+          until: reboot_health.status == 200 and reboot_health.json.status == 'ok'
+          retries: 60
+          delay: 5
+
+        - name: Verify Thinvids services stayed stopped
+          ansible.builtin.command:
+            argv: [systemctl, is-active, "{{ item }}"]
+          loop: "{{ inference_units }}"
+          register: final_worker
+          changed_when: false
+          failed_when: final_worker.stdout not in ['inactive', 'failed', 'unknown']
+
+        - name: Record successful reboot and retirement validation
+          ansible.builtin.copy:
+            dest: /opt/inference/reboot-verified.json
+            content: "{{ {'host': inventory_hostname, 'llama_revision': llama_revision} | to_nice_json }}\n"
+            mode: '0644'
+
+        - name: Fetch benchmark and manifest to swarm4
+          ansible.builtin.fetch:
+            src: "{{ item }}"
+            dest: "{{ lookup('env', 'HOME') }}/.local/state/thinvids-inference/results/{{ inventory_hostname }}/"
+            flat: true
+          loop:
+            - /opt/inference/results/baseline-cpu.json
+            - /opt/inference/automation.json

@@ -314,13 +314,19 @@ def _ffprobe_duration(input_path: str) -> float:
 def _ffprobe_video_frame_count_details(
     input_path: str,
     *,
+    stream_index: int = 0,
+    heartbeat_stage: str = "audio_mux_frame_count",
     job_id: Optional[str] = None,
     timeout_sec: Optional[int] = None,
 ) -> Tuple[int, dict, str, bool]:
+    try:
+        stream_index = max(0, int(stream_index or 0))
+    except Exception:
+        stream_index = 0
     args = [
         'ffprobe', '-v', 'error',
         '-count_frames',
-        '-select_streams', 'v:0',
+        '-select_streams', f'v:{stream_index}',
         '-show_entries', 'stream=nb_read_frames,nb_frames,duration,avg_frame_rate',
         '-of', 'json',
         input_path,
@@ -333,7 +339,7 @@ def _ffprobe_video_frame_count_details(
         deadline = _now() + max(1, int(timeout_sec or AUDIO_MUX_FRAME_COUNT_TIMEOUT_SEC))
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         while proc.poll() is None:
-            _job_heartbeat(job_id, "audio_mux_frame_count", note="ffprobe-count-frames")
+            _job_heartbeat(job_id, heartbeat_stage, note="ffprobe-count-frames")
             if _now() >= deadline:
                 try:
                     proc.terminate()
@@ -362,11 +368,69 @@ def _ffprobe_video_frame_count_details(
     except Exception as exc:
         return (0, {}, f"ffprobe frame count parse failed: {exc}", False)
 
+
+def _ffprobe_video_packet_count_details(
+    input_path: str,
+    *,
+    stream_index: int = 0,
+    heartbeat_stage: str = "source_packet_count",
+    job_id: Optional[str] = None,
+    timeout_sec: Optional[int] = None,
+) -> Tuple[int, dict, str, bool]:
+    try:
+        stream_index = max(0, int(stream_index or 0))
+    except Exception:
+        stream_index = 0
+    args = [
+        'ffprobe', '-v', 'error',
+        '-count_packets',
+        '-select_streams', f'v:{stream_index}',
+        '-show_entries', 'stream=nb_read_packets,nb_frames,duration,avg_frame_rate',
+        '-of', 'json',
+        input_path,
+    ]
+    if not job_id:
+        out, err, timed_out = _run_ffprobe(args)
+        if err:
+            return (0, {}, err, timed_out)
+    else:
+        deadline = _now() + max(1, int(timeout_sec or FFPROBE_TIMEOUT_SEC))
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while proc.poll() is None:
+            _job_heartbeat(job_id, heartbeat_stage, note="ffprobe-count-packets")
+            if _now() >= deadline:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return (0, {}, f"ffprobe packet count timed out after {int(timeout_sec or FFPROBE_TIMEOUT_SEC)}s", True)
+            time.sleep(2)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            detail = (err or out or "").strip()
+            if detail:
+                detail = detail[-600:]
+            return (0, {}, f"ffprobe packet count rc={proc.returncode}{(': ' + detail) if detail else ''}", False)
+    try:
+        payload = json.loads(out or "{}")
+        streams = payload.get("streams") or []
+        stream = streams[0] if streams else {}
+        raw_count = stream.get("nb_read_packets") or stream.get("nb_frames") or 0
+        if str(raw_count).upper() == "N/A":
+            raw_count = 0
+        return (int(raw_count or 0), stream, "", False)
+    except Exception as exc:
+        return (0, {}, f"ffprobe packet count parse failed: {exc}", False)
+
 def _ffprobe_stream0_details(input_path: str) -> Tuple[dict, str, bool]:
     out, err, timed_out = _run_ffprobe([
         'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name,width,height,avg_frame_rate,nb_frames',
+        '-show_entries', 'stream=codec_name,width,height,avg_frame_rate,nb_frames,duration:stream_tags=NUMBER_OF_FRAMES,NUMBER_OF_PACKETS,DURATION',
         '-show_entries', 'format=size,bit_rate',
         '-of', 'json', input_path
     ])
@@ -389,12 +453,18 @@ def _ffprobe_stream0_details(input_path: str) -> Tuple[dict, str, bool]:
                 fps = float(afr)
             except Exception:
                 fps = 0.0
+        tags = v.get('tags') or {}
+        raw_nb_frames = v.get('nb_frames') or tags.get('NUMBER_OF_FRAMES') or tags.get('NUMBER_OF_PACKETS') or 0
+        if str(raw_nb_frames).upper() == "N/A":
+            raw_nb_frames = 0
         return ({
             "codec":  v.get('codec_name') or '',
             "width":  int(v.get('width') or 0),
             "height": int(v.get('height') or 0),
             "fps":    fps,
-            "nb_frames": int(v.get('nb_frames') or 0),
+            "nb_frames": int(raw_nb_frames or 0),
+            "stream_duration": v.get('duration') or tags.get('DURATION') or '',
+            "tags": tags,
             "size":   int(fmt.get('size') or 0),
             "bit_rate": int(fmt.get('bit_rate') or 0),
         }, "", False)
@@ -658,6 +728,10 @@ def _reset_job_run_state(job_id: str, job=None):
     parts_dir = os.path.join(base_dir, "parts")
     enc_dir = os.path.join(base_dir, "encoded")
     audio_dir = os.path.join(base_dir, "audio")
+    try:
+        old_parts_total = int(redis.hget(job_key, "parts_total") or 0)
+    except Exception:
+        old_parts_total = 0
 
     for path in (parts_dir, enc_dir, audio_dir):
         try:
@@ -710,6 +784,19 @@ def _reset_job_run_state(job_id: str, job=None):
             'audio_mux_target_duration': '',
             'audio_mux_sync_correction_sec': '',
             'video_duration_before_audio_mux': '',
+            'frame_chunking_mode': '',
+            'frame_plan_json': '',
+            'frame_plan_total_frames': '',
+            'frame_plan_parts': '',
+            'frame_validation_status': '',
+            'frame_validation_error': '',
+            'final_video_frame_count': '',
+            'final_video_frame_delta': '',
+            'final_video_frame_details_json': '',
+            'source_frame_count_exact': '',
+            'source_frame_count_method': '',
+            'source_frame_count_details_json': '',
+            'part_frame_count_error': '',
             'stitch_expected_video_duration': '',
             'segment_manifest_count': '',
             'segment_manifest_path': '',
@@ -728,6 +815,16 @@ def _reset_job_run_state(job_id: str, job=None):
             'last_heartbeat_note': '',
             'ended_at': 0,
         })
+        if old_parts_total > 0:
+            stale_part_fields = []
+            for i in range(1, min(old_parts_total, 5000) + 1):
+                stale_part_fields.extend([
+                    f'part_{i:03d}_expected_frames',
+                    f'part_{i:03d}_actual_frames',
+                    f'part_{i:03d}_frame_details_json',
+                ])
+            if stale_part_fields:
+                redis.hdel(job_key, *stale_part_fields)
         redis.hdel(job_key, 'master_host', 'stitch_host', 'stitch_enqueued_at')
         redis.delete(f"job_done_parts:{job_id}")
         redis.delete(f"job_retry_counts:{job_id}")
@@ -898,6 +995,21 @@ def _direct_source_trim_filter(
     return ",".join(filters)
 
 
+def _direct_source_hybrid_filter(
+    filtergraph: str,
+    *,
+    trim_start_s: float,
+    trim_duration_s: float,
+    frame_count: Optional[int],
+) -> str:
+    return _direct_source_trim_filter(
+        filtergraph,
+        trim_start_s=trim_start_s,
+        trim_duration_s=trim_duration_s,
+        frame_count=frame_count,
+    )
+
+
 def _source_dimensions_for_job(job) -> Tuple[int, int]:
     raw = str(job.get("source_resolution") or "").strip().lower()
     match = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", raw)
@@ -1052,6 +1164,79 @@ def _selected_video_fps_from_job(job) -> float:
         pass
     return 0.0
 
+
+def _selected_video_frame_count_from_job(job, meta: Optional[dict], duration: float, fps: float) -> Tuple[int, str, dict]:
+    meta = meta or {}
+
+    def _positive_int(value) -> int:
+        try:
+            raw = str(value or "").strip()
+            if not raw or raw.upper() == "N/A":
+                return 0
+            return int(float(raw))
+        except Exception:
+            return 0
+
+    count = _positive_int((job or {}).get("source_frame_count_exact"))
+    if count > 0:
+        return count, "cached_exact", {}
+
+    try:
+        selected = int((job or {}).get("selected_v_stream") or 0)
+    except Exception:
+        selected = 0
+    try:
+        streams = json.loads((job or {}).get("streams_json") or "{}").get("video") or []
+    except Exception:
+        streams = []
+    if 0 <= selected < len(streams):
+        stream = streams[selected] or {}
+        count = _positive_int(stream.get("nb_frames") or stream.get("number_of_frames"))
+        if count > 0:
+            return count, "streams_json", stream
+        tags = stream.get("tags") or {}
+        count = _positive_int(tags.get("NUMBER_OF_FRAMES") or tags.get("NUMBER_OF_PACKETS"))
+        if count > 0:
+            return count, "streams_json_tags", stream
+
+    count = _positive_int(meta.get("nb_frames"))
+    if count > 0:
+        return count, "stream_metadata", meta
+    tags = meta.get("tags") or {}
+    count = _positive_int(tags.get("NUMBER_OF_FRAMES") or tags.get("NUMBER_OF_PACKETS"))
+    if count > 0:
+        return count, "stream_tags", meta
+
+    cached_method = str((job or {}).get("source_frame_count_method") or "").strip().lower()
+    count = _positive_int((job or {}).get("total_frames"))
+    if count > 0:
+        method = "cached_total_frames_estimate"
+        if cached_method in {"duration_x_fps_estimate", "estimated_duration_x_fps"}:
+            method = "cached_duration_x_fps_estimate"
+        return count, method, {}
+
+    try:
+        duration = float(duration or 0.0)
+        fps = float(fps or 0.0)
+    except Exception:
+        duration = 0.0
+        fps = 0.0
+    if duration > 0 and fps > 0:
+        return max(1, int(round(duration * fps))), "duration_x_fps_estimate", {}
+
+    return 0, "", {}
+
+
+def _frame_count_method_is_exact(method: str) -> bool:
+    return str(method or "").strip().lower() not in {
+        "",
+        "cached_total_frames",
+        "cached_total_frames_estimate",
+        "duration_x_fps_estimate",
+        "cached_duration_x_fps_estimate",
+        "estimated_duration_x_fps",
+    }
+
 def _direct_source_plan_for_part(
     source_duration: float,
     segment_duration: float,
@@ -1092,6 +1277,22 @@ def _direct_source_plan_for_part(
     if source_duration:
         part_duration = max(0.05, min(segment_duration, source_duration - start_s))
     return start_s, part_duration, None
+
+
+def _frame_plan_for_part(total_frames: int, idx: int, total_parts: int) -> Tuple[int, int, int]:
+    try:
+        total_frames = max(0, int(total_frames or 0))
+        idx = int(idx or 0)
+        total_parts = max(1, int(total_parts or 1))
+    except Exception:
+        return 0, 0, 0
+    if idx <= 0 or idx > total_parts or total_frames <= 0:
+        return 0, 0, 0
+    start_frame = int(((idx - 1) * total_frames) // total_parts)
+    end_frame = int((idx * total_frames) // total_parts)
+    if end_frame <= start_frame:
+        return start_frame, end_frame, 0
+    return start_frame, end_frame, end_frame - start_frame
 
 
 def _parts_for_target_size(size_b: int, target_segment_bytes: int = DEFAULT_TARGET_SEGMENT_BYTES) -> int:
@@ -1613,17 +1814,76 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
         _job_heartbeat(job_id, "plan", force=True, note=f"mode={processing_mode}")
         logger.info(f"[{job_id}] Processing mode: {processing_mode} ({processing_reason})")
         if processing_mode == "direct" and duration <= 0:
-            processing_mode = "split"
-            processing_reason = "missing_source_duration"
-            redis.hset(job_key, mapping={
-                "processing_mode_effective": processing_mode,
-                "processing_mode_reason": processing_reason,
-            })
-            logger.warning(f"[{job_id}] Falling back to split mode because source duration is unavailable.")
+            logger.warning(
+                f"[{job_id}] Source duration is unavailable; staying in direct frame-based mode."
+            )
 
         split_settings = _load_global_settings()
         target_segment_mb, target_segment_bytes = _target_segment_bytes_from_settings(split_settings)
         min_segment_count = _min_segment_count_from_settings(split_settings)
+        source_frame_count = 0
+        source_frame_details = {}
+        source_frame_method = ""
+        if processing_mode == "direct":
+            source_frame_count, source_frame_method, source_frame_details = _selected_video_frame_count_from_job(
+                job,
+                meta,
+                duration,
+                fps,
+            )
+            if source_frame_count <= 0:
+                probe_count, probe_details, probe_err, _ = _ffprobe_video_packet_count_details(
+                    src_path,
+                    stream_index=v_sel,
+                    job_id=job_id,
+                    timeout_sec=FFPROBE_TIMEOUT_SEC,
+                )
+                if probe_err:
+                    logger.warning(
+                        "[%s] Source packet-count fallback failed for %s: %s",
+                        job_id,
+                        src_path,
+                        probe_err,
+                    )
+                else:
+                    source_frame_count = int(probe_count or 0)
+                    source_frame_method = "packet_count"
+                    source_frame_details = probe_details or {}
+            if source_frame_count <= 0:
+                reason = "source frame count unavailable; refusing frame-based direct encode"
+                logger.error(f"[{job_id}] {reason}")
+                redis.hset(job_key, mapping={
+                    'status': Status.FAILED.value,
+                    'error': reason,
+                    'failed_stage': 'frame_probe',
+                    'failed_worker': WORKER_NAME,
+                    'ended_at': _now(),
+                })
+                return {'status': 'FAILED', 'reason': reason}
+            source_frame_exact = _frame_count_method_is_exact(source_frame_method)
+            frame_count_mapping = {
+                'total_frames': source_frame_count,
+                'source_frame_count_method': source_frame_method,
+                'source_frame_count_details_json': json.dumps(source_frame_details, separators=(",", ":")),
+                'frame_chunking_mode': 'seek_preroll_frame_count',
+                'frame_validation_status': 'planned',
+            }
+            if source_frame_exact:
+                frame_count_mapping['source_frame_count_exact'] = source_frame_count
+            else:
+                frame_count_mapping['source_frame_count_exact'] = ''
+            redis.hset(job_key, mapping=frame_count_mapping)
+            if duration <= 0 and fps > 0:
+                duration = source_frame_count / fps
+                redis.hset(job_key, 'source_duration', f"{duration:.2f}")
+                job['source_duration'] = f"{duration:.2f}"
+            job.update({
+                'total_frames': str(source_frame_count),
+                'source_frame_count_exact': str(source_frame_count) if source_frame_exact else '',
+                'source_frame_count_method': source_frame_method,
+                'source_frame_count_details_json': json.dumps(source_frame_details, separators=(",", ":")),
+                'frame_chunking_mode': 'seek_preroll_frame_count',
+            })
 
         # requested parts from configured segment size
         requested_parts = _parts_for_target_size(int(size_b or 0), target_segment_bytes)
@@ -1734,9 +1994,10 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
             part_opened_at = _now()
             direct_fps = _selected_video_fps_from_job(job)
             try:
-                direct_total_frames = int(job.get("total_frames") or meta.get("nb_frames") or 0)
+                direct_total_frames = int(source_frame_count or job.get("total_frames") or meta.get("nb_frames") or 0)
             except Exception:
                 direct_total_frames = 0
+            frame_plan = []
             for part_idx in range(1, P + 1):
                 if _is_job_halted(job_id):
                     logger.warning(f"[{job_id}] Halted while scheduling direct-source parts.")
@@ -1754,8 +2015,19 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 )
                 if start_s is None:
                     break
+                start_frame, end_frame, expected_frames = _frame_plan_for_part(direct_total_frames, part_idx, P)
+                if expected_frames <= 0:
+                    break
 
                 total_chunks = part_idx
+                frame_plan.append({
+                    "part": part_idx,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "frame_count": expected_frames,
+                    "start_s": start_s,
+                    "duration_s": part_duration,
+                })
                 part_elapsed_ms = _elapsed_ms(part_opened_at)
                 part_opened_at = _now()
                 emit_activity(
@@ -1777,6 +2049,8 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                     source_start_s=start_s,
                     source_duration_s=part_duration,
                     source_frame_count=part_frame_count,
+                    source_start_frame=start_frame,
+                    source_end_frame=end_frame,
                     run_token=run_token,
                 )
                 prog = int((part_idx / max(1, P)) * 100)
@@ -1803,6 +2077,10 @@ def split(job_id: str, file_path: str, run_token: Optional[str] = None):
                 'segmented_chunks': total_chunks,
                 'segment_progress': 100,
                 'segment_elapsed': round(_now() - seg_t0, 2),
+                'frame_plan_json': json.dumps(frame_plan, separators=(",", ":")),
+                'frame_plan_total_frames': direct_total_frames,
+                'frame_plan_parts': total_chunks,
+                'frame_validation_status': 'encoding',
             })
             emit_activity(
                 f'Segmenting "{title}" completed in {_elapsed_ms(seg_t0)}ms',
@@ -2113,6 +2391,8 @@ def encode(
     source_start_s: Optional[float] = None,
     source_duration_s: Optional[float] = None,
     source_frame_count: Optional[int] = None,
+    source_start_frame: Optional[int] = None,
+    source_end_frame: Optional[int] = None,
     run_token: Optional[str] = None,
 ):
     """
@@ -2216,6 +2496,8 @@ def encode(
                 source_start_s=source_start_s,
                 source_duration_s=source_duration_s,
                 source_frame_count=source_frame_count,
+                source_start_frame=source_start_frame,
+                source_end_frame=source_end_frame,
                 run_token=run_token,
             )
             return {'status': 'RETRYING', 'reason': failure_reason}
@@ -2302,6 +2584,7 @@ def encode(
         else:
             logger.info(
                 f"[{job_id}] Direct-source encode part {idx} "
+                f"frames={int(source_start_frame or 0)}:{int(source_end_frame or 0)} "
                 f"start={float(source_start_s or 0):.3f}s dur={float(source_duration_s or 0):.3f}s source={source_path}"
             )
 
@@ -2320,9 +2603,20 @@ def encode(
             pass
         input_args = ['-fflags', '+genpts', '-i', in_path]
         map_args = ['-map', '0:v:0', '-an']
+        frame_limit_args = []
+        hybrid_direct = False
         if direct_source:
             requested_start = max(0.0, float(source_start_s or 0.0))
             requested_duration = max(0.05, float(source_duration_s or 0.0))
+            try:
+                planned_start_frame = max(0, int(source_start_frame or 0))
+                planned_end_frame = max(planned_start_frame, int(source_end_frame or 0))
+                planned_frame_count = max(0, int(source_frame_count or 0))
+            except Exception:
+                planned_start_frame = 0
+                planned_end_frame = 0
+                planned_frame_count = 0
+            hybrid_direct = planned_frame_count > 0 and planned_end_frame > planned_start_frame
             preroll = min(requested_start, DIRECT_SOURCE_SEEK_PREROLL_SEC)
             seek_start = max(0.0, requested_start - preroll)
             trim_start = requested_start - seek_start
@@ -2332,6 +2626,8 @@ def encode(
                 '-t', f"{read_duration:.6f}",
                 '-i', source_path,
             ]
+            if hybrid_direct:
+                frame_limit_args = ['-frames:v', str(planned_frame_count)]
             map_args = [
                 '-map', f'0:v:{int(v_sel)}',
                 '-an',
@@ -2346,7 +2642,7 @@ def encode(
                 else ['-c:v', SOFTWARE_H264_ENCODER, '-preset', SOFTWARE_H264_PRESET, '-crf', SOFTWARE_H264_CRF]
             )
             video_filter = (
-                _direct_source_trim_filter(
+                _direct_source_hybrid_filter(
                     _software_scale_filter(target_height, deinterlace=force_deinterlace),
                     trim_start_s=trim_start,
                     trim_duration_s=requested_duration,
@@ -2364,6 +2660,7 @@ def encode(
                 *input_args,
                 *map_args,
                 '-vf', video_filter,
+                *frame_limit_args,
                 *software_video_args,
                 out_path
             ]
@@ -2376,7 +2673,7 @@ def encode(
             if video_encoder == 'h265':
                 vaapi_video_args.extend(['-tag:v', 'hvc1'])
             video_filter = (
-                _direct_source_trim_filter(
+                _direct_source_hybrid_filter(
                     _vaapi_scale_filter(target_height),
                     trim_start_s=trim_start,
                     trim_duration_s=requested_duration,
@@ -2393,6 +2690,7 @@ def encode(
                 *input_args,
                 *map_args,
                 '-vf', video_filter,
+                *frame_limit_args,
                 *vaapi_video_args,
                 out_path
             ]
@@ -2462,6 +2760,71 @@ def encode(
             tail = "\n".join(list(stderr_tail)[-40:])  # keep it short
             return _fail(f"ffmpeg rc={rc}; tail:\n{tail}", stage)
 
+        if direct_source and source_frame_count:
+            expected_frames = int(source_frame_count or 0)
+            source_frame_method = redis.hget(job_key, "source_frame_count_method") or ""
+            source_frame_exact = _frame_count_method_is_exact(source_frame_method)
+            try:
+                parts_total_for_validation = int(redis.hget(job_key, "parts_total") or 0)
+            except Exception:
+                parts_total_for_validation = 0
+            actual_frames, frame_details, frame_err, _ = _ffprobe_video_packet_count_details(
+                out_path,
+                heartbeat_stage="encode_packet_count",
+                timeout_sec=FFPROBE_TIMEOUT_SEC,
+            )
+            if frame_err or actual_frames != expected_frames:
+                reason = (
+                    f"encoded packet/frame count mismatch for part {idx}: "
+                    f"expected={expected_frames} actual={actual_frames or 'unknown'}"
+                    f"{('; ' + frame_err) if frame_err else ''}"
+                )
+                estimated_final_tail = (
+                    not source_frame_exact
+                    and parts_total_for_validation > 0
+                    and int(idx) == parts_total_for_validation
+                    and not frame_err
+                    and int(actual_frames or 0) > 0
+                    and int(actual_frames or 0) <= expected_frames
+                )
+                if estimated_final_tail:
+                    logger.warning("[%s] accepting estimated final tail mismatch: %s", job_id, reason)
+                    try:
+                        redis.hset(job_key, mapping={
+                            f'part_{idx:03d}_expected_frames': expected_frames,
+                            f'part_{idx:03d}_actual_frames': actual_frames,
+                            f'part_{idx:03d}_frame_details_json': json.dumps(frame_details or {}, separators=(",", ":")),
+                            'frame_validation_status': 'estimated_final_tail',
+                            'frame_validation_error': reason,
+                        })
+                    except Exception:
+                        pass
+                else:
+                    logger.error("[%s] %s", job_id, reason)
+                    redis.hset(job_key, mapping={
+                        'status': Status.FAILED.value,
+                        'error': reason,
+                        'failed_part': idx,
+                        'failed_stage': 'encode_frame_count',
+                        'failed_worker': worker_name,
+                        'part_frame_count_error': reason,
+                        f'part_{idx:03d}_expected_frames': expected_frames,
+                        f'part_{idx:03d}_actual_frames': actual_frames or '',
+                        f'part_{idx:03d}_frame_details_json': json.dumps(frame_details or {}, separators=(",", ":")),
+                        'frame_validation_status': 'failed',
+                        'frame_validation_error': reason,
+                        'ended_at': _now(),
+                    })
+                    _cleanup_encode_task_files("frame count mismatch")
+                    return {'status': 'FAILED', 'reason': reason}
+            if not (frame_err or actual_frames != expected_frames):
+                try:
+                    redis.hset(job_key, mapping={
+                        f'part_{idx:03d}_expected_frames': expected_frames,
+                        f'part_{idx:03d}_actual_frames': actual_frames,
+                    })
+                except Exception:
+                    pass
         logger.info(f"[{job_id}] Encoded part {idx}")
 
         # Upload result to stitcher
@@ -3397,9 +3760,63 @@ def stitch(job_id: str, run_token: Optional[str] = None):
             logger.warning(f"[{job_id}] stitch halted before moving file")
             return {'status': 'ABORTED'}
 
+        job = redis.hgetall(job_key) or {}
+        try:
+            source_frame_count = int(job.get("frame_plan_total_frames") or job.get("total_frames") or 0)
+        except Exception:
+            source_frame_count = 0
+        source_frame_method = job.get("source_frame_count_method") or ""
+        source_frame_exact = _frame_count_method_is_exact(source_frame_method)
+        if source_frame_count > 0:
+            final_video_frame_count, final_frame_details, final_frame_err, _ = _ffprobe_video_packet_count_details(
+                local_out,
+                heartbeat_stage="stitch_packet_count",
+                job_id=job_id,
+                timeout_sec=FFPROBE_TIMEOUT_SEC,
+            )
+            final_delta = (final_video_frame_count - source_frame_count) if final_video_frame_count else 0
+            redis.hset(job_key, mapping={
+                'final_video_frame_count': str(final_video_frame_count or ''),
+                'final_video_frame_delta': str(final_delta) if final_video_frame_count else '',
+                'final_video_frame_details_json': json.dumps(final_frame_details or {}, separators=(",", ":")),
+                'frame_validation_status': 'stitched',
+                'frame_validation_error': final_frame_err or '',
+            })
+            if final_frame_err or final_video_frame_count != source_frame_count:
+                reason = (
+                    "stitched video packet/frame count mismatch: "
+                    f"expected={source_frame_count} actual={final_video_frame_count or 'unknown'}"
+                    f"{('; ' + final_frame_err) if final_frame_err else ''}"
+                )
+                if not source_frame_exact:
+                    logger.warning(
+                        "[%s] accepting stitched frame count delta because source count is estimated (%s): %s",
+                        job_id,
+                        source_frame_method or "unknown",
+                        reason,
+                    )
+                    redis.hset(job_key, mapping={
+                        'frame_validation_status': 'stitched_estimated',
+                        'frame_validation_error': reason,
+                    })
+                else:
+                    logger.error(f"[{job_id}] {reason}")
+                    redis.hset(job_key, mapping={
+                        'status': Status.FAILED.value,
+                        'error': reason,
+                        'failed_stage': 'stitch_frame_count',
+                        'failed_worker': WORKER_NAME,
+                        'preserve_project_dir': '1',
+                        'preserve_project_dir_reason': 'stitch_frame_count_diagnostic',
+                        'frame_validation_status': 'failed',
+                        'frame_validation_error': reason,
+                        'ended_at': _now(),
+                    })
+                    cleanup_on_exit = False
+                    return {'status': 'FAILED', 'reason': reason}
+
         # New pipeline mode: encoded chunks are video-only; audio is encoded
         # once from the original source and uploaded as a single continuous m4a.
-        job = redis.hgetall(job_key) or {}
         audio_status = str(job.get("audio_status") or "").strip().upper()
         audio_path = _audio_path(job_id)
         if audio_status and audio_status != "NONE":
@@ -3447,10 +3864,17 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                 expected_video_duration if expected_video_duration > 0 else (src_dur if src_dur and src_dur > 0 else 0.0)
             )
             video_input_args = []
-            video_timebase_scale = 1.0
             if stitched_video_duration > 0 and target_mux_duration > 0:
                 drift_sec = stitched_video_duration - target_mux_duration
-                if abs(drift_sec) > 0.05:
+                if abs(drift_sec) <= 0.05:
+                    redis.hset(job_key, mapping={
+                        'video_duration_before_audio_mux': f'{stitched_video_duration:.6f}',
+                        'audio_mux_target_duration': f'{target_mux_duration:.6f}',
+                        'audio_mux_sync_correction_sec': f'{drift_sec:.6f}',
+                        'audio_mux_video_itsscale': '',
+                        'audio_mux_sync_mode': 'none',
+                    })
+                else:
                     allowed_stretch_sec = max(
                         AUDIO_MUX_MAX_TIMESTAMP_STRETCH_SEC,
                         target_mux_duration * AUDIO_MUX_MAX_TIMESTAMP_STRETCH_PCT,
@@ -3506,22 +3930,20 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                         })
                         cleanup_on_exit = False
                         return {'status': 'FAILED', 'reason': reason}
-                    video_timebase_scale = target_mux_duration / stitched_video_duration
-                    video_input_args = ['-itsscale', f'{video_timebase_scale:.12f}']
                     redis.hset(job_key, mapping={
                         'video_duration_before_audio_mux': f'{stitched_video_duration:.6f}',
                         'audio_mux_target_duration': f'{target_mux_duration:.6f}',
                         'audio_mux_sync_correction_sec': f'{drift_sec:.6f}',
-                        'audio_mux_video_itsscale': f'{video_timebase_scale:.12f}',
-                        'audio_mux_sync_mode': 'timestamp_scale',
+                        'audio_mux_video_itsscale': '',
+                        'audio_mux_sync_mode': 'duration_tolerated_no_scale',
                     })
                     logger.warning(
-                        "[%s] applying video timestamp scale before audio mux: video=%.6fs target=%.6fs drift=%.6fs scale=%.12f",
+                        "[%s] tolerating small mux duration difference without retiming video: video=%.6fs target_audio=%.6fs drift=%.6fs max=%.6fs",
                         job_id,
                         stitched_video_duration,
                         target_mux_duration,
                         drift_sec,
-                        video_timebase_scale,
+                        allowed_stretch_sec,
                     )
             audio_mux_cmd = [
                 'ffmpeg', '-hide_banner',

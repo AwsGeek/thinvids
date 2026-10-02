@@ -1,0 +1,24 @@
+[Unit]
+Description=Dedicated Qwen inference baseline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inference
+Group=inference
+WorkingDirectory=/opt/inference/llama.cpp
+ExecStart=/opt/inference/llama.cpp/build/bin/llama-server -m /opt/inference/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --alias qwen-baseline --host 127.0.0.1 --port 8080 -c 4096 -np 1 -t 4 -tb 4 -ngl 0
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+StateDirectory=inference
+Environment=LLAMA_CACHE=/var/lib/inference/cache
+InaccessiblePaths=-/watch -/library -/source_media -/projects -/opt/jerry
+
+[Install]
+WantedBy=multi-user.target
