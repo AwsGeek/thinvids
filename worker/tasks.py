@@ -976,6 +976,7 @@ def _direct_source_trim_filter(
     trim_start_s: float,
     trim_duration_s: float,
     frame_count: Optional[int],
+    pad_last_frame: bool = False,
 ) -> str:
     try:
         frames = int(frame_count or 0)
@@ -987,6 +988,10 @@ def _direct_source_trim_filter(
         f"trim=start={trim_start_s:.6f}:duration={trim_duration_s:.6f}",
         "setpts=PTS-STARTPTS",
     ]
+    if pad_last_frame and frames > 0:
+        # Soft-telecine MPEG-2 can decode one frame short at a rounded time
+        # boundary; clone the last in-range frame instead of reading the next part.
+        filters.append("tpad=stop_mode=clone:stop=1")
     if frames > 0:
         filters.extend([f"trim=end_frame={frames}", "setpts=PTS-STARTPTS"])
     filtergraph = (filtergraph or "").strip()
@@ -1001,12 +1006,14 @@ def _direct_source_hybrid_filter(
     trim_start_s: float,
     trim_duration_s: float,
     frame_count: Optional[int],
+    pad_last_frame: bool = False,
 ) -> str:
     return _direct_source_trim_filter(
         filtergraph,
         trim_start_s=trim_start_s,
         trim_duration_s=trim_duration_s,
         frame_count=frame_count,
+        pad_last_frame=pad_last_frame,
     )
 
 
@@ -2593,6 +2600,13 @@ def encode(
         software_encode = int(redis.hget(job_key, 'software_encode') or 0)
         target_height, force_deinterlace = _effective_target_height_for_job(job_key)
         video_encoder = _video_encoder_for_job(job_key)
+        source_frame_method = redis.hget(job_key, 'source_frame_count_method') or ''
+        pad_last_frame = (
+            direct_source
+            and bool(source_frame_count)
+            and (redis.hget(job_key, 'source_codec') or '').strip().lower() == 'mpeg2video'
+            and not _frame_count_method_is_exact(source_frame_method)
+        )
         try:
             redis.hset(job_key, mapping={
                 'target_height_effective': target_height,
@@ -2647,6 +2661,7 @@ def encode(
                     trim_start_s=trim_start,
                     trim_duration_s=requested_duration,
                     frame_count=source_frame_count,
+                    pad_last_frame=pad_last_frame,
                 )
                 if direct_source
                 else _reset_segment_video_pts_filter(
@@ -2678,6 +2693,7 @@ def encode(
                     trim_start_s=trim_start,
                     trim_duration_s=requested_duration,
                     frame_count=source_frame_count,
+                    pad_last_frame=pad_last_frame,
                 )
                 if direct_source
                 else _reset_segment_video_pts_filter(_vaapi_scale_filter(target_height))
@@ -2762,7 +2778,6 @@ def encode(
 
         if direct_source and source_frame_count:
             expected_frames = int(source_frame_count or 0)
-            source_frame_method = redis.hget(job_key, "source_frame_count_method") or ""
             source_frame_exact = _frame_count_method_is_exact(source_frame_method)
             try:
                 parts_total_for_validation = int(redis.hget(job_key, "parts_total") or 0)
@@ -3429,6 +3444,7 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                     logger.error(f"[{job_id}] stitch: cannot retry direct-source part {idx}; missing segment plan")
                     redis.srem(inflight_key, idx)
                     return False
+                start_frame, end_frame, _ = _frame_plan_for_part(direct_total_frames, idx, P)
                 _dispatch_encode_part(
                     job_id,
                     idx,
@@ -3440,6 +3456,8 @@ def stitch(job_id: str, run_token: Optional[str] = None):
                     source_start_s=start_s,
                     source_duration_s=part_dur,
                     source_frame_count=part_frame_count,
+                    source_start_frame=start_frame,
+                    source_end_frame=end_frame,
                     run_token=run_token,
                 )
             else:
